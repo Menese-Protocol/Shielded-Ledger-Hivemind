@@ -43,8 +43,9 @@ anyone watch it work.
   the public commitment log, Groth16 proving, and the PIR client. Shielded keys derive from
   Internet Identity through vetKeys and live only in memory.
 - **`scripts/security-gate.sh`**: one command that re-runs the full offline security battery.
-- **`nns_adapter/`, `tree_oracle/`, `icrc3_oracle/`, `cert_oracle/`**: the certified
-  NNS-to-ICRC-3 adapter and the native Rust oracles the tests compare against.
+- **`nns_adapter/`, `tree_oracle/`, `icrc3_oracle/`, `cert_oracle/`, `cross_oracle/`**: the
+  certified NNS-to-ICRC-3 adapter and the native Rust oracles the tests compare against,
+  including the blst second-implementation Groth16 oracle.
 
 ## How the pool works
 
@@ -96,7 +97,9 @@ The ledger exposes an LWE-based private information retrieval endpoint, `pir_que
 client encrypts its selector, so no index travels on the wire; the ledger performs the same
 uniform scan over every record regardless of the target; the client decrypts the answer
 locally. Every response reports `records_scanned` (always all of them) and
-`target_dependent_branches` (always zero), and the security gate asserts both.
+`target_dependent_branches` (always zero), and the security gate asserts both. The exact LWE
+parameters, the claimed security level, the cost model, and the stated scaling boundaries are
+in [`docs/PIR-SPEC.md`](docs/PIR-SPEC.md).
 
 *The ledger answers without knowing the question.*
 
@@ -109,6 +112,11 @@ inversion-free projective Miller loop with reusable G2 preparation, and one shar
 final exponentiation across all four pairings. Every L2 module is differentially tested against
 L1 on the same inputs, with live formula mutants that must turn the tests red before the
 optimization is accepted. Optimizations earn their place by measurement, not by argument.
+
+Verdicts are anchored to two reference implementations with unrelated lineages. Every frozen
+fixture must produce the identical accept or reject decision in arkworks, in blst
+(`cross_oracle/`), and in the Motoko verifier; a specification misreading has to be shared by
+two independent pairing libraries before it can hide from the gate.
 
 Measured on the Internet Computer, per verification, garbage collection included:
 
@@ -130,8 +138,9 @@ mops install
 One command, offline, no canister installs. It re-verifies: SHA-256 integrity of every frozen
 fixture; byte-identity of the vendored circuit source; deterministic regeneration of every
 public test vector; randomized circuit-property batteries and the Groth16 mutation battery
-(all eight public inputs and every one of the 192 compressed proof bytes); the independent
-Motoko curve, pairing, and wire oracles; ICRC-3 official hash vectors and exact-block matching;
+(all eight public inputs and every one of the 192 compressed proof bytes); the blst
+second-oracle verdict agreement; the independent Motoko curve, pairing, and wire oracles;
+ICRC-3 official hash vectors and exact-block matching;
 the canister compile gates and the DEMO token API boundary; key provenance with negative
 controls; and a production frontend build booted in a real browser. `--with-replica-e2e`
 additionally runs the stateful local-replica suite.

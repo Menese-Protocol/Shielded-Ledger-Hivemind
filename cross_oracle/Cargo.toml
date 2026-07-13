@@ -1,0 +1,10 @@
+[package]
+name = "cross_oracle"
+version = "0.1.0"
+edition = "2021"
+authors = ["Menese DeFi Team"]
+description = "Second-implementation Groth16 oracle over blst: verdict agreement with the arkworks fixtures and the Motoko verifier, using an unrelated pairing library"
+
+[dependencies]
+blst = "0.3"
+hex = "0.4"

@@ -57,6 +57,9 @@ grep -qF 'crypto.getRandomValues' demo-frontend/src/wallet.js
 step "Current eight-public-input vectors through the vendored Motoko verifier"
 node scripts/verify-current-groth16.mjs
 
+step "Second-implementation cross-oracle: blst verdict agreement"
+cargo test --quiet --release -p cross_oracle
+
 step "Independent Motoko arithmetic, subgroup, pairing, and wire oracles"
 for test in CurveJacTest.mo Groth16MultiTest.mo WireTest.mo; do
   "$MOC" -r --package core "$CORE" "$VLAB/$test"
