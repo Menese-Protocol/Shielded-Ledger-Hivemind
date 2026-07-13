@@ -1,0 +1,10 @@
+/.dfx/
+/.mops/
+/target/
+/circuit/target/
+/e2e-result.json
+__pycache__/
+node_modules/
+!/vendor/verifier/verifier.wasm
+!/vendor/tree_oracle/tree_oracle.wasm
+!/vendor/tree_oracle_bls/tree_oracle_bls.wasm

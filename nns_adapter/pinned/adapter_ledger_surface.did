@@ -1,0 +1,89 @@
+// Exact projection of the NNS ICP ledger methods consumed by the adapter.
+// Source: dfinity/ic c6a37193d91ddad3254fccce83fff18809fbbc1d,
+// rs/ledger_suite/icp/ledger.did.
+type Tokens = record { e8s : nat64 };
+type TimeStamp = record { timestamp_nanos : nat64 };
+type AccountIdentifier = blob;
+type BlockIndex = nat64;
+type Memo = nat64;
+type Transaction = record {
+  memo : Memo;
+  icrc1_memo : opt blob;
+  operation : opt Operation;
+  created_at_time : TimeStamp;
+};
+type Operation = variant {
+  Mint : record { to : AccountIdentifier; amount : Tokens };
+  Burn : record {
+    from : AccountIdentifier;
+    spender : opt AccountIdentifier;
+    amount : Tokens;
+  };
+  Transfer : record {
+    from : AccountIdentifier;
+    to : AccountIdentifier;
+    amount : Tokens;
+    fee : Tokens;
+    spender : opt vec nat8;
+  };
+  Approve : record {
+    from : AccountIdentifier;
+    spender : AccountIdentifier;
+    allowance_e8s : int;
+    allowance : Tokens;
+    fee : Tokens;
+    expires_at : opt TimeStamp;
+    expected_allowance : opt Tokens;
+  };
+};
+type Block = record {
+  parent_hash : opt blob;
+  transaction : Transaction;
+  timestamp : TimeStamp;
+};
+type GetBlocksArgs = record { start : BlockIndex; length : nat64 };
+type BlockRange = record { blocks : vec Block };
+type QueryArchiveError = variant {
+  BadFirstBlockIndex : record {
+    requested_index : BlockIndex;
+    first_valid_index : BlockIndex;
+  };
+  Other : record { error_code : nat64; error_message : text };
+};
+type QueryArchiveResult = variant { Ok : BlockRange; Err : QueryArchiveError };
+type QueryArchiveFn = func (GetBlocksArgs) -> (QueryArchiveResult) query;
+type ArchivedBlocksRange = record {
+  start : BlockIndex;
+  length : nat64;
+  callback : QueryArchiveFn;
+};
+type QueryBlocksResponse = record {
+  chain_length : nat64;
+  certificate : opt blob;
+  blocks : vec Block;
+  first_block_index : BlockIndex;
+  archived_blocks : vec ArchivedBlocksRange;
+};
+type ArchivedEncodedBlocksRange = record {
+  callback : func (GetBlocksArgs) ->
+    (variant { Ok : vec blob; Err : QueryArchiveError }) query;
+  start : nat64;
+  length : nat64;
+};
+type QueryEncodedBlocksResponse = record {
+  certificate : opt blob;
+  blocks : vec blob;
+  chain_length : nat64;
+  first_block_index : nat64;
+  archived_blocks : vec ArchivedEncodedBlocksRange;
+};
+type Archives = record { archives : vec record { canister_id : principal } };
+type TipOfChainRes = record { certification : opt blob; tip_index : BlockIndex };
+service : {
+  query_blocks : (GetBlocksArgs) -> (QueryBlocksResponse) query;
+  query_encoded_blocks : (GetBlocksArgs) -> (QueryEncodedBlocksResponse) query;
+  archives : () -> (Archives) query;
+  icrc1_decimals : () -> (nat8) query;
+  icrc1_fee : () -> (nat) query;
+  tip_of_chain : () -> (TipOfChainRes) query;
+}

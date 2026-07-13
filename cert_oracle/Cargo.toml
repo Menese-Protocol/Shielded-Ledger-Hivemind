@@ -1,0 +1,21 @@
+[package]
+name = "cert_oracle"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "cert-oracle"
+path = "src/main.rs"
+
+[dependencies]
+candid = "0.10"
+hex = "0.4"
+ic-agent = { version = "=0.48.1", default-features = false }
+ic-cbor = "=3.2.0"
+ic-certificate-verification = "=3.2.0"
+ic-certification = "=3.2.0"
+leb128 = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

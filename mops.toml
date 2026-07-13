@@ -1,0 +1,7 @@
+[package]
+name = "zk-ledger-poc"
+version = "0.1.0"
+description = "Sandbox shielded ICRC-3 companion ledger"
+
+[dependencies]
+sha2 = "0.1.9"

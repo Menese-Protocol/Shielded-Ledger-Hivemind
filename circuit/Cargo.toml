@@ -1,0 +1,34 @@
+[workspace]
+members = ["common", "gen"]
+resolver = "2"
+
+[workspace.dependencies]
+ark-ff = "0.5"
+ark-ec = "0.5"
+ark-bn254 = "0.5"
+ark-bls12-381 = "0.5"
+ark-groth16 = { version = "0.5", default-features = false }
+ark-relations = "0.5"
+ark-r1cs-std = "0.5"
+ark-snark = "0.5"
+ark-serialize = "0.5"
+ark-std = "0.5"
+ark-crypto-primitives = { version = "0.5", features = ["sponge", "r1cs"] }
+hex = "0.4"
+
+# Bulletproofs (transparent, no trusted setup) — comparison controls for the frozen
+# bn254-era fixtures. v4.0.0 is pinned to the curve25519-dalek-ng fork; use its own
+# types on both sides.
+bulletproofs = "4"
+curve25519-dalek-ng = "4"
+merlin = "3"
+rand = "0.8"
+
+# hash-cost comparison controls for the tree-hash choice
+sha2 = { version = "0.10", default-features = false }
+blake3 = { version = "1", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

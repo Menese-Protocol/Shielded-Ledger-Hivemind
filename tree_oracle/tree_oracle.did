@@ -1,0 +1,16 @@
+type TreeState = record {
+  filled : vec text;
+  root : text;
+  next_index : nat64;
+};
+
+type Transition = record {
+  state : opt TreeState;
+  error : opt text;
+};
+
+service : {
+  empty : () -> (Transition);
+  append : (TreeState, vec text) -> (Transition);
+};
+

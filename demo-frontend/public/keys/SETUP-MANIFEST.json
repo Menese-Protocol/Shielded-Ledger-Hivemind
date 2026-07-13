@@ -1,0 +1,14 @@
+{
+  "format": 1,
+  "proof_system": "Groth16",
+  "curve": "BLS12-381",
+  "setup_mode": "os-csprng-single-party",
+  "publicly_reproducible_toxic_waste": false,
+  "multi_party_ceremony": false,
+  "real_value_eligible": false,
+  "transfer_pk_sha256": "c78f65a8a032113ad1d405e3a65e15e972c13b5c455bf0768245cabb424eace5",
+  "transfer_vk_sha256": "c5ea9d4ce2fcf033c5e46e3aca784e00941acb779907555c11cf56392e367be1",
+  "deposit_pk_sha256": "2897a455aba5fd4ee3205374f167ce4c7adbc5bb270e0b3ad037f3fe16e2294d",
+  "deposit_vk_sha256": "6db0a81374e73d4166f72f1c4e188e7ca09f394597090cc56151327ddaad6350",
+  "warning": "A production keyset requires a separately verified multi-party ceremony transcript."
+}

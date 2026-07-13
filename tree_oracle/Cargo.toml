@@ -1,0 +1,18 @@
+[package]
+name = "tree_oracle"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+common = { path = "../vendor/tree_common" }
+ark-bn254 = "0.5"
+ark-bls12-381 = { version = "0.5", optional = true }
+ic-cdk = "0.17"
+candid = "0.10"
+serde = { version = "1", features = ["derive"] }
+
+[features]
+bls12-381 = ["common/bls12-381", "dep:ark-bls12-381"]

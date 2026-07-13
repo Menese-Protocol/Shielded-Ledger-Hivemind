@@ -1,0 +1,52 @@
+{
+  "version": 1,
+  "defaults": {
+    "build": {
+      "packtool": "mops sources"
+    }
+  },
+  "canisters": {
+    "zk_verifier": {
+      "type": "custom",
+      "candid": "vendor/verifier/verifier.did",
+      "wasm": "vendor/verifier/verifier.wasm"
+    },
+    "tree_oracle": {
+      "type": "custom",
+      "candid": "vendor/tree_oracle_bls/tree_oracle_bls.did",
+      "wasm": "vendor/tree_oracle_bls/tree_oracle_bls.wasm"
+    },
+    "zk_ledger": {
+      "type": "motoko",
+      "main": "src/Main.mo"
+    },
+    "stable_storage_test": {
+      "type": "motoko",
+      "main": "tests/Gate3StableTest.mo"
+    },
+    "icp_ledger_fixture": {
+      "type": "motoko",
+      "main": "tests/IcpLedgerFixture.mo"
+    },
+    "nns_archive_fixture": {
+      "type": "motoko",
+      "main": "tests/NnsArchiveFixture.mo"
+    },
+    "nns_adapter": {
+      "type": "custom",
+      "candid": "nns_adapter/nns_adapter.did",
+      "wasm": "nns_adapter/target/wasm32-unknown-unknown/release/nns_adapter.wasm"
+    },
+    "nns_adapter_metadata_probe": {
+      "type": "custom",
+      "candid": "nns_adapter/nns_adapter.did",
+      "wasm": "nns_adapter/target/wasm32-unknown-unknown/release/nns_adapter.wasm"
+    }
+  },
+  "networks": {
+    "local": {
+      "bind": "127.0.0.1:4945",
+      "type": "ephemeral"
+    }
+  }
+}

@@ -1,0 +1,18 @@
+[workspace]
+members = ["tree_oracle", "icrc3_oracle", "cert_oracle", "vendor/tree_common"]
+resolver = "2"
+
+[workspace.dependencies]
+ark-ff = "0.5"
+ark-bn254 = "0.5"
+ark-bls12-381 = "0.5"
+ark-relations = "0.5"
+ark-r1cs-std = "0.5"
+ark-serialize = "0.5"
+ark-std = "0.5"
+ark-crypto-primitives = { version = "0.5", features = ["sponge", "r1cs"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

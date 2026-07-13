@@ -1,0 +1,17 @@
+{
+  "demo_directory": {
+    "ic": "gvlus-biaaa-aaaau-ag3aa-cai"
+  },
+  "demo_frontend": {
+    "ic": "nl5gm-2aaaa-aaaau-ag27q-cai"
+  },
+  "demo_token": {
+    "ic": "nm4ay-xyaaa-aaaau-ag27a-cai"
+  },
+  "tree_oracle": {
+    "ic": "nc6nq-miaaa-aaaau-ag26a-cai"
+  },
+  "zk_ledger": {
+    "ic": "nf7le-bqaaa-aaaau-ag26q-cai"
+  }
+}

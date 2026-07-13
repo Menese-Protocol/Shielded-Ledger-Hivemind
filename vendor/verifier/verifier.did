@@ -1,0 +1,12 @@
+type VerifyResult = record {
+  accepted : bool;
+  verify_instructions : nat64;
+  deserialize_instructions : nat64;
+};
+
+service : {
+  poseidon_compressions : (nat32) -> (nat64, nat64);
+  verify_bn254 : (text, text, text) -> (VerifyResult);
+  verify_bls12381 : (text, text, text) -> (VerifyResult);
+  try_verify_bn254 : (text, text, text) -> (text);
+}

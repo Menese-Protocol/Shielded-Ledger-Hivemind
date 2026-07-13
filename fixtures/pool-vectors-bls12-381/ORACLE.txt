@@ -1,0 +1,19 @@
+SETUP-MODE insecure-deterministic-test
+SETUP-WARNING PUBLIC FIXED SEED; TEST VECTORS ONLY; DEPLOYMENT FORBIDDEN
+TREE-XCHECK incremental==dense OK
+TRANSFER-CIRCUIT constraints=20146 witnesses=20213 publics=8
+PROVE-TIME transfer circuit (native, single-thread arkworks) = 1273 ms
+P0 transfer valid-proof            -> ACCEPT
+C1 transfer forged-proof(bitflip)  -> REJECT (deserialize-or-pairing)
+C4a transfer tampered-fee          -> REJECT (pairing)
+C4b transfer tampered-recipient    -> REJECT (pairing)
+C2 transfer fabricated-tree proof  -> pairing ACCEPTS; canister MUST reject on unknown anchor
+A1 imbalanced witness (+1 out)     -> UNSATISFIABLE (cannot construct a proof)
+A2a negative-value mint vs NO-RANGE variant -> SATISFIED (vulnerability demonstrated)
+A2b same attack vs REAL circuit    -> UNSATISFIABLE (S3 range check is load-bearing)
+P1 withdraw valid-proof            -> ACCEPT (v_pub_out=90, fee=5)
+P0d deposit valid-proofs x2        -> ACCEPT
+C6 deposit amount-lie              -> REJECT (pairing)
+PK-EMIT transfer_pk.bin 12853104 bytes, deposit_pk.bin 449040 bytes (same setup as the pinned vks)
+SETUP-MANIFEST key hashes + eligibility written
+MOTOKO-EMIT uncompressed affine vectors written (verdicts as asserted above)

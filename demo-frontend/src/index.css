@@ -1,0 +1,55 @@
+@import "@fontsource/unbounded/500.css";
+@import "@fontsource/unbounded/700.css";
+@import "@fontsource/inter/400.css";
+@import "@fontsource/inter/500.css";
+@import "@fontsource/inter/600.css";
+@import "@fontsource/jetbrains-mono/400.css";
+@import "@fontsource/jetbrains-mono/500.css";
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root { color-scheme: light; }
+
+body {
+  margin: 0;
+  color: #17203d;
+  font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+  background:
+    radial-gradient(900px 560px at 86% -8%, rgba(148, 116, 255, 0.24), transparent 68%),
+    radial-gradient(760px 520px at -4% 32%, rgba(68, 199, 246, 0.18), transparent 66%),
+    radial-gradient(780px 520px at 65% 108%, rgba(255, 194, 104, 0.15), transparent 64%),
+    linear-gradient(145deg, #fbfcff 0%, #f4f2ff 50%, #f8fbff 100%);
+  background-attachment: fixed;
+  min-height: 100vh;
+}
+
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  opacity: .35;
+  background-image: linear-gradient(rgba(104, 71, 245, .035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(104, 71, 245, .035) 1px, transparent 1px);
+  background-size: 40px 40px;
+  mask-image: linear-gradient(to bottom, black, transparent 72%);
+}
+
+.hexwrap { word-break: break-all; }
+.scroll-thin::-webkit-scrollbar { width: 8px; height: 8px; }
+.scroll-thin::-webkit-scrollbar-thumb { background: #cbd0e5; border-radius: 4px; }
+
+button:focus-visible, input:focus-visible, a:focus-visible {
+  outline: 2px solid #6847f5;
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

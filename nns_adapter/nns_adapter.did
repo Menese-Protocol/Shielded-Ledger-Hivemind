@@ -1,0 +1,74 @@
+type Value = variant {
+  Blob : blob;
+  Text : text;
+  Nat : nat;
+  Int : int;
+  Array : vec Value;
+  Map : vec record { text; Value };
+};
+type Account = record { owner : principal; subaccount : opt blob };
+type TransactionHint = record {
+  block_index : nat64;
+  btype : text;
+  from : Account;
+  to : opt Account;
+  spender : opt Account;
+  amount : nat64;
+  effective_fee : nat64;
+  fee_was_supplied : bool;
+  memo : opt blob;
+  created_at_time : opt nat64;
+  expected_allowance : opt nat64;
+  expires_at : opt nat64;
+};
+type Result = variant { ok : text; err : text };
+type Metadata = record {
+  configured : bool;
+  ledger : opt principal;
+  fee : opt nat;
+  decimals : opt nat8;
+  source_blocks : nat;
+  translated_blocks : nat;
+  registered_accounts : nat;
+  registered_hints : nat;
+};
+type SyncReport = record {
+  source_blocks : nat;
+  translated_blocks : nat;
+  archive_ranges : nat;
+  encoded_roundtrips : nat;
+  candid_semantic_matches : nat;
+  source_tip_hash : opt blob;
+};
+type SyncResult = variant { ok : SyncReport; err : text };
+type GetBlocksArgs = record { start : nat; length : nat };
+type BlockWithId = record { id : nat; block : Value };
+type GetBlocksResult = record {
+  log_length : nat;
+  blocks : vec BlockWithId;
+  archived_blocks : vec record {
+    args : vec GetBlocksArgs;
+    callback : func (vec GetBlocksArgs) -> (GetBlocksResult) query;
+  };
+};
+type DataCertificate = record { certificate : blob; hash_tree : blob };
+type AuditBinding = record {
+  adapter_tip_index : opt nat;
+  adapter_tip_hash : opt blob;
+  source_tip_hash : opt blob;
+  source_ledger : opt principal;
+};
+service : {
+  configure : (principal) -> (Result);
+  register_account : (Account) -> (Result);
+  register_transaction_hint : (TransactionHint) -> (Result);
+  sync : () -> (SyncResult);
+  metadata : () -> (Metadata) query;
+  audit_binding : () -> (AuditBinding) query;
+  icrc3_get_blocks : (vec GetBlocksArgs) -> (GetBlocksResult) query;
+  icrc3_get_tip_certificate : () -> (opt DataCertificate) query;
+  icrc3_get_archives : (record { from : opt principal }) ->
+    (vec record { canister_id : principal; start : nat; end : nat }) query;
+  icrc3_supported_block_types : () ->
+    (vec record { block_type : text; url : text }) query;
+}

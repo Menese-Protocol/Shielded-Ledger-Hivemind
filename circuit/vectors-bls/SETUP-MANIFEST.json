@@ -1,0 +1,14 @@
+{
+  "format": 1,
+  "proof_system": "Groth16",
+  "curve": "BLS12-381",
+  "setup_mode": "insecure-deterministic-test",
+  "publicly_reproducible_toxic_waste": true,
+  "multi_party_ceremony": false,
+  "real_value_eligible": false,
+  "transfer_pk_sha256": "bdd321778c6e1050a094accb8dafff466cc56dfc2727aa9c64c02ec27ff0d1fe",
+  "transfer_vk_sha256": "aa9436a48912c4f01ce56d9a8fc497af053db6255460a7ccb6fa226918308811",
+  "deposit_pk_sha256": "a1b7d251b7aacc329d7effe292244c88b341b764222a2c7374d5a8337284b804",
+  "deposit_vk_sha256": "cd047620dc693e8ce0f7934dc84c19779892e8a6cac8083ca72c57de3c311e8c",
+  "warning": "A production keyset requires a separately verified multi-party ceremony transcript."
+}

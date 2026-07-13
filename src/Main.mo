@@ -1,0 +1,1744 @@
+/// Sandbox ZK-ledger integration PoC.
+///
+/// Motoko owns the append-only opaque-note log, historical roots, nullifier set, certified root,
+/// and PIR. Proof verdicts come from the IN-PROCESS Motoko Groth16 verifier over BLS12-381
+/// (`src/groth16/`, vendored from `verifier-lab/`; oracle-gated against arkworks at every layer and
+/// measured at 12.6B/10.1B instructions per verify, inside the 40B message budget). The verify
+/// is no longer an inter-canister await, so no state-change window exists between the guards and
+/// the verdict. Circuit-native Poseidon transitions still come from the stateless tree adapter.
+
+import Array "mo:core/Array";
+import Blob "mo:core/Blob";
+import CertifiedData "mo:core/CertifiedData";
+import Char "mo:core/Char";
+import Error "mo:core/Error";
+import Int "mo:core/Int";
+import List "mo:core/List";
+import Nat "mo:core/Nat";
+import Nat32 "mo:core/Nat32";
+import Nat64 "mo:core/Nat64";
+import Nat8 "mo:core/Nat8";
+import Principal "mo:core/Principal";
+import Runtime "mo:core/Runtime";
+import Text "mo:core/Text";
+import Time "mo:core/Time";
+import Prim "mo:⛔";
+import CertifiedTuple "CertifiedTuple";
+import Groth16Multi "groth16/Groth16Multi";
+import Groth16Wire "groth16/Groth16Wire";
+import ICRC1Block "ICRC1Block";
+import ICRC2 "ICRC2";
+import ICRC2Block "ICRC2Block";
+import ICRC3 "ICRC3";
+import NoteCodec "NoteCodec";
+import StableBlobSet "StableBlobSet";
+import StableLog "StableLog";
+
+persistent actor ZkLedger {
+  public type Result<T> = { #ok : T; #err : Text };
+
+  public type MeteredVerify = {
+    accepted : Bool;
+    verify_instructions : Nat64;
+    deserialize_instructions : Nat64;
+  };
+  public type TreeState = {
+    filled : [Text];
+    root : Text;
+    next_index : Nat64;
+  };
+  public type TreeTransition = {
+    state : ?TreeState;
+    error : ?Text;
+  };
+  type TreeOracle = actor {
+    empty : shared () -> async TreeTransition;
+    append : shared (TreeState, [Text]) -> async TreeTransition;
+  };
+  type TransferLedger = actor {
+    icrc1_transfer : shared ICRC2.TransferArg -> async ICRC2.TransferResult;
+    icrc2_transfer_from : shared ICRC2.TransferFromArgs -> async ICRC2.TransferFromResult;
+    icrc1_fee : shared query () -> async Nat;
+    icrc1_decimals : shared query () -> async Nat8;
+  };
+  type HistoryAdapter = actor {
+    icrc3_get_blocks : shared query ([ICRC2.GetBlocksArgs]) -> async ICRC2.GetBlocksResult;
+  };
+
+  public type NoteOrigin = NoteCodec.NoteOrigin;
+  type ShieldedNoteBlock = NoteCodec.ShieldedNoteBlock;
+  public type Block = { id : Nat; block : ICRC3.Value };
+  public type GetBlocksArgs = { start : Nat; length : Nat };
+  public type GetBlocksResult = {
+    log_length : Nat;
+    blocks : [Block];
+    archived_blocks : [ArchivedBlocks];
+  };
+  public type GetBlocksCallback = shared query ([GetBlocksArgs]) -> async GetBlocksResult;
+  public type ArchivedBlocks = { args : [GetBlocksArgs]; callback : GetBlocksCallback };
+  public type GetArchivesArgs = { from : ?Principal };
+  public type ArchiveInfo = { canister_id : Principal; start : Nat; end : Nat };
+
+  public type DepositArgs = {
+    value : Nat64;
+    from_subaccount : ?Blob;
+    created_at_time : Nat64;
+    client_nonce : Blob;
+    commitment : Blob;
+    ephemeral_key : Blob;
+    note_ciphertext : Blob;
+    proof_hex : Text;
+  };
+  public type OutputRecord = {
+    commitment : Blob;
+    ephemeral_key : Blob;
+    note_ciphertext : Blob;
+  };
+  public type TransferArgs = {
+    anchor : Blob;
+    nullifier_1 : Blob;
+    nullifier_2 : Blob;
+    output_1 : OutputRecord;
+    output_2 : OutputRecord;
+    fee : Nat64;
+    v_pub_out : Nat64;
+    recipient : ?ICRC2.Account;
+    created_at_time : ?Nat64;
+    proof_hex : Text;
+  };
+  public type MutationResult = {
+    outcome : Text;
+    verifier_outcome : Text;
+    note_root : Blob;
+    note_count : Nat;
+    nullifier_count : Nat;
+    pool_value : Nat;
+    epoch : Nat;
+  };
+
+  public type LedgerStatus = {
+    configured : Bool;
+    note_root : Blob;
+    note_count : Nat;
+    log_length : Nat;
+    nullifier_count : Nat;
+    historical_root_count : Nat;
+    pool_value : Nat;
+    epoch : Nat;
+    tree_state : ?TreeState;
+    transfer_statement_version : Nat;
+  };
+  public type StorageStatus = {
+    layout_version : Nat;
+    note_entries : Nat;
+    note_bytes : Nat;
+    note_digest : Blob;
+    root_entries : Nat;
+    root_capacity : Nat;
+    root_region_bytes : Nat;
+    root_digest : Blob;
+    nullifier_entries : Nat;
+    nullifier_capacity : Nat;
+    nullifier_region_bytes : Nat;
+    nullifier_digest : Blob;
+    completed_shield_entries : Nat;
+    completed_shield_capacity : Nat;
+    completed_shield_region_bytes : Nat;
+    completed_shield_digest : Blob;
+    completed_unshield_entries : Nat;
+    completed_unshield_capacity : Nat;
+    completed_unshield_region_bytes : Nat;
+    completed_unshield_digest : Blob;
+  };
+  public type PendingShield = {
+    intent_id : Blob;
+    caller : Principal;
+    output : OutputRecord;
+    value : Nat64;
+    transfer_args : ICRC2.TransferFromArgs;
+    anchor_before : Blob;
+    root_after : Blob;
+    next_tree : TreeState;
+    base_epoch : Nat;
+    verifier_outcome : Text;
+    attempts : Nat;
+    // Token-ledger log length captured BEFORE the token call. Recovery scans blocks from here for a
+    // 2xfer carrying memo == intent_id, so it reconciles by idempotency key rather than by the
+    // ICRC-2 dedup cache — which expires after the ledger's transaction window and, once expired,
+    // would strand a trapped-after-transfer shield (money in pool, no note) permanently.
+    ledger_tip_before : Nat;
+  };
+  public type PendingUnshield = {
+    intent_id : Blob;
+    caller : Principal;
+    output_1 : OutputRecord;
+    output_2 : OutputRecord;
+    nullifier_1 : Blob;
+    nullifier_2 : Blob;
+    transfer_args : ICRC2.TransferArg;
+    recipient_binding : Blob;
+    public_value : Nat64;
+    pool_debit : Nat;
+    anchor_before : Blob;
+    root_after : Blob;
+    next_tree : TreeState;
+    base_epoch : Nat;
+    verifier_outcome : Text;
+    attempts : Nat;
+    ledger_tip_before : Nat;
+  };
+  public type AtomicityStatus = {
+    token_configured : Bool;
+    token_ledger : ?Principal;
+    history_adapter : ?Principal;
+    transparent_ledger_fee : Nat;
+    transparent_ledger_decimals : Nat8;
+    pool_account : ICRC2.Account;
+    pending : ?PendingShield;
+    pending_unshield : ?PendingUnshield;
+    completed_intents : Nat;
+    completed_intent_digest : Blob;
+    completed_unshield_intents : Nat;
+    completed_unshield_intent_digest : Blob;
+    test_fault_armed : Bool;
+  };
+  public type CertifiedSnapshot = {
+    last_block_index : ?Nat;
+    last_block_hash : ?Blob;
+    note_root : Blob;
+    note_count : Nat;
+    encoding_version : Nat;
+    archive_manifest : Blob;
+    certificate : ?Blob;
+    hash_tree : Blob;
+  };
+  public type DataCertificate = { certificate : Blob; hash_tree : Blob };
+
+  public type LweCiphertext = { a : [Nat64]; b : Nat64 };
+  public type LwePirArgs = { selectors : [LweCiphertext] };
+  public type LweQueryTrace = {
+    records_scanned : Nat;
+    selectors_received : Nat;
+    lwe_dimension : Nat;
+    output_bits : Nat;
+    selector_decryptions : Nat;
+    target_index_parameters : Nat;
+    target_dependent_branches : Nat;
+    instructions : Nat64;
+  };
+  public type LwePirResponse = {
+    ciphertexts : [LweCiphertext];
+    trace : LweQueryTrace;
+    snapshot_root : Blob;
+  };
+
+  let ENCODING_VERSION : Nat = 1;
+  let STABLE_LAYOUT_VERSION : Nat = 1;
+  let LWE_DIMENSION : Nat = 630;
+  let RECORD_BITS : Nat = 256;
+  let BIT_SHIFTS : [Nat] = [7, 6, 5, 4, 3, 2, 1, 0];
+
+  var configuring : Bool = false;
+  var administrator : ?Principal = null;
+  var verifier_id : ?Principal = null;
+  var tree_oracle_id : ?Principal = null;
+  var token_ledger_id : ?Principal = null;
+  var history_adapter_id : ?Principal = null;
+  var token_configuring : Bool = false;
+  var transparent_ledger_fee : Nat = 0;
+  var transparent_ledger_decimals : Nat8 = 0;
+  var pool_subaccount : ?Blob = null;
+  var transfer_vk_hex : Text = "";
+  var deposit_vk_hex : Text = "";
+  // Parsed + prepared ONCE at configure (subgroup-validated, fixed pairs precomputed) — the
+  // per-proof path never re-validates the vk. Stable: survives upgrades with the hexes.
+  var transfer_vk_prepared : ?Groth16Multi.PreparedVk = null;
+  var deposit_vk_prepared : ?Groth16Multi.PreparedVk = null;
+  var tree_state : ?TreeState = null;
+  var note_root : Blob = "";
+  let historical_roots = StableBlobSet.newState();
+  let spent_nullifiers = StableBlobSet.newState();
+  let completed_shield_intents = StableBlobSet.newState();
+  let completed_unshield_intents = StableBlobSet.newState();
+  let note_log = StableLog.newState();
+  var last_block_hash : ?Blob = null;
+  var pool_value : Nat = 0;
+  var epoch : Nat = 0;
+  var pending_shield : ?PendingShield = null;
+  var pending_unshield : ?PendingUnshield = null;
+  // An upgraded v1 deployment remains locked until the administrator rotates the transfer VK.
+  // A fresh configure() installs the recipient-bound v2 statement immediately.
+  var transfer_statement_version : Nat = 1;
+  var test_fail_after_token_once : Bool = false;
+  let stable_layout_version : Nat = STABLE_LAYOUT_VERSION;
+
+  StableBlobSet.ensureInit(historical_roots);
+  StableBlobSet.ensureInit(spent_nullifiers);
+  StableBlobSet.ensureInit(completed_shield_intents);
+  StableBlobSet.ensureInit(completed_unshield_intents);
+  StableLog.ensureInit(note_log);
+
+  func noteCount() : Nat { StableLog.size(note_log) };
+  func rootCount() : Nat { StableBlobSet.size(historical_roots) };
+  func nullifierCount() : Nat { StableBlobSet.size(spent_nullifiers) };
+  func completedShieldCount() : Nat { StableBlobSet.size(completed_shield_intents) };
+  func completedUnshieldCount() : Nat { StableBlobSet.size(completed_unshield_intents) };
+
+  func selfPrincipal() : Principal { Principal.fromActor(ZkLedger) };
+  func poolAccount() : ICRC2.Account { { owner = selfPrincipal(); subaccount = pool_subaccount } };
+  func tokenConfigured() : Bool { token_ledger_id != null and history_adapter_id != null };
+
+  func isAdministrator(caller : Principal) : Bool {
+    switch (administrator) { case (?value) Principal.equal(value, caller); case null false }
+  };
+
+  func tokenActor() : TransferLedger {
+    switch (token_ledger_id) {
+      case (?id) actor (Principal.toText(id));
+      case null Runtime.trap("unconfigured token ledger");
+    }
+  };
+
+  func historyActor() : HistoryAdapter {
+    switch (history_adapter_id) {
+      case (?id) actor (Principal.toText(id));
+      case null Runtime.trap("unconfigured history adapter");
+    }
+  };
+
+  func shieldIntentId(caller : Principal, args : DepositArgs) : Blob {
+    let entries = List.empty<(Text, ICRC3.Value)>();
+    List.add(entries, ("domain", #Text("zk-ledger/icrc2-shield/v1")));
+    List.add(entries, ("caller", #Blob(Principal.toBlob(caller))));
+    switch (args.from_subaccount) {
+      case (?value) List.add(entries, ("from_subaccount", #Blob(value)));
+      case null {};
+    };
+    List.add(entries, ("created_at_time", #Nat(Nat64.toNat(args.created_at_time))));
+    List.add(entries, ("client_nonce", #Blob(args.client_nonce)));
+    List.add(entries, ("value", #Nat(Nat64.toNat(args.value))));
+    List.add(entries, ("commitment", #Blob(args.commitment)));
+    List.add(entries, ("ephemeral_key", #Blob(args.ephemeral_key)));
+    List.add(entries, ("note_ciphertext", #Blob(args.note_ciphertext)));
+    switch (token_ledger_id) {
+      case (?id) List.add(entries, ("token_ledger", #Blob(Principal.toBlob(id))));
+      case null {};
+    };
+    List.add(entries, ("pool_owner", #Blob(Principal.toBlob(selfPrincipal()))));
+    switch (pool_subaccount) {
+      case (?value) List.add(entries, ("pool_subaccount", #Blob(value)));
+      case null {};
+    };
+    ICRC3.hashValue(#Map(List.toArray(entries)))
+  };
+
+  func zeroField() : Blob { Blob.fromArray(Array.repeat<Nat8>(0, 32)) };
+
+  /// Canonical recipient commitment used as the eighth Groth16 public input. Hashing includes
+  /// the pool and token canisters, so a proof cannot be replayed into another pool or asset. The
+  /// high byte is cleared because field wire encoding is little-endian and 31 bytes are safely
+  /// below the BLS12-381 scalar modulus.
+  func recipientBindingValue(recipient : ICRC2.Account) : Result<Blob> {
+    switch (recipient.subaccount) {
+      case (?value) { if (value.size() != 32) return #err("REJECT:recipient-subaccount-length") };
+      case null {};
+    };
+    let token = switch (token_ledger_id) {
+      case (?value) value;
+      case null return #err("REJECT:token-unconfigured");
+    };
+    let entries = List.empty<(Text, ICRC3.Value)>();
+    List.add(entries, ("domain", #Text("picp-unshield-recipient/v1")));
+    List.add(entries, ("pool", #Blob(Principal.toBlob(selfPrincipal()))));
+    List.add(entries, ("token", #Blob(Principal.toBlob(token))));
+    List.add(entries, ("owner", #Blob(Principal.toBlob(recipient.owner))));
+    switch (recipient.subaccount) {
+      case (?value) List.add(entries, ("subaccount", #Blob(value)));
+      case null {};
+    };
+    let digest = Blob.toArray(ICRC3.hashValue(#Map(List.toArray(entries))));
+    if (digest.size() != 32) return #err("REJECT:recipient-binding-hash");
+    let field = Prim.Array_init<Nat8>(32, 0);
+    var i : Nat = 0;
+    while (i < 31) {
+      field[i] := digest[i];
+      i += 1;
+    };
+    #ok(Blob.fromArray(Array.fromVarArray(field)))
+  };
+
+  func unshieldIntentId(caller : Principal, args : TransferArgs, binding : Blob) : Blob {
+    let entries = List.empty<(Text, ICRC3.Value)>();
+    List.add(entries, ("domain", #Text("zk-ledger/icrc1-unshield/v1")));
+    List.add(entries, ("caller", #Blob(Principal.toBlob(caller))));
+    List.add(entries, ("anchor", #Blob(args.anchor)));
+    List.add(entries, ("nullifier_1", #Blob(args.nullifier_1)));
+    List.add(entries, ("nullifier_2", #Blob(args.nullifier_2)));
+    List.add(entries, ("output_1", #Blob(args.output_1.commitment)));
+    List.add(entries, ("output_2", #Blob(args.output_2.commitment)));
+    List.add(entries, ("fee", #Nat(Nat64.toNat(args.fee))));
+    List.add(entries, ("public_value", #Nat(Nat64.toNat(args.v_pub_out))));
+    List.add(entries, ("recipient_binding", #Blob(binding)));
+    switch (args.created_at_time) {
+      case (?value) List.add(entries, ("created_at_time", #Nat(Nat64.toNat(value))));
+      case null {};
+    };
+    ICRC3.hashValue(#Map(List.toArray(entries)))
+  };
+
+  func decodeBlockAt(index : Nat) : Result<ShieldedNoteBlock> {
+    let encoded = switch (StableLog.get(note_log, index)) {
+      case (?value) value;
+      case null return #err("stable-state:missing-note");
+    };
+    switch (NoteCodec.decode(encoded)) {
+      case (#ok(block)) #ok(block);
+      case (#err(message)) #err(message);
+    }
+  };
+
+  func blockAt(index : Nat) : ShieldedNoteBlock {
+    switch (decodeBlockAt(index)) {
+      case (#ok(block)) block;
+      case (#err(message)) Runtime.trap(message);
+    }
+  };
+
+  func addRoot(root : Blob) {
+    switch (StableBlobSet.put(historical_roots, root)) {
+      case (#ok(_)) {};
+      case (#err(message)) Runtime.trap(message);
+    }
+  };
+
+  func addNullifier(nullifier : Blob) {
+    switch (StableBlobSet.put(spent_nullifiers, nullifier)) {
+      case (#ok(true)) {};
+      case (#ok(false)) Runtime.trap("stable-state:duplicate-nullifier-commit");
+      case (#err(message)) Runtime.trap(message);
+    }
+  };
+
+  func archiveManifest() : Blob { ICRC3.hashValue(#Array([])) };
+
+  func certifiedTuple() : CertifiedTuple.Tuple {
+    let index : ?Nat = switch (noteCount()) {
+      case 0 null;
+      case size ?Nat.sub(size, 1);
+    };
+    {
+      last_block_index = index;
+      last_block_hash;
+      note_count = noteCount();
+      note_root;
+      encoding_version = ENCODING_VERSION;
+      archive_manifest = archiveManifest();
+    }
+  };
+
+  func certifiedTree() : CertifiedTuple.HashTree { CertifiedTuple.build(certifiedTuple()) };
+
+  func refreshCertification() {
+    CertifiedData.set(CertifiedTuple.digest(certifiedTree()));
+  };
+
+  func validateStableState() : Result<()> {
+    if (stable_layout_version != STABLE_LAYOUT_VERSION) {
+      return #err("stable-state:layout-version");
+    };
+    switch (StableLog.validate(note_log)) {
+      case (#err(message)) return #err(message);
+      case (#ok(_)) {};
+    };
+    switch (StableBlobSet.validate(historical_roots)) {
+      case (#err(message)) return #err("roots:" # message);
+      case (#ok(_)) {};
+    };
+    switch (StableBlobSet.validate(spent_nullifiers)) {
+      case (#err(message)) return #err("nullifiers:" # message);
+      case (#ok(_)) {};
+    };
+    switch (StableBlobSet.validate(completed_shield_intents)) {
+      case (#err(message)) return #err("completed-shields:" # message);
+      case (#ok(_)) {};
+    };
+    switch (StableBlobSet.validate(completed_unshield_intents)) {
+      case (#err(message)) return #err("completed-unshields:" # message);
+      case (#ok(_)) {};
+    };
+    if (transfer_statement_version != 1 and transfer_statement_version != 2) {
+      return #err("stable-state:transfer-statement-version");
+    };
+
+    var expected_parent : ?Blob = null;
+    var index : Nat = 0;
+    while (index < noteCount()) {
+      let encoded = switch (StableLog.get(note_log, index)) {
+        case (?value) value;
+        case null return #err("stable-state:missing-note");
+      };
+      let block = switch (NoteCodec.decode(encoded)) {
+        case (#ok(value)) value;
+        case (#err(message)) return #err(message);
+      };
+      if (block.btype != "zknote1" or block.encoding_version != ENCODING_VERSION) {
+        return #err("stable-state:block-domain");
+      };
+      if (block.note_position != index) return #err("stable-state:note-position");
+      if (block.phash != expected_parent) return #err("stable-state:phash");
+      if (not fieldSized(block.commitment) or not fieldSized(block.anchor_before) or
+          not fieldSized(block.note_root_after)) {
+        return #err("stable-state:block-field-length");
+      };
+      if (not StableBlobSet.contains(historical_roots, block.note_root_after)) {
+        return #err("stable-state:missing-historical-root");
+      };
+      for (nullifier in block.nullifiers.vals()) {
+        if (not StableBlobSet.contains(spent_nullifiers, nullifier)) {
+          return #err("stable-state:missing-nullifier");
+        };
+      };
+      let canonical = switch (NoteCodec.encode(block)) {
+        case (#ok(value)) value;
+        case (#err(message)) return #err(message);
+      };
+      if (canonical != encoded) return #err("stable-state:noncanonical-note");
+      expected_parent := ?ICRC3.hashValue(blockValue(block));
+      index += 1;
+    };
+    if (expected_parent != last_block_hash) return #err("stable-state:last-block-hash");
+
+    if (configured()) {
+      if (transfer_vk_hex.size() == 0 or deposit_vk_hex.size() == 0) {
+        return #err("stable-state:empty-vk");
+      };
+      if (not fieldSized(note_root) or not StableBlobSet.contains(historical_roots, note_root)) {
+        return #err("stable-state:current-root");
+      };
+      let state = currentTree();
+      if (state.filled.size() != 32 or state.next_index != Nat64.fromNat(noteCount())) {
+        return #err("stable-state:tree-position");
+      };
+      switch (hexToBlob(state.root)) {
+        case (?root) { if (root != note_root) return #err("stable-state:tree-root") };
+        case null return #err("stable-state:tree-root-hex");
+      };
+    } else {
+      if (noteCount() != 0 or rootCount() != 0 or nullifierCount() != 0 or
+          last_block_hash != null or pool_value != 0 or epoch != 0) {
+        return #err("stable-state:unconfigured-nonempty");
+      };
+    };
+    switch (pool_subaccount) {
+      case (?value) { if (value.size() != 32) return #err("stable-state:pool-subaccount") };
+      case null {};
+    };
+    if (tokenConfigured() and administrator == null) return #err("stable-state:token-admin");
+    if (pending_shield != null and pending_unshield != null) {
+      return #err("stable-state:multiple-pending-token-mutations");
+    };
+    switch (pending_shield) {
+      case (?pending) {
+        if (not tokenConfigured()) return #err("stable-state:pending-token-unconfigured");
+        if (not fieldSized(pending.intent_id) or
+            StableBlobSet.contains(completed_shield_intents, pending.intent_id)) {
+          return #err("stable-state:pending-intent");
+        };
+        switch (validateOutput(pending.output)) {
+          case (?_) return #err("stable-state:pending-output");
+          case null {};
+        };
+        if (pending.base_epoch != epoch or pending.anchor_before != note_root) {
+          return #err("stable-state:pending-epoch");
+        };
+        if (pending.next_tree.filled.size() != 32 or
+            pending.next_tree.next_index != Nat64.fromNat(noteCount() + 1)) {
+          return #err("stable-state:pending-tree-position");
+        };
+        switch (hexToBlob(pending.next_tree.root)) {
+          case (?root) { if (root != pending.root_after) return #err("stable-state:pending-root") };
+          case null return #err("stable-state:pending-root-hex");
+        };
+        let transfer = pending.transfer_args;
+        if (not Principal.equal(transfer.from.owner, pending.caller) or
+            transfer.spender_subaccount != null) {
+          return #err("stable-state:pending-from");
+        };
+        if (not ICRC2.accountsEqual(transfer.to, poolAccount()) or
+            transfer.amount != Nat64.toNat(pending.value) or transfer.fee != ?transparent_ledger_fee or
+            transfer.created_at_time == null or transfer.memo != ?pending.intent_id) {
+          return #err("stable-state:pending-transfer");
+        };
+      };
+      case null {};
+    };
+    switch (pending_unshield) {
+      case (?pending) {
+        if (not tokenConfigured() or transfer_statement_version != 2) {
+          return #err("stable-state:pending-unshield-configuration");
+        };
+        if (not fieldSized(pending.intent_id) or not fieldSized(pending.recipient_binding) or
+            StableBlobSet.contains(completed_unshield_intents, pending.intent_id)) {
+          return #err("stable-state:pending-unshield-intent");
+        };
+        switch (validateOutput(pending.output_1)) {
+          case (?_) return #err("stable-state:pending-unshield-output-1");
+          case null {};
+        };
+        switch (validateOutput(pending.output_2)) {
+          case (?_) return #err("stable-state:pending-unshield-output-2");
+          case null {};
+        };
+        if (pending.base_epoch != epoch or pending.anchor_before != note_root or
+            not StableBlobSet.contains(historical_roots, pending.anchor_before)) {
+          return #err("stable-state:pending-unshield-epoch");
+        };
+        if (pending.next_tree.filled.size() != 32 or
+            pending.next_tree.next_index != Nat64.fromNat(noteCount() + 2)) {
+          return #err("stable-state:pending-unshield-tree-position");
+        };
+        switch (hexToBlob(pending.next_tree.root)) {
+          case (?root) { if (root != pending.root_after) return #err("stable-state:pending-unshield-root") };
+          case null return #err("stable-state:pending-unshield-root-hex");
+        };
+        if (pending.nullifier_1 == pending.nullifier_2 or
+            StableBlobSet.contains(spent_nullifiers, pending.nullifier_1) or
+            StableBlobSet.contains(spent_nullifiers, pending.nullifier_2)) {
+          return #err("stable-state:pending-unshield-nullifier");
+        };
+        let transfer = pending.transfer_args;
+        if (transfer.from_subaccount != pool_subaccount or transfer.amount != Nat64.toNat(pending.public_value) or
+            transfer.fee != ?transparent_ledger_fee or transfer.created_at_time == null or
+            transfer.memo != ?pending.intent_id or not Principal.equal(transfer.to.owner, pending.caller)) {
+          return #err("stable-state:pending-unshield-transfer");
+        };
+        if (pending.pool_debit != transfer.amount + transparent_ledger_fee or pending.pool_debit > pool_value) {
+          return #err("stable-state:pending-unshield-pool-debit");
+        };
+        switch (recipientBindingValue(transfer.to)) {
+          case (#ok(value)) { if (value != pending.recipient_binding) return #err("stable-state:pending-unshield-binding") };
+          case (#err(_)) return #err("stable-state:pending-unshield-binding-invalid");
+        };
+      };
+      case null {};
+    };
+    #ok(())
+  };
+
+  system func postupgrade() {
+    configuring := false;
+    switch (validateStableState()) {
+      case (#ok(_)) refreshCertification();
+      case (#err(message)) Runtime.trap("postupgrade:" # message);
+    }
+  };
+
+  func configured() : Bool {
+    verifier_id != null and tree_oracle_id != null and tree_state != null
+  };
+
+  func mutation(outcome : Text, verifierOutcome : Text) : MutationResult {
+    {
+      outcome;
+      verifier_outcome = verifierOutcome;
+      note_root;
+      note_count = noteCount();
+      nullifier_count = nullifierCount();
+      pool_value;
+      epoch;
+    }
+  };
+
+  func fieldSized(value : Blob) : Bool { value.size() == 32 };
+
+  func nibbleText(n : Nat) : Text {
+    switch (n) {
+      case 0 "0"; case 1 "1"; case 2 "2"; case 3 "3";
+      case 4 "4"; case 5 "5"; case 6 "6"; case 7 "7";
+      case 8 "8"; case 9 "9"; case 10 "a"; case 11 "b";
+      case 12 "c"; case 13 "d"; case 14 "e"; case _ "f";
+    }
+  };
+
+  func blobToHex(value : Blob) : Text {
+    var result = "";
+    for (byte in value.vals()) {
+      let n = Nat8.toNat(byte);
+      result #= nibbleText(n / 16) # nibbleText(n % 16);
+    };
+    result
+  };
+
+  func hexNibble(c : Char) : ?Nat8 {
+    let n = Nat32.toNat(Char.toNat32(c));
+    if (n >= 48 and n <= 57) return ?Nat8.fromNat(n - 48);
+    if (n >= 97 and n <= 102) return ?Nat8.fromNat(n - 87);
+    if (n >= 65 and n <= 70) return ?Nat8.fromNat(n - 55);
+    null
+  };
+
+  func hexToBlob(value : Text) : ?Blob {
+    let output = List.empty<Nat8>();
+    var high : ?Nat8 = null;
+    for (c in value.chars()) {
+      let nibble = switch (hexNibble(c)) { case (?n) n; case null return null };
+      switch (high) {
+        case null { high := ?nibble };
+        case (?h) {
+          List.add(output, Nat8.fromNat(Nat8.toNat(h) * 16 + Nat8.toNat(nibble)));
+          high := null;
+        };
+      };
+    };
+    if (high != null) return null;
+    ?Blob.fromArray(List.toArray(output))
+  };
+
+  func nat64Field(valueInput : Nat64) : Blob {
+    let output = Prim.Array_init<Nat8>(32, 0);
+    var value = valueInput;
+    var i : Nat = 0;
+    while (i < 8) {
+      output[i] := Nat8.fromNat(Nat64.toNat(value % 256));
+      value /= 256;
+      i += 1;
+    };
+    Blob.fromArray(Array.fromVarArray(output))
+  };
+
+  // ark-serialize Vec<Fr>: u64 little-endian length, then 32-byte compressed Fr values.
+  func serializePublicInputs(fields : [Blob]) : ?Text {
+    for (field in fields.vals()) { if (not fieldSized(field)) return null };
+    let bytes = Prim.Array_init<Nat8>(8 + 32 * fields.size(), 0);
+    var length = Nat64.fromNat(fields.size());
+    var i : Nat = 0;
+    while (i < 8) {
+      bytes[i] := Nat8.fromNat(Nat64.toNat(length % 256));
+      length /= 256;
+      i += 1;
+    };
+    var offset : Nat = 8;
+    for (field in fields.vals()) {
+      for (byte in field.vals()) {
+        bytes[offset] := byte;
+        offset += 1;
+      };
+    };
+    ?blobToHex(Blob.fromArray(Array.fromVarArray(bytes)))
+  };
+
+  func parseTransition(result : TreeTransition) : Result<TreeState> {
+    switch (result.error) { case (?message) return #err(message); case null {} };
+    switch (result.state) {
+      case (?state) {
+        if (state.filled.size() != 32) return #err("REJECT:tree-frontier-length");
+        switch (hexToBlob(state.root)) {
+          case (?root) { if (root.size() != 32) return #err("REJECT:tree-root-length") };
+          case null return #err("REJECT:tree-root-hex");
+        };
+        #ok(state)
+      };
+      case null #err("REJECT:tree-oracle-empty-response");
+    }
+  };
+
+  func currentTree() : TreeState {
+    switch (tree_state) { case (?state) state; case null Runtime.trap("unconfigured") }
+  };
+
+  // The verify boundary, in-process. Same verdict strings the Rust verifier canister returned
+  // (ACCEPT / REJECT:hex / REJECT:proof-deserialize / REJECT:inputs-deserialize /
+  // REJECT:pairing-check), so every downstream consumer and test is unchanged.
+  func verifyShieldProof(proofHex : Text, inputsHex : Text) : Text {
+    switch (deposit_vk_prepared) {
+      case (?vk) Groth16Wire.verifyPrepared(vk, proofHex, inputsHex);
+      case null "REJECT:unconfigured";
+    }
+  };
+  func verifyTransferProof(proofHex : Text, inputsHex : Text) : Text {
+    switch (transfer_vk_prepared) {
+      case (?vk) Groth16Wire.verifyPrepared(vk, proofHex, inputsHex);
+      case null "REJECT:unconfigured";
+    }
+  };
+
+  func treeActor() : TreeOracle {
+    switch (tree_oracle_id) {
+      case (?id) actor (Principal.toText(id));
+      case null Runtime.trap("unconfigured tree oracle");
+    }
+  };
+
+  func appendBlock(
+    output : OutputRecord,
+    nullifiers : [Blob],
+    anchor : Blob,
+    rootAfter : Blob,
+    origin : NoteOrigin,
+  ) {
+    let position = noteCount();
+    let block : ShieldedNoteBlock = {
+      btype = "zknote1";
+      phash = last_block_hash;
+      encoding_version = ENCODING_VERSION;
+      note_position = position;
+      commitment = output.commitment;
+      ephemeral_key = output.ephemeral_key;
+      note_ciphertext = output.note_ciphertext;
+      nullifiers;
+      anchor_before = anchor;
+      note_root_after = rootAfter;
+      timestamp = Nat64.fromNat(Int.abs(Time.now()));
+      origin;
+    };
+    let encoded = switch (NoteCodec.encode(block)) {
+      case (#ok(value)) value;
+      case (#err(message)) Runtime.trap(message);
+    };
+    switch (StableLog.append(note_log, encoded)) {
+      case (#ok(index)) { if (index != position) Runtime.trap("stable-state:note-position") };
+      case (#err(message)) Runtime.trap(message);
+    };
+    last_block_hash := ?ICRC3.hashValue(blockValue(block));
+  };
+
+  func blockValue(block : ShieldedNoteBlock) : ICRC3.Value {
+    let entries = List.empty<(Text, ICRC3.Value)>();
+    List.add(entries, ("btype", #Text(block.btype)));
+    switch (block.phash) { case (?hash) List.add(entries, ("phash", #Blob(hash))); case null {} };
+    List.add(entries, ("encoding_version", #Nat(block.encoding_version)));
+    List.add(entries, ("note_position", #Nat(block.note_position)));
+    List.add(entries, ("commitment", #Blob(block.commitment)));
+    List.add(entries, ("ephemeral_key", #Blob(block.ephemeral_key)));
+    List.add(entries, ("note_ciphertext", #Blob(block.note_ciphertext)));
+    List.add(entries, ("nullifiers", #Array(Array.map<Blob, ICRC3.Value>(block.nullifiers, func(value) {
+      #Blob(value)
+    }))));
+    List.add(entries, ("anchor_before", #Blob(block.anchor_before)));
+    List.add(entries, ("note_root_after", #Blob(block.note_root_after)));
+    List.add(entries, ("timestamp", #Nat(Nat64.toNat(block.timestamp))));
+    List.add(entries, ("origin", #Text(switch (block.origin) {
+      case (#shield) "shield";
+      case (#confidential_transfer) "confidential_transfer";
+    })));
+    #Map(List.toArray(entries))
+  };
+
+  func validateOutput(output : OutputRecord) : ?Text {
+    if (not fieldSized(output.commitment)) return ?"REJECT:commitment-length";
+    if (output.ephemeral_key.size() == 0) return ?"REJECT:ephemeral-key-empty";
+    if (output.note_ciphertext.size() == 0) return ?"REJECT:ciphertext-empty";
+    null
+  };
+
+  public shared ({ caller }) func configure(
+    verifierId : Principal,
+    treeOracleId : Principal,
+    transferVkHex : Text,
+    depositVkHex : Text,
+  ) : async Result<LedgerStatus> {
+    if (configured() or configuring) return #err("REJECT:already-configured");
+    if (transferVkHex.size() == 0 or depositVkHex.size() == 0) return #err("REJECT:empty-vk");
+    // Parse + validate + prepare both verifying keys NOW (in-process, no await, no state
+    // change on failure): every vk point is subgroup-checked and the three fixed G2 pairs are
+    // precomputed once, so no per-proof message ever re-validates the vk.
+    let transferPrepared = switch (Groth16Wire.parseAndPrepareVk(transferVkHex)) {
+      case (?vk) vk;
+      case null return #err("REJECT:vk-deserialize:transfer");
+    };
+    let depositPrepared = switch (Groth16Wire.parseAndPrepareVk(depositVkHex)) {
+      case (?vk) vk;
+      case null return #err("REJECT:vk-deserialize:deposit");
+    };
+    configuring := true;
+    let oracle : TreeOracle = actor (Principal.toText(treeOracleId));
+    let response = try { await oracle.empty() } catch (error) {
+      configuring := false;
+      return #err("REJECT:tree-oracle-call:" # Error.message(error));
+    };
+    let initial = switch (parseTransition(response)) {
+      case (#ok(state)) state;
+      case (#err(message)) { configuring := false; return #err(message) };
+    };
+    if (configured()) { configuring := false; return #err("REJECT:configuration-race") };
+    verifier_id := ?verifierId;
+    tree_oracle_id := ?treeOracleId;
+    transfer_vk_hex := transferVkHex;
+    deposit_vk_hex := depositVkHex;
+    transfer_vk_prepared := ?transferPrepared;
+    deposit_vk_prepared := ?depositPrepared;
+    transfer_statement_version := 2;
+    tree_state := ?initial;
+    note_root := switch (hexToBlob(initial.root)) { case (?root) root; case null Runtime.trap("validated root") };
+    addRoot(note_root);
+    administrator := ?caller;
+    refreshCertification();
+    configuring := false;
+    #ok(statusValue())
+  };
+
+  /// Upgrade an existing pool from the v1 transfer statement to recipient-bound v2 without
+  /// replacing any note, nullifier, tree, token, or pool-balance state.
+  public shared ({ caller }) func rotate_verifying_keys_v2(
+    expectedOldTransferVkHex : Text,
+    expectedOldDepositVkHex : Text,
+    newTransferVkHex : Text,
+    newDepositVkHex : Text,
+  ) : async Result<LedgerStatus> {
+    if (not isAdministrator(caller)) return #err("REJECT:not-administrator");
+    if (not configured()) return #err("REJECT:unconfigured");
+    if (pending_shield != null or pending_unshield != null) return #err("REJECT:pending-token-mutation");
+    if (transfer_vk_hex != expectedOldTransferVkHex) return #err("REJECT:transfer-vk-precondition");
+    if (deposit_vk_hex != expectedOldDepositVkHex) return #err("REJECT:deposit-vk-precondition");
+    if (newTransferVkHex.size() == 0 or newDepositVkHex.size() == 0) return #err("REJECT:empty-vk");
+    let transferPrepared = switch (Groth16Wire.parseAndPrepareVk(newTransferVkHex)) {
+      case (?value) value;
+      case null return #err("REJECT:vk-deserialize:transfer");
+    };
+    let depositPrepared = switch (Groth16Wire.parseAndPrepareVk(newDepositVkHex)) {
+      case (?value) value;
+      case null return #err("REJECT:vk-deserialize:deposit");
+    };
+    transfer_vk_hex := newTransferVkHex;
+    deposit_vk_hex := newDepositVkHex;
+    transfer_vk_prepared := ?transferPrepared;
+    deposit_vk_prepared := ?depositPrepared;
+    transfer_statement_version := 2;
+    #ok(statusValue())
+  };
+
+  public shared ({ caller }) func configure_token_ledger(
+    tokenLedgerId : Principal,
+    historyAdapterId : Principal,
+    poolSubaccount : ?Blob,
+  ) : async Result<AtomicityStatus> {
+    if (not isAdministrator(caller)) return #err("REJECT:not-administrator");
+    if (token_configuring) return #err("REJECT:token-configuration-in-progress");
+    if (tokenConfigured()) return #err("REJECT:token-already-configured");
+    if (noteCount() != 0 or pool_value != 0 or pending_shield != null or pending_unshield != null) {
+      return #err("REJECT:token-configuration-after-state");
+    };
+    switch (poolSubaccount) {
+      case (?value) { if (value.size() != 32) return #err("REJECT:pool-subaccount-length") };
+      case null {};
+    };
+    token_configuring := true;
+    let ledger : TransferLedger = actor (Principal.toText(tokenLedgerId));
+    let metadata = try {
+      let fee = await ledger.icrc1_fee();
+      let decimals = await ledger.icrc1_decimals();
+      (fee, decimals)
+    } catch (error) {
+      token_configuring := false;
+      return #err("REJECT:token-metadata:" # Error.message(error));
+    };
+    if (metadata.1 != 8) {
+      token_configuring := false;
+      return #err("REJECT:token-decimals:" # Nat8.toText(metadata.1));
+    };
+    if (tokenConfigured() or noteCount() != 0 or pool_value != 0 or pending_shield != null or pending_unshield != null) {
+      token_configuring := false;
+      return #err("REJECT:token-configuration-race");
+    };
+    token_ledger_id := ?tokenLedgerId;
+    history_adapter_id := ?historyAdapterId;
+    transparent_ledger_fee := metadata.0;
+    transparent_ledger_decimals := metadata.1;
+    pool_subaccount := poolSubaccount;
+    token_configuring := false;
+    #ok(atomicityStatusValue())
+  };
+
+  func statusValue() : LedgerStatus {
+    {
+      configured = configured();
+      note_root;
+      note_count = noteCount();
+      log_length = noteCount();
+      nullifier_count = nullifierCount();
+      historical_root_count = rootCount();
+      pool_value;
+      epoch;
+      tree_state;
+      transfer_statement_version;
+    }
+  };
+
+  public query func status() : async LedgerStatus { statusValue() };
+
+  public query func recipient_binding(recipient : ICRC2.Account) : async Result<Blob> {
+    recipientBindingValue(recipient)
+  };
+
+  func storageStatusValue() : StorageStatus {
+    {
+      layout_version = stable_layout_version;
+      note_entries = noteCount();
+      note_bytes = StableLog.dataSize(note_log);
+      note_digest = StableLog.digest(note_log);
+      root_entries = rootCount();
+      root_capacity = Nat64.toNat(historical_roots.capacity);
+      root_region_bytes = StableBlobSet.bytesAllocated(historical_roots);
+      root_digest = StableBlobSet.digest(historical_roots);
+      nullifier_entries = nullifierCount();
+      nullifier_capacity = Nat64.toNat(spent_nullifiers.capacity);
+      nullifier_region_bytes = StableBlobSet.bytesAllocated(spent_nullifiers);
+      nullifier_digest = StableBlobSet.digest(spent_nullifiers);
+      completed_shield_entries = completedShieldCount();
+      completed_shield_capacity = Nat64.toNat(completed_shield_intents.capacity);
+      completed_shield_region_bytes = StableBlobSet.bytesAllocated(completed_shield_intents);
+      completed_shield_digest = StableBlobSet.digest(completed_shield_intents);
+      completed_unshield_entries = completedUnshieldCount();
+      completed_unshield_capacity = Nat64.toNat(completed_unshield_intents.capacity);
+      completed_unshield_region_bytes = StableBlobSet.bytesAllocated(completed_unshield_intents);
+      completed_unshield_digest = StableBlobSet.digest(completed_unshield_intents);
+    }
+  };
+
+  func atomicityStatusValue() : AtomicityStatus {
+    {
+      token_configured = tokenConfigured();
+      token_ledger = token_ledger_id;
+      history_adapter = history_adapter_id;
+      transparent_ledger_fee;
+      transparent_ledger_decimals;
+      pool_account = poolAccount();
+      pending = pending_shield;
+      pending_unshield;
+      completed_intents = completedShieldCount();
+      completed_intent_digest = StableBlobSet.digest(completed_shield_intents);
+      completed_unshield_intents = completedUnshieldCount();
+      completed_unshield_intent_digest = StableBlobSet.digest(completed_unshield_intents);
+      test_fault_armed = test_fail_after_token_once;
+    }
+  };
+
+  public query func atomicity_status() : async AtomicityStatus { atomicityStatusValue() };
+
+  public shared ({ caller }) func test_arm_fail_after_token_once() : async Result<()> {
+    if (not isAdministrator(caller)) return #err("REJECT:not-administrator");
+    if (pending_shield != null or pending_unshield != null) return #err("REJECT:pending-token-mutation");
+    test_fail_after_token_once := true;
+    #ok(())
+  };
+
+  public query func storage_status() : async StorageStatus { storageStatusValue() };
+
+  public query func validate_stable_state() : async Result<StorageStatus> {
+    switch (validateStableState()) {
+      case (#ok(_)) #ok(storageStatusValue());
+      case (#err(message)) #err(message);
+    }
+  };
+
+  public query func certified_snapshot() : async CertifiedSnapshot {
+    let tuple = certifiedTuple();
+    let tree = CertifiedTuple.build(tuple);
+    {
+      last_block_index = tuple.last_block_index;
+      last_block_hash = tuple.last_block_hash;
+      note_root;
+      note_count = noteCount();
+      encoding_version = ENCODING_VERSION;
+      archive_manifest = tuple.archive_manifest;
+      certificate = CertifiedData.getCertificate();
+      hash_tree = CertifiedTuple.encodeCBOR(tree);
+    }
+  };
+
+  public query func icrc3_get_tip_certificate() : async ?DataCertificate {
+    if (noteCount() == 0) return null;
+    switch (CertifiedData.getCertificate()) {
+      case (?certificate) {
+        ?{ certificate; hash_tree = CertifiedTuple.encodeCBOR(certifiedTree()) }
+      };
+      case null null;
+    }
+  };
+
+  public query func is_nullifier_spent(nullifier : Blob) : async Bool {
+    StableBlobSet.contains(spent_nullifiers, nullifier)
+  };
+
+  public query func is_known_root(root : Blob) : async Bool {
+    StableBlobSet.contains(historical_roots, root)
+  };
+
+  public query func icrc3_supported_block_types() : async [{ block_type : Text; url : Text }] {
+    [{ block_type = "zknote1"; url = "https://github.com/dfinity/ICRC-1/tree/main/standards/ICRC-3" }]
+  };
+
+  public query func icrc3_get_archives(_args : GetArchivesArgs) : async [ArchiveInfo] { [] };
+
+  public query func icrc3_get_blocks(args : [GetBlocksArgs]) : async GetBlocksResult {
+    let result = List.empty<Block>();
+    for (range in args.vals()) {
+      if (range.start < noteCount()) {
+        let end = Nat.min(range.start + range.length, noteCount());
+        var i = range.start;
+        while (i < end) {
+          List.add(result, { id = i; block = blockValue(blockAt(i)) });
+          i += 1;
+        };
+      };
+    };
+    { blocks = List.toArray(result); log_length = noteCount(); archived_blocks = [] }
+  };
+
+  func pendingById(intentId : Blob) : ?PendingShield {
+    switch (pending_shield) {
+      case (?pending) { if (Blob.equal(pending.intent_id, intentId)) ?pending else null };
+      case null null;
+    }
+  };
+
+  func tokenErrorName(error : ICRC2.TransferFromError) : Text {
+    switch (error) {
+      case (#BadFee(_)) "BadFee";
+      case (#BadBurn(_)) "BadBurn";
+      case (#InsufficientFunds(_)) "InsufficientFunds";
+      case (#InsufficientAllowance(_)) "InsufficientAllowance";
+      case (#TooOld) "TooOld";
+      case (#CreatedInFuture(_)) "CreatedInFuture";
+      case (#Duplicate(_)) "Duplicate";
+      case (#TemporarilyUnavailable) "TemporarilyUnavailable";
+      case (#GenericError(_)) "GenericError";
+    }
+  };
+
+  func deterministicNoEffectError(error : ICRC2.TransferFromError) : Bool {
+    switch (error) {
+      case (#BadFee(_)) true;
+      case (#BadBurn(_)) true;
+      case (#InsufficientFunds(_)) true;
+      case (#InsufficientAllowance(_)) true;
+      case (#CreatedInFuture(_)) true;
+      case _ false;
+    }
+  };
+
+  func finalizeShield(intentId : Blob) : MutationResult {
+    if (StableBlobSet.contains(completed_shield_intents, intentId)) {
+      return mutation("ACCEPT:already-finalized", "ACCEPT");
+    };
+    let pending = switch (pendingById(intentId)) {
+      case (?value) value;
+      case null return mutation("REJECT:pending-shield-changed", "NOT_CALLED");
+    };
+    if (epoch != pending.base_epoch or note_root != pending.anchor_before) {
+      return mutation("REJECT:pending-shield-epoch", pending.verifier_outcome);
+    };
+
+    // No await after this point: the exact token block is already observed. If any stable write
+    // traps, this callback rolls back to the pre-callback pending intent and remains recoverable.
+    tree_state := ?pending.next_tree;
+    note_root := pending.root_after;
+    addRoot(pending.root_after);
+    appendBlock(pending.output, [], pending.anchor_before, pending.root_after, #shield);
+    pool_value += Nat64.toNat(pending.value);
+    epoch += 1;
+    switch (StableBlobSet.put(completed_shield_intents, intentId)) {
+      case (#ok(true)) {};
+      case (#ok(false)) Runtime.trap("stable-state:completed-shield-duplicate");
+      case (#err(message)) Runtime.trap(message);
+    };
+    pending_shield := null;
+    refreshCertification();
+    mutation("ACCEPT", pending.verifier_outcome)
+  };
+
+  // Recovery by idempotency key: scan the token ledger's blocks from the pre-call low-water for the
+  // unique 2xfer carrying memo == intent_id. Independent of the ICRC-2 dedup window, so it recovers
+  // a trapped-after-transfer shield no matter how long the outage lasted. Bounded per message by
+  // PAGE; the await loop paginates the instruction budget across messages.
+  type ReconcileResult = { #found : Nat; #absent; #error : Text };
+  func reconcileShieldBlock(pending : PendingShield) : async ReconcileResult {
+    let PAGE : Nat = 64;
+    var index = pending.ledger_tip_before;
+    loop {
+      let page = try {
+        await historyActor().icrc3_get_blocks([{ start = index; length = PAGE }])
+      } catch (error) {
+        return #error(Error.message(error));
+      };
+      if (page.blocks.size() == 0) return #absent;
+      for (b in page.blocks.vals()) {
+        if (ICRC2Block.matchesTransferFrom(b.block, pending.transfer_args, selfPrincipal())) {
+          return #found(b.id);
+        };
+      };
+      index += page.blocks.size();
+      if (index >= page.log_length) return #absent;
+    };
+  };
+
+  func drivePendingShield(intentId : Blob, trapAfterToken : Bool, reconcileFirst : Bool) : async MutationResult {
+    let pending = switch (pendingById(intentId)) {
+      case (?value) value;
+      case null return mutation("REJECT:pending-shield-changed", "NOT_CALLED");
+    };
+    // Recovery path: if the token block already landed under this intent's memo, finalize against it
+    // directly — never re-call transfer_from (which would hit #TooOld or double-charge post-window).
+    if (reconcileFirst) {
+      switch (await reconcileShieldBlock(pending)) {
+        case (#found(_)) {
+          switch (pendingById(intentId)) {
+            case (?current) {
+              if (epoch != current.base_epoch or note_root != current.anchor_before) {
+                return mutation("REJECT:pending-shield-epoch", current.verifier_outcome);
+              };
+              return finalizeShield(intentId);
+            };
+            case null {
+              if (StableBlobSet.contains(completed_shield_intents, intentId)) {
+                return mutation("ACCEPT:already-finalized", "ACCEPT");
+              };
+              return mutation("REJECT:pending-shield-changed", pending.verifier_outcome);
+            };
+          };
+        };
+        case (#error(msg)) return mutation("PENDING:reconcile-scan:" # msg, pending.verifier_outcome);
+        case (#absent) {}; // transfer never landed — safe to (re)send below
+      };
+    };
+    let response = try {
+      await tokenActor().icrc2_transfer_from(pending.transfer_args)
+    } catch (error) {
+      return mutation("PENDING:token-call:" # Error.message(error), "CALL_FAILED");
+    };
+
+    let blockIndex = switch (response) {
+      case (#Ok(index)) index;
+      case (#Err(#Duplicate({ duplicate_of }))) duplicate_of;
+      case (#Err(error)) {
+        if (deterministicNoEffectError(error) and pendingById(intentId) != null) {
+          pending_shield := null;
+          return mutation("REJECT:token:" # tokenErrorName(error), pending.verifier_outcome);
+        };
+        return mutation("PENDING:token:" # tokenErrorName(error), pending.verifier_outcome);
+      };
+    };
+
+    if (trapAfterToken) Runtime.trap("TEST_ONLY:fail-after-token-before-finalize");
+    let observed = try {
+      await historyActor().icrc3_get_blocks([{ start = blockIndex; length = 1 }])
+    } catch (error) {
+      return mutation("PENDING:token-block-call:" # Error.message(error), pending.verifier_outcome);
+    };
+    let current = switch (pendingById(intentId)) {
+      case (?value) value;
+      case null {
+        if (StableBlobSet.contains(completed_shield_intents, intentId)) {
+          return mutation("ACCEPT:already-finalized", "ACCEPT");
+        };
+        return mutation("REJECT:pending-shield-changed", pending.verifier_outcome);
+      };
+    };
+    if (epoch != current.base_epoch or observed.blocks.size() != 1 or
+        observed.blocks[0].id != blockIndex or
+        not ICRC2Block.matchesTransferFrom(observed.blocks[0].block, current.transfer_args, selfPrincipal())) {
+      return mutation("PENDING:token-block-mismatch", current.verifier_outcome);
+    };
+    finalizeShield(intentId)
+  };
+
+  public shared ({ caller }) func shield(args : DepositArgs) : async MutationResult {
+    if (not configured()) return mutation("REJECT:unconfigured", "NOT_CALLED");
+    if (not tokenConfigured()) return mutation("REJECT:token-unconfigured", "NOT_CALLED");
+    if (pending_shield != null or pending_unshield != null) {
+      return mutation("REJECT:pending-token-mutation", "NOT_CALLED");
+    };
+    if (not fieldSized(args.commitment)) return mutation("REJECT:commitment-length", "NOT_CALLED");
+    if (args.client_nonce.size() != 32) return mutation("REJECT:client-nonce-length", "NOT_CALLED");
+    switch (args.from_subaccount) {
+      case (?value) { if (value.size() != 32) return mutation("REJECT:from-subaccount-length", "NOT_CALLED") };
+      case null {};
+    };
+    if (args.ephemeral_key.size() == 0 or args.note_ciphertext.size() == 0) {
+      return mutation("REJECT:opaque-record-empty", "NOT_CALLED");
+    };
+    let intentId = shieldIntentId(caller, args);
+    if (StableBlobSet.contains(completed_shield_intents, intentId)) {
+      return mutation("ACCEPT:already-finalized", "ACCEPT");
+    };
+    let inputs = switch (serializePublicInputs([args.commitment, nat64Field(args.value)])) {
+      case (?encoded) encoded;
+      case null return mutation("REJECT:public-input-encoding", "NOT_CALLED");
+    };
+    let startEpoch = epoch;
+    // In-process verify: no await, so no state can change between the guards above and the
+    // verdict — the old post-verify state-change re-check is structurally impossible to fail
+    // and is gone with the call boundary.
+    let verdict = verifyShieldProof(args.proof_hex, inputs);
+    if (verdict != "ACCEPT") return mutation(verdict, verdict);
+
+    let transition = try {
+      await treeActor().append(currentTree(), [blobToHex(args.commitment)])
+    } catch (error) {
+      return mutation("REJECT:tree-oracle-call:" # Error.message(error), verdict);
+    };
+    if (pending_shield != null or pending_unshield != null or epoch != startEpoch) {
+      return mutation("REJECT:state-changed", verdict);
+    };
+    let next = switch (parseTransition(transition)) {
+      case (#ok(state)) state;
+      case (#err(message)) return mutation(message, verdict);
+    };
+    let rootAfter = switch (hexToBlob(next.root)) {
+      case (?root) root;
+      case null return mutation("REJECT:tree-root-hex", verdict);
+    };
+    let transferArgs : ICRC2.TransferFromArgs = {
+      spender_subaccount = null;
+      from = { owner = caller; subaccount = args.from_subaccount };
+      to = poolAccount();
+      amount = Nat64.toNat(args.value);
+      fee = ?transparent_ledger_fee;
+      memo = ?intentId;
+      created_at_time = ?args.created_at_time;
+    };
+    // Low-water for dedup-window-independent recovery: the token ledger's block count BEFORE the
+    // transfer. Any block minted by this shield lands at an index >= this, bounding the recovery scan.
+    let ledgerTip = try {
+      (await historyActor().icrc3_get_blocks([{ start = 0; length = 0 }])).log_length
+    } catch (error) {
+      return mutation("REJECT:ledger-tip-call:" # Error.message(error), verdict);
+    };
+    if (pending_shield != null or pending_unshield != null or epoch != startEpoch) {
+      return mutation("REJECT:state-changed", verdict);
+    };
+    pending_shield := ?{
+      intent_id = intentId;
+      caller;
+      output = {
+        commitment = args.commitment;
+        ephemeral_key = args.ephemeral_key;
+        note_ciphertext = args.note_ciphertext;
+      };
+      value = args.value;
+      transfer_args = transferArgs;
+      anchor_before = note_root;
+      root_after = rootAfter;
+      next_tree = next;
+      base_epoch = epoch;
+      verifier_outcome = verdict;
+      attempts = 1;
+      ledger_tip_before = ledgerTip;
+    };
+    let trapAfterToken = test_fail_after_token_once;
+    test_fail_after_token_once := false;
+    await drivePendingShield(intentId, trapAfterToken, false)
+  };
+
+  public shared ({ caller }) func resume_shield() : async MutationResult {
+    let pending = switch (pending_shield) {
+      case (?value) value;
+      case null return mutation("REJECT:no-pending-shield", "NOT_CALLED");
+    };
+    if (not Principal.equal(caller, pending.caller) and not isAdministrator(caller)) {
+      return mutation("REJECT:not-pending-owner", "NOT_CALLED");
+    };
+    pending_shield := ?{ pending with attempts = pending.attempts + 1 };
+    await drivePendingShield(pending.intent_id, false, true)
+  };
+
+  func pendingUnshieldById(intentId : Blob) : ?PendingUnshield {
+    switch (pending_unshield) {
+      case (?pending) { if (Blob.equal(pending.intent_id, intentId)) ?pending else null };
+      case null null;
+    }
+  };
+
+  func directTokenErrorName(error : ICRC2.TransferError) : Text {
+    switch (error) {
+      case (#BadFee(_)) "BadFee";
+      case (#BadBurn(_)) "BadBurn";
+      case (#InsufficientFunds(_)) "InsufficientFunds";
+      case (#TooOld) "TooOld";
+      case (#CreatedInFuture(_)) "CreatedInFuture";
+      case (#Duplicate(_)) "Duplicate";
+      case (#TemporarilyUnavailable) "TemporarilyUnavailable";
+      case (#GenericError(_)) "GenericError";
+    }
+  };
+
+  func directDeterministicNoEffectError(error : ICRC2.TransferError) : Bool {
+    switch (error) {
+      case (#BadFee(_)) true;
+      case (#BadBurn(_)) true;
+      case (#InsufficientFunds(_)) true;
+      case (#CreatedInFuture(_)) true;
+      case _ false;
+    }
+  };
+
+  func finalizeUnshield(intentId : Blob) : MutationResult {
+    if (StableBlobSet.contains(completed_unshield_intents, intentId)) {
+      return mutation("ACCEPT:already-finalized", "ACCEPT");
+    };
+    let pending = switch (pendingUnshieldById(intentId)) {
+      case (?value) value;
+      case null return mutation("REJECT:pending-unshield-changed", "NOT_CALLED");
+    };
+    if (epoch != pending.base_epoch or note_root != pending.anchor_before or
+        pending.pool_debit > pool_value) {
+      return mutation("REJECT:pending-unshield-epoch", pending.verifier_outcome);
+    };
+
+    // No await after this point. The exact ICRC-1 payout block has already been observed; the
+    // nullifiers, two change records, tree root, physical pool balance, and completion marker
+    // therefore commit atomically or the callback rolls back to this recoverable pending intent.
+    addNullifier(pending.nullifier_1);
+    addNullifier(pending.nullifier_2);
+    tree_state := ?pending.next_tree;
+    note_root := pending.root_after;
+    addRoot(pending.root_after);
+    let nullifiers = [pending.nullifier_1, pending.nullifier_2];
+    appendBlock(pending.output_1, nullifiers, pending.anchor_before, pending.root_after, #confidential_transfer);
+    appendBlock(pending.output_2, nullifiers, pending.anchor_before, pending.root_after, #confidential_transfer);
+    pool_value -= pending.pool_debit;
+    epoch += 1;
+    switch (StableBlobSet.put(completed_unshield_intents, intentId)) {
+      case (#ok(true)) {};
+      case (#ok(false)) Runtime.trap("stable-state:completed-unshield-duplicate");
+      case (#err(message)) Runtime.trap(message);
+    };
+    pending_unshield := null;
+    refreshCertification();
+    mutation("ACCEPT", pending.verifier_outcome)
+  };
+
+  func reconcileUnshieldBlock(pending : PendingUnshield) : async ReconcileResult {
+    let PAGE : Nat = 64;
+    var index = pending.ledger_tip_before;
+    loop {
+      let page = try {
+        await historyActor().icrc3_get_blocks([{ start = index; length = PAGE }])
+      } catch (error) {
+        return #error(Error.message(error));
+      };
+      if (page.blocks.size() == 0) return #absent;
+      for (block in page.blocks.vals()) {
+        if (ICRC1Block.matchesTransfer(block.block, pending.transfer_args, selfPrincipal())) {
+          return #found(block.id);
+        };
+      };
+      index += page.blocks.size();
+      if (index >= page.log_length) return #absent;
+    }
+  };
+
+  func drivePendingUnshield(intentId : Blob, trapAfterToken : Bool, reconcileFirst : Bool) : async MutationResult {
+    let pending = switch (pendingUnshieldById(intentId)) {
+      case (?value) value;
+      case null return mutation("REJECT:pending-unshield-changed", "NOT_CALLED");
+    };
+    if (reconcileFirst) {
+      switch (await reconcileUnshieldBlock(pending)) {
+        case (#found(_)) {
+          switch (pendingUnshieldById(intentId)) {
+            case (?current) {
+              if (epoch != current.base_epoch or note_root != current.anchor_before) {
+                return mutation("REJECT:pending-unshield-epoch", current.verifier_outcome);
+              };
+              return finalizeUnshield(intentId);
+            };
+            case null {
+              if (StableBlobSet.contains(completed_unshield_intents, intentId)) {
+                return mutation("ACCEPT:already-finalized", "ACCEPT");
+              };
+              return mutation("REJECT:pending-unshield-changed", pending.verifier_outcome);
+            };
+          };
+        };
+        case (#error(message)) return mutation("PENDING:unshield-reconcile-scan:" # message, pending.verifier_outcome);
+        case (#absent) {};
+      };
+    };
+
+    let response = try {
+      await tokenActor().icrc1_transfer(pending.transfer_args)
+    } catch (error) {
+      return mutation("PENDING:unshield-token-call:" # Error.message(error), "CALL_FAILED");
+    };
+    let blockIndex = switch (response) {
+      case (#Ok(index)) index;
+      case (#Err(#Duplicate({ duplicate_of }))) duplicate_of;
+      case (#Err(error)) {
+        if (directDeterministicNoEffectError(error) and pendingUnshieldById(intentId) != null) {
+          pending_unshield := null;
+          return mutation("REJECT:unshield-token:" # directTokenErrorName(error), pending.verifier_outcome);
+        };
+        return mutation("PENDING:unshield-token:" # directTokenErrorName(error), pending.verifier_outcome);
+      };
+    };
+
+    if (trapAfterToken) Runtime.trap("TEST_ONLY:fail-after-token-before-unshield-finalize");
+    let observed = try {
+      await historyActor().icrc3_get_blocks([{ start = blockIndex; length = 1 }])
+    } catch (error) {
+      return mutation("PENDING:unshield-token-block-call:" # Error.message(error), pending.verifier_outcome);
+    };
+    let current = switch (pendingUnshieldById(intentId)) {
+      case (?value) value;
+      case null {
+        if (StableBlobSet.contains(completed_unshield_intents, intentId)) {
+          return mutation("ACCEPT:already-finalized", "ACCEPT");
+        };
+        return mutation("REJECT:pending-unshield-changed", pending.verifier_outcome);
+      };
+    };
+    if (epoch != current.base_epoch or observed.blocks.size() != 1 or
+        observed.blocks[0].id != blockIndex or
+        not ICRC1Block.matchesTransfer(observed.blocks[0].block, current.transfer_args, selfPrincipal())) {
+      return mutation("PENDING:unshield-token-block-mismatch", current.verifier_outcome);
+    };
+    finalizeUnshield(intentId)
+  };
+
+  public shared ({ caller }) func resume_unshield() : async MutationResult {
+    let pending = switch (pending_unshield) {
+      case (?value) value;
+      case null return mutation("REJECT:no-pending-unshield", "NOT_CALLED");
+    };
+    if (not Principal.equal(caller, pending.caller) and not isAdministrator(caller)) {
+      return mutation("REJECT:not-pending-owner", "NOT_CALLED");
+    };
+    pending_unshield := ?{ pending with attempts = pending.attempts + 1 };
+    await drivePendingUnshield(pending.intent_id, false, true)
+  };
+
+  public shared ({ caller }) func confidential_transfer(args : TransferArgs) : async MutationResult {
+    if (not configured()) return mutation("REJECT:unconfigured", "NOT_CALLED");
+    if (transfer_statement_version != 2) {
+      return mutation("REJECT:transfer-statement-version", "NOT_CALLED");
+    };
+    if (pending_shield != null or pending_unshield != null) {
+      return mutation("REJECT:pending-token-mutation", "NOT_CALLED");
+    };
+    if (not fieldSized(args.anchor) or not fieldSized(args.nullifier_1) or not fieldSized(args.nullifier_2)) {
+      return mutation("REJECT:field-length", "NOT_CALLED");
+    };
+    switch (validateOutput(args.output_1)) { case (?e) return mutation(e, "NOT_CALLED"); case null {} };
+    switch (validateOutput(args.output_2)) { case (?e) return mutation(e, "NOT_CALLED"); case null {} };
+
+    let isUnshield = args.v_pub_out > 0;
+    let recipientBinding : Blob = if (isUnshield) {
+      if (not tokenConfigured()) return mutation("REJECT:token-unconfigured", "NOT_CALLED");
+      if (Nat64.toNat(args.fee) < transparent_ledger_fee) {
+        return mutation("REJECT:unshield-fee-below-token-fee", "NOT_CALLED");
+      };
+      if (args.created_at_time == null) {
+        return mutation("REJECT:unshield-created-at-time", "NOT_CALLED");
+      };
+      let recipient = switch (args.recipient) {
+        case (?value) value;
+        case null return mutation("REJECT:unshield-recipient-missing", "NOT_CALLED");
+      };
+      if (not Principal.equal(recipient.owner, caller)) {
+        return mutation("REJECT:unshield-recipient-not-caller", "NOT_CALLED");
+      };
+      switch (recipientBindingValue(recipient)) {
+        case (#ok(value)) value;
+        case (#err(message)) return mutation(message, "NOT_CALLED");
+      }
+    } else {
+      if (args.recipient != null or args.created_at_time != null) {
+        return mutation("REJECT:private-transfer-public-recipient", "NOT_CALLED");
+      };
+      zeroField()
+    };
+
+    let intentId = if (isUnshield) ?unshieldIntentId(caller, args, recipientBinding) else null;
+    switch (intentId) {
+      case (?value) {
+        if (StableBlobSet.contains(completed_unshield_intents, value)) {
+          return mutation("ACCEPT:already-finalized", "ACCEPT");
+        };
+      };
+      case null {};
+    };
+
+    // Cheap state-machine guards precede the pairing call. All are repeated after every await.
+    if (not StableBlobSet.contains(historical_roots, args.anchor)) {
+      return mutation("REJECT:unknown-anchor", "NOT_CALLED");
+    };
+    if (args.nullifier_1 == args.nullifier_2) {
+      return mutation("REJECT:duplicate-nullifier-in-tx", "NOT_CALLED");
+    };
+    if (StableBlobSet.contains(spent_nullifiers, args.nullifier_1) or
+        StableBlobSet.contains(spent_nullifiers, args.nullifier_2)) {
+      return mutation("REJECT:nullifier-spent", "NOT_CALLED");
+    };
+    let poolDebit = if (isUnshield) Nat64.toNat(args.v_pub_out) + transparent_ledger_fee else 0;
+    if (poolDebit > pool_value) {
+      return mutation("REJECT:turnstile", "NOT_CALLED");
+    };
+
+    let inputs = switch (serializePublicInputs([
+      args.anchor,
+      args.nullifier_1,
+      args.nullifier_2,
+      args.output_1.commitment,
+      args.output_2.commitment,
+      nat64Field(args.fee),
+      nat64Field(args.v_pub_out),
+      recipientBinding,
+    ])) {
+      case (?encoded) encoded;
+      case null return mutation("REJECT:public-input-encoding", "NOT_CALLED");
+    };
+    let startEpoch = epoch;
+    // In-process verify: no await before the tree append, so the anchor/nullifier/turnstile
+    // guards above are still the live state when the verdict lands. The re-checks below the
+    // old verifier await collapse into the post-tree-append re-checks that remain.
+    let verdict = verifyTransferProof(args.proof_hex, inputs);
+    if (verdict != "ACCEPT") return mutation(verdict, verdict);
+
+    let transition = try {
+      await treeActor().append(currentTree(), [
+        blobToHex(args.output_1.commitment),
+        blobToHex(args.output_2.commitment),
+      ])
+    } catch (error) {
+      return mutation("REJECT:tree-oracle-call:" # Error.message(error), verdict);
+    };
+    if (pending_shield != null or pending_unshield != null or epoch != startEpoch) {
+      return mutation("REJECT:state-changed", verdict);
+    };
+    if (not StableBlobSet.contains(historical_roots, args.anchor)) return mutation("REJECT:unknown-anchor", verdict);
+    if (StableBlobSet.contains(spent_nullifiers, args.nullifier_1) or
+        StableBlobSet.contains(spent_nullifiers, args.nullifier_2)) {
+      return mutation("REJECT:nullifier-spent", verdict);
+    };
+    if (poolDebit > pool_value) return mutation("REJECT:turnstile", verdict);
+    let next = switch (parseTransition(transition)) {
+      case (#ok(state)) state;
+      case (#err(message)) return mutation(message, verdict);
+    };
+    let rootAfter = switch (hexToBlob(next.root)) {
+      case (?root) root;
+      case null return mutation("REJECT:tree-root-hex", verdict);
+    };
+
+    if (not isUnshield) {
+      // No await after this point: a private transfer commits all shielded state together.
+      addNullifier(args.nullifier_1);
+      addNullifier(args.nullifier_2);
+      tree_state := ?next;
+      note_root := rootAfter;
+      addRoot(rootAfter);
+      let nullifiers = [args.nullifier_1, args.nullifier_2];
+      appendBlock(args.output_1, nullifiers, args.anchor, rootAfter, #confidential_transfer);
+      appendBlock(args.output_2, nullifiers, args.anchor, rootAfter, #confidential_transfer);
+      epoch += 1;
+      refreshCertification();
+      return mutation("ACCEPT", verdict);
+    };
+
+    let recipient = switch (args.recipient) { case (?value) value; case null Runtime.trap("validated recipient") };
+    let createdAt = switch (args.created_at_time) { case (?value) value; case null Runtime.trap("validated timestamp") };
+    let intent = switch (intentId) { case (?value) value; case null Runtime.trap("validated intent") };
+    let ledgerTip = try {
+      (await historyActor().icrc3_get_blocks([{ start = 0; length = 0 }])).log_length
+    } catch (error) {
+      return mutation("REJECT:unshield-ledger-tip-call:" # Error.message(error), verdict);
+    };
+    if (pending_shield != null or pending_unshield != null or epoch != startEpoch) {
+      return mutation("REJECT:state-changed", verdict);
+    };
+    if (StableBlobSet.contains(spent_nullifiers, args.nullifier_1) or
+        StableBlobSet.contains(spent_nullifiers, args.nullifier_2) or poolDebit > pool_value) {
+      return mutation("REJECT:state-changed", verdict);
+    };
+    let transferArgs : ICRC2.TransferArg = {
+      from_subaccount = pool_subaccount;
+      to = recipient;
+      amount = Nat64.toNat(args.v_pub_out);
+      fee = ?transparent_ledger_fee;
+      memo = ?intent;
+      created_at_time = ?createdAt;
+    };
+    pending_unshield := ?{
+      intent_id = intent;
+      caller;
+      output_1 = args.output_1;
+      output_2 = args.output_2;
+      nullifier_1 = args.nullifier_1;
+      nullifier_2 = args.nullifier_2;
+      transfer_args = transferArgs;
+      recipient_binding = recipientBinding;
+      public_value = args.v_pub_out;
+      pool_debit = poolDebit;
+      anchor_before = args.anchor;
+      root_after = rootAfter;
+      next_tree = next;
+      base_epoch = epoch;
+      verifier_outcome = verdict;
+      attempts = 1;
+      ledger_tip_before = ledgerTip;
+    };
+    let trapAfterToken = test_fail_after_token_once;
+    test_fail_after_token_once := false;
+    await drivePendingUnshield(intent, trapAfterToken, false)
+  };
+
+  func publicRecordBit(record : [Nat8], bitIndex : Nat) : Bool {
+    let byteIndex = bitIndex / 8;
+    let bitInByte = BIT_SHIFTS[bitIndex % 8];
+    ((Nat8.toNat(record[byteIndex]) / (2 ** bitInByte)) % 2) == 1
+  };
+
+  /// Fixed-shape private retrieval of a known note position. The API has no target index.
+  public query func pir_query_lwe(args : LwePirArgs) : async LwePirResponse {
+    let c0 = Prim.performanceCounter(0);
+    if (args.selectors.size() != noteCount()) {
+      Runtime.trap("selector count must equal the full note log length");
+    };
+    var selectorIndex : Nat = 0;
+    while (selectorIndex < args.selectors.size()) {
+      if (args.selectors[selectorIndex].a.size() != LWE_DIMENSION) {
+        Runtime.trap("wrong LWE selector dimension");
+      };
+      selectorIndex += 1;
+    };
+
+    let records = Array.tabulate<[Nat8]>(noteCount(), func(index) {
+      Blob.toArray(blockAt(index).commitment)
+    });
+    let outputs = Array.tabulate<LweCiphertext>(RECORD_BITS, func(bitIndex) {
+      let sumA = Prim.Array_init<Nat64>(LWE_DIMENSION, 0);
+      var sumB : Nat64 = 0;
+      var recordIndex : Nat = 0;
+      while (recordIndex < noteCount()) {
+        // Branching depends only on the public database bit, never the encrypted selector.
+        if (publicRecordBit(records[recordIndex], bitIndex)) {
+          let selector = args.selectors[recordIndex];
+          var coefficientIndex : Nat = 0;
+          while (coefficientIndex < LWE_DIMENSION) {
+            sumA[coefficientIndex] +%= selector.a[coefficientIndex];
+            coefficientIndex += 1;
+          };
+          sumB +%= selector.b;
+        };
+        recordIndex += 1;
+      };
+      { a = Array.fromVarArray(sumA); b = sumB }
+    });
+    let c1 = Prim.performanceCounter(0);
+    {
+      ciphertexts = outputs;
+      snapshot_root = note_root;
+      trace = {
+        records_scanned = noteCount();
+        selectors_received = args.selectors.size();
+        lwe_dimension = LWE_DIMENSION;
+        output_bits = RECORD_BITS;
+        selector_decryptions = 0;
+        target_index_parameters = 0;
+        target_dependent_branches = 0;
+        instructions = c1 - c0;
+      };
+    }
+  };
+}

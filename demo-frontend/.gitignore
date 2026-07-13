@@ -1,0 +1,17 @@
+node_modules/
+.mops/
+.dfx/
+dist/
+target/
+verify-shots/
+verify-shots*/
+verify-shots*.png
+prover-wasm/pkg/
+prover-wasm/target/
+# Generated wasm runtime (rebuild: cd prover-wasm && wasm-pack build --target web --release --out-dir ../src/prover-pkg)
+src/prover-pkg/
+# Generated declarations (rebuild: dfx generate)
+src/declarations/
+# The exact public proving keys are tracked: an OS-CSPRNG setup cannot be reproduced without
+# changing its verifying-key lineage. A real-value replacement must come from a reviewed ceremony.
+mops.lock
