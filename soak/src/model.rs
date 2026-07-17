@@ -71,6 +71,19 @@ pub struct ExpectedBlock {
     pub nullifiers: Vec<[u8; 32]>,
     pub anchor_before: [u8; 32],
     pub root_after: [u8; 32],
+    /// GROUND TRUTH for the B11 linkage audit (never used by the adversary, only for scoring):
+    /// the account that authored this block (shield depositor or transfer caller).
+    pub actor: usize,
+    /// the model note index this block's commitment corresponds to.
+    pub output_note: usize,
+}
+
+/// GROUND TRUTH for the B11 amount-correlation audit: a public value event (shield-in or
+/// unshield-out), with the block index and timestamp-bearing position it occurred at.
+#[derive(Clone, Debug)]
+pub struct PublicAmountEvent {
+    pub value: u64,
+    pub block_index: usize,
 }
 
 pub struct Model {
@@ -94,6 +107,10 @@ pub struct Model {
     pub cumulative_shield_in: u128,
     /// cumulative value paid out of the pool by unshields, including token fees
     pub cumulative_unshield_out: u128,
+    /// B11 ground truth: public shield-in value events (value is public on the token ledger)
+    pub shield_events: Vec<PublicAmountEvent>,
+    /// B11 ground truth: public unshield-out value events (v_pub_out is public on the token ledger)
+    pub unshield_events: Vec<PublicAmountEvent>,
 }
 
 impl Model {
@@ -118,6 +135,8 @@ impl Model {
             token_fee,
             cumulative_shield_in: 0,
             cumulative_unshield_out: 0,
+            shield_events: Vec::new(),
+            unshield_events: Vec::new(),
         }
     }
 
@@ -139,13 +158,17 @@ impl Model {
         self.cm_to_note.insert(f_bytes(&cm), idx);
         self.nf_to_note.insert(f_bytes(&nf), idx);
         self.unspent_by_account[acct.index].insert(idx);
+        let block_index = self.blocks.len();
         self.blocks.push(ExpectedBlock {
             origin: "shield",
             commitment: f_bytes(&cm),
             nullifiers: vec![],
             anchor_before,
             root_after,
+            actor: acct.index,
+            output_note: idx,
         });
+        self.shield_events.push(PublicAmountEvent { value: v, block_index });
         self.historical_roots.insert(root_after);
         self.token_balances[acct.index] = self.token_balances[acct.index]
             .checked_sub(v as u128 + self.token_fee as u128)
@@ -209,19 +232,23 @@ impl Model {
         // the SAME root_after (the root after both appends) and the proof's anchor as
         // anchor_before (src/Main.mo appendBlock calls at :1632-:1633 and :1397-:1398).
         let final_root = f_bytes(&roots_after[1]);
-        for (j, (owner, v, _)) in outs.iter().enumerate() {
-            let _ = (owner, v);
+        // the transaction's actor (caller) is the spender: the owner of the input notes.
+        let actor = self.notes[in1].owner;
+        for j in 0..2 {
             self.blocks.push(ExpectedBlock {
                 origin: "confidential_transfer",
                 commitment: f_bytes(&self.notes[new_note_indices[j]].cm),
                 nullifiers: nullifiers.clone(),
                 anchor_before: anchor,
                 root_after: final_root,
+                actor,
+                output_note: new_note_indices[j],
             });
         }
         self.historical_roots.insert(final_root);
         if v_pub_out > 0 {
             let recipient = recipient_acct.expect("unshield needs recipient");
+            self.unshield_events.push(PublicAmountEvent { value: v_pub_out, block_index: self.blocks.len() - 2 });
             // pool pays v_pub_out to the recipient plus the transparent fee.
             let debit = v_pub_out as u128 + self.token_fee as u128;
             self.pool_custody = self

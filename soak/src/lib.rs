@@ -13,6 +13,7 @@ pub mod cert;
 pub mod crypto;
 pub mod icrc3_hash;
 pub mod keys;
+pub mod linkage;
 pub mod mint_guard;
 pub mod model;
 pub mod observer;

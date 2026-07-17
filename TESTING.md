@@ -172,6 +172,19 @@ identical state hash.
     the keyed replayer reads all of them on the same stream. This is a leakage regression guard
     on the block encoding, not a proof of cryptographic unlinkability (that rests on the circuit
     design and its review). Shield/unshield token legs are public by design and out of scope.
+11. **Statistical correlation / cryptanalysis audit**: a keyless adversary sees only the public
+    block log (commitments, nullifiers, proof bytes, ordering and timestamps, and the public
+    shield/unshield amounts) and runs genuine linkage attacks, each scored against the model's
+    ground truth. (a) Nullifier-to-commitment linkage: for every spend, rank the true input
+    commitment against 255 decoys by byte correlation to the nullifier; the true input's
+    percentile rank must stay within a sample-size epsilon of 0.5 and the top-1 rate within
+    epsilon of 1/256. (b) Same-account linkage: classify balanced same-owner vs different-owner
+    output-commitment pairs by byte similarity; balanced accuracy must stay within epsilon of
+    0.5. Both are pass/fail cryptographic checks; a score that beats chance is treated as
+    a real leak, fails the run, and is written up as a proposal rather than softened. Like the
+    keyless-observer audit, they empirically confirm cryptographic unlinkability for this
+    dataset and are a regression guard; they are not a substitute for the circuit's
+    unlinkability argument.
 
 ### Scope notes
 

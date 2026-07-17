@@ -1188,6 +1188,30 @@ impl Runner {
                 leak.amount_needles, replay.recognized_notes
             ));
 
+        // B11: statistical correlation / cryptanalysis audit
+        let t4 = Instant::now();
+        let link = crate::linkage::run_audit(&self.model);
+        self.progress(&format!(
+            "B11 linkage: (a) nf->cm {} samples mean-percentile {:.4} top1 {:.5} (chance {:.5}); (b) same-account balanced-acc {:.4} over {} pairs; (c) amount unique-match {:.3} CI[{:.3},{:.3}] over {} unshields; (d) timing-adjacency {:.4} vs chance {:.4} ({:.1}s)",
+            link.nf_cm_samples, link.nf_cm_mean_percentile, link.nf_cm_top1_rate, link.nf_cm_chance_top1,
+            link.same_acct_balanced_acc, link.same_acct_samples,
+            link.amount_unique_match_rate, link.amount_unique_match_ci95.0, link.amount_unique_match_ci95.1, link.unshield_events,
+            link.adjacency_same_actor_rate, link.adjacency_chance, t4.elapsed().as_secs_f64()
+        ));
+        // (a) and (b) are PASS/FAIL: a beat-chance result is a real leak finding, surfaced by a
+        // panic here (that is a success of the harness, never softened).
+        crate::linkage::verdict(&link).unwrap_or_else(|e| {
+            panic!("B11 LINKAGE FINDING (investigate before weakening anything): {e}")
+        });
+        push(&mut battery, "B11-linkage-cryptanalysis",
+            format!(
+                "PASS crypto (a) nf->cm percentile {:.4} within {:.3} of 0.5, top1 {:.5}<=chance {:.5}; (b) same-account {:.4} within {:.3} of 0.5. MEASURE (c) amount unique-match {:.3} CI[{:.3},{:.3}]; (d) timing-adjacency {:.4} vs chance {:.4}",
+                link.nf_cm_mean_percentile, link.epsilon_a, link.nf_cm_top1_rate, link.nf_cm_chance_top1,
+                link.same_acct_balanced_acc, link.epsilon_b,
+                link.amount_unique_match_rate, link.amount_unique_match_ci95.0, link.amount_unique_match_ci95.1,
+                link.adjacency_same_actor_rate, link.adjacency_chance
+            ));
+
         let state_hash = self.model.state_hash(&replayer_tip_hash);
         (battery, state_hash, blocks.len() as u64)
     }
