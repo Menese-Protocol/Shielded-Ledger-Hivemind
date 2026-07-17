@@ -42,6 +42,12 @@ pub struct TierConfig {
     pub batch: usize,
     pub check_interval: usize,
     pub recycle_ops: usize,
+    /// durable checkpoint cadence (ops). Each checkpoint persists PocketIC state + the model so a
+    /// crash resumes from here. Also serves as the memory-recycle. 0 disables checkpointing.
+    pub checkpoint_ops: usize,
+    /// durable PocketIC state directory and model checkpoint file (for crash-resume).
+    pub state_dir: PathBuf,
+    pub checkpoint_file: PathBuf,
 }
 
 impl TierConfig {
@@ -57,9 +63,20 @@ impl TierConfig {
             upgrades: get("SOAK_UPGRADES", 3) as usize,
             batch: get("SOAK_BATCH", 46) as usize,
             check_interval: get("SOAK_CHECK_INTERVAL", 1000) as usize,
-            // recycle the PocketIC instance every this-many ops to bound server memory over a
-            // long run (DFINITY drop_and_take_state pattern). 0 disables recycling.
-            recycle_ops: get("SOAK_RECYCLE_OPS", 100) as usize,
+            // pure in-process memory recycle (no durable persist). 0 disables; the durable
+            // checkpoint below also recycles, so this is usually left 0.
+            recycle_ops: get("SOAK_RECYCLE_OPS", 0) as usize,
+            checkpoint_ops: get("SOAK_CHECKPOINT_OPS", 2000) as usize,
+            state_dir: std::env::var("SOAK_STATE_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| {
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("checkpoints/state")
+                }),
+            checkpoint_file: std::env::var("SOAK_CHECKPOINT_FILE")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| {
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("checkpoints/model.ckpt")
+                }),
         }
     }
 }
@@ -86,6 +103,40 @@ pub const ALL_INJECTIONS: [InjectionClass; 7] = [
     InjectionClass::InsufficientAllowance,
     InjectionClass::CounterfeitMint,
 ];
+
+impl InjectionClass {
+    fn to_u8(self) -> u8 {
+        ALL_INJECTIONS.iter().position(|c| *c == self).unwrap() as u8
+    }
+    fn from_u8(b: u8) -> Self {
+        ALL_INJECTIONS[b as usize]
+    }
+}
+
+impl Counters {
+    fn to_array(&self) -> [u64; 7] {
+        [
+            self.shields,
+            self.private_transfers,
+            self.unshields,
+            self.fault_shield,
+            self.fault_unshield,
+            self.injections,
+            self.injections_rejected,
+        ]
+    }
+    fn from_array(a: [u64; 7]) -> Self {
+        Counters {
+            shields: a[0],
+            private_transfers: a[1],
+            unshields: a[2],
+            fault_shield: a[3],
+            fault_unshield: a[4],
+            injections: a[5],
+            injections_rejected: a[6],
+        }
+    }
+}
 
 enum PlannedOp {
     Shield { acct: usize, prepared: Box<PreparedShield> },
@@ -119,7 +170,7 @@ struct PlannedJob {
     bp: Blueprint,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, serde::Deserialize, Clone)]
 pub struct InjectionTranscript {
     pub class: String,
     pub op_index: u64,
@@ -191,6 +242,9 @@ pub struct Runner {
     pub upgrades_done: Vec<u64>,
     progress_path: Option<String>,
     fixture_proof_hex: String,
+    pub resumed_from: u64,
+    executed_start: u64,
+    next_upgrade_start: usize,
     pub started: Instant,
 }
 
@@ -211,17 +265,112 @@ const ALLOWANCE: u128 = 1 << 60;
 impl Runner {
     pub fn new(tier: TierConfig, keys: Keyset, wasms: &pic_env::BuiltWasms) -> Self {
         let cfg = common::poseidon_config();
-        let env = pic_env::setup(wasms, &keys.transfer_vk_hex, &keys.deposit_vk_hex);
         let accounts = derive_accounts(tier.seed, tier.accounts, &cfg);
         let pauper = derive_accounts(tier.seed.wrapping_add(0xdead), tier.accounts + 1, &cfg)
             .pop()
             .unwrap();
+        let fixture_proof_hex = std::fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .join("fixtures/pool-vectors-bls12-381/transfer_proof.hex"),
+        )
+        .expect("read fixture transfer proof")
+        .trim()
+        .to_string();
+
+        // RESUME PATH: a matching checkpoint (same seed) means a prior process was interrupted.
+        if tier.checkpoint_ops > 0 {
+            if let Some(ckpt) = crate::checkpoint::load(&tier.checkpoint_file) {
+                if ckpt.seed == tier.seed && ckpt.accounts == tier.accounts {
+                    println!(
+                        "[resume] found checkpoint at op {} (seed {}); reloading PocketIC state + model...",
+                        ckpt.executed, ckpt.seed
+                    );
+                    let env = pic_env::resume(
+                        &tier.state_dir,
+                        ckpt.ledger,
+                        ckpt.token,
+                        ckpt.tree_oracle,
+                        ckpt.admin,
+                        ckpt.token_fee,
+                        wasms.ledger.clone(),
+                    );
+                    // reconstruct the runner state from the checkpoint
+                    let rng = ckpt.rng.clone();
+                    let op_index = ckpt.op_index;
+                    let executed = ckpt.executed;
+                    let upgrade_points = ckpt.upgrade_points.clone();
+                    let next_upgrade = ckpt.next_upgrade;
+                    let upgrades_done = ckpt.upgrades_done.clone();
+                    let pauper_used = ckpt.pauper_used;
+                    let counters = Counters::from_array(ckpt.counters);
+                    let injection_counts: std::collections::HashMap<InjectionClass, u64> = ckpt
+                        .injection_counts
+                        .iter()
+                        .map(|(b, c)| (InjectionClass::from_u8(*b), *c))
+                        .collect();
+                    let report_injections: Vec<InjectionTranscript> =
+                        serde_json::from_str(&ckpt.report_injections_json).unwrap_or_default();
+                    let last_accepted_private = ckpt
+                        .last_accepted_private
+                        .as_ref()
+                        .map(|b| candid::decode_one::<ct::TransferArgs>(b).expect("decode replay args"));
+                    let model = ckpt.into_model(&cfg);
+                    let runner = Runner {
+                        fixture_proof_hex,
+                        progress_path: std::env::var("SOAK_PROGRESS_LOG").ok(),
+                        resumed_from: executed,
+                        tier,
+                        keys,
+                        env,
+                        model,
+                        accounts,
+                        cfg,
+                        rng,
+                        op_index,
+                        last_accepted_private,
+                        pauper,
+                        pauper_used,
+                        report_injections,
+                        injection_counts,
+                        counters,
+                        upgrade_points,
+                        upgrades_done,
+                        executed_start: executed,
+                        next_upgrade_start: next_upgrade,
+                        started: Instant::now(),
+                    };
+                    // consistency: the reloaded canister must agree with the reloaded model
+                    let status = runner.env.ledger_status();
+                    let cn = u64::try_from(status.note_count.0.clone()).unwrap();
+                    assert_eq!(
+                        cn,
+                        runner.model.blocks.len() as u64,
+                        "resume: canister note_count {cn} != model blocks {}. Checkpoint inconsistent.",
+                        runner.model.blocks.len()
+                    );
+                    assert_eq!(
+                        status.note_root.as_slice(),
+                        f_bytes(&runner.model.mirror.root()).as_slice(),
+                        "resume: canister note_root != model mirror root"
+                    );
+                    println!("[resume] consistent at op {executed}: note_count {cn}, root matches.");
+                    return runner;
+                }
+            }
+        }
+
+        // FRESH PATH: clear any stale durable state, set up, and fund.
+        let _ = std::fs::remove_file(&tier.checkpoint_file);
+        let _ = std::fs::remove_dir_all(&tier.state_dir);
+        std::fs::create_dir_all(&tier.state_dir).expect("create state dir");
+        std::fs::create_dir_all(tier.checkpoint_file.parent().unwrap()).ok();
+        let env = pic_env::setup(wasms, &keys.transfer_vk_hex, &keys.deposit_vk_hex, &tier.state_dir);
         let principals: Vec<Principal> = accounts.iter().map(|a| a.principal).collect();
         println!("[setup] funding {} accounts on the token fixture...", principals.len());
         let t0 = Instant::now();
         pic_env::fund_accounts(&env, &principals, INITIAL_BALANCE, ALLOWANCE);
-        // the pauper's allowance covers less than any shield value + fee: the
-        // insufficient-allowance class must be rejected by the token leg.
         pic_env::fund_accounts(&env, &[pauper.principal], INITIAL_BALANCE, 1);
         println!("[setup] funded in {:.1}s", t0.elapsed().as_secs_f64());
 
@@ -236,18 +385,10 @@ impl Runner {
             .collect();
         upgrade_points.sort();
         println!("[setup] upgrade points at ops {upgrade_points:?}");
-        let fixture_proof_hex = std::fs::read_to_string(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .parent()
-                .unwrap()
-                .join("fixtures/pool-vectors-bls12-381/transfer_proof.hex"),
-        )
-        .expect("read fixture transfer proof")
-        .trim()
-        .to_string();
         Runner {
             fixture_proof_hex,
             progress_path: std::env::var("SOAK_PROGRESS_LOG").ok(),
+            resumed_from: 0,
             tier,
             keys,
             env,
@@ -264,8 +405,49 @@ impl Runner {
             counters: Default::default(),
             upgrade_points,
             upgrades_done: Vec::new(),
+            executed_start: 0,
+            next_upgrade_start: 0,
             started: Instant::now(),
         }
+    }
+
+    /// Persist a durable checkpoint: flush PocketIC state to the state dir (via recycle) and write
+    /// the model + planner state to the checkpoint file. Returns the recycle wall-time.
+    fn checkpoint(&mut self, executed: u64, next_upgrade: usize, last_recycle: u64, last_checkpoint: u64) -> f64 {
+        let t = Instant::now();
+        // recycle persists the PocketIC instance to the durable state dir and frees server memory
+        self.env.recycle();
+        let model_part = crate::checkpoint::Checkpoint::from_model(&self.model);
+        let last_private = self
+            .last_accepted_private
+            .as_ref()
+            .map(|a| candid::encode_one(a).expect("encode replay args"));
+        let injection_counts: Vec<(u8, u64)> = self
+            .injection_counts
+            .iter()
+            .map(|(k, v)| (k.to_u8(), *v))
+            .collect();
+        let ckpt = model_part.into_checkpoint(
+            self.tier.seed,
+            self.tier.accounts,
+            self.env.token_fee,
+            (self.env.ledger, self.env.token, self.env.tree_oracle, self.env.admin),
+            executed,
+            self.op_index,
+            self.upgrade_points.clone(),
+            next_upgrade,
+            self.upgrades_done.clone(),
+            last_recycle,
+            last_checkpoint,
+            self.pauper_used,
+            self.rng.clone(),
+            injection_counts,
+            self.counters.to_array(),
+            serde_json::to_string(&self.report_injections).unwrap(),
+            last_private,
+        );
+        crate::checkpoint::save(&ckpt, &self.tier.checkpoint_file);
+        t.elapsed().as_secs_f64()
     }
 
     fn progress(&self, line: &str) {
@@ -968,12 +1150,16 @@ impl Runner {
     }
 
     pub fn run(&mut self) -> u64 {
-        let mut executed: u64 = 0;
+        let mut executed: u64 = self.executed_start;
         let total = self.tier.ops as u64;
-        let mut next_upgrade = 0usize;
-        let mut last_checkpoint = 0u64;
-        let mut last_recycle = 0u64;
+        let mut next_upgrade = self.next_upgrade_start;
+        let mut last_checkpoint = executed;
+        let mut last_recycle = executed;
+        let mut last_durable_ckpt = executed;
         let mut upgrade_since_recycle = false;
+        if self.resumed_from > 0 {
+            self.progress(&format!("resumed at op {} of {total}", self.resumed_from));
+        }
         while executed < total {
             let want = self.tier.batch.min((total - executed) as usize);
             let plan = self.plan_batch(want);
@@ -1007,6 +1193,7 @@ impl Runner {
                 }
             }
             let submitting = t1.elapsed().as_secs_f64();
+            // pure in-process recycle (memory only), if configured separately from checkpointing
             let interval_due = self.tier.recycle_ops > 0
                 && executed / self.tier.recycle_ops as u64 > last_recycle / self.tier.recycle_ops as u64;
             if executed < total && (interval_due || upgrade_since_recycle) {
@@ -1014,9 +1201,18 @@ impl Runner {
                 self.env.recycle();
                 last_recycle = executed;
                 upgrade_since_recycle = false;
-                // the recycled instance must carry identical state
                 self.cheap_invariants();
                 self.progress(&format!("recycled instance at op {executed} in {:.1}s (server memory freed, recycle #{})", t.elapsed().as_secs_f64(), self.env.recycles));
+            }
+            // DURABLE CHECKPOINT: persist PocketIC state + model so a crash resumes from here.
+            let ckpt_due = self.tier.checkpoint_ops > 0
+                && executed / self.tier.checkpoint_ops as u64 > last_durable_ckpt / self.tier.checkpoint_ops as u64;
+            if executed < total && (ckpt_due || (upgrade_since_recycle && self.tier.checkpoint_ops > 0)) {
+                let secs = self.checkpoint(executed, next_upgrade, last_recycle, last_checkpoint);
+                last_durable_ckpt = executed;
+                upgrade_since_recycle = false;
+                self.cheap_invariants();
+                self.progress(&format!("durable checkpoint at op {executed} in {secs:.1}s (state persisted, resumable)"));
             }
             if executed - last_checkpoint >= 5000 || executed >= total {
                 let rate = executed as f64 / self.started.elapsed().as_secs_f64();

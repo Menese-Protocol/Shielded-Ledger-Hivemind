@@ -44,9 +44,10 @@ serde_bytes = "0.11"
 sha2 = "0.10"
 hex = "0.4"
 rand = "0.8"
-rand_chacha = "0.3"
+rand_chacha = { version = "0.3", features = ["serde1"] }
 rayon = "1"
 num-bigint = "0.4"
+bincode = "1"
 
 # certificate verification for B6 (same crates and versions as cert_oracle/)
 ic-certification = "=3.2.0"

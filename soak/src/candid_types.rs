@@ -79,14 +79,14 @@ pub struct DepositArgs {
     pub proof_hex: String,
 }
 
-#[derive(CandidType, Clone, Debug)]
+#[derive(CandidType, Deserialize, Clone, Debug)]
 pub struct OutputRecord {
     pub commitment: Blob,
     pub ephemeral_key: Blob,
     pub note_ciphertext: Blob,
 }
 
-#[derive(CandidType, Clone, Debug)]
+#[derive(CandidType, Deserialize, Clone, Debug)]
 pub struct TransferArgs {
     pub anchor: Blob,
     pub nullifier_1: Blob,

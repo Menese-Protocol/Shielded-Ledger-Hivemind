@@ -15,3 +15,4 @@ node_modules/
 /coordinator/battery/target/
 /coordinator/.mops/
 /demo-frontend/contributor-wasm/target/
+/soak/checkpoints/

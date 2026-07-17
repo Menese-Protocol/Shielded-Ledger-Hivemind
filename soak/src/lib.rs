@@ -10,6 +10,7 @@
 pub mod bench;
 pub mod candid_types;
 pub mod cert;
+pub mod checkpoint;
 pub mod crypto;
 pub mod icrc3_hash;
 pub mod keys;

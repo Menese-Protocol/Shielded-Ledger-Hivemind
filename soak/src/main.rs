@@ -117,6 +117,10 @@ fn main() {
             std::fs::write(&out_path, serde_json::to_string_pretty(&report).unwrap())
                 .expect("write report");
 
+            // the run completed: clear the durable checkpoint so a future rerun starts fresh
+            let _ = std::fs::remove_file(&tier.checkpoint_file);
+            let _ = std::fs::remove_dir_all(&tier.state_dir);
+
             println!("=== SOAK COMPLETE ===");
             println!("tier        : {} ({} accounts / {} ops)", tier.label, tier.accounts, executed);
             println!("SEED        : {}", tier.seed);

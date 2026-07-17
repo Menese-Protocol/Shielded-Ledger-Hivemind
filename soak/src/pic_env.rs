@@ -287,14 +287,39 @@ impl Env {
     }
 }
 
-/// Start PocketIC, install and wire all canisters. `keyset_vks` are the regenerated vk hexes.
-pub fn setup(wasms: &BuiltWasms, transfer_vk_hex: &str, deposit_vk_hex: &str) -> Env {
+/// Rebuild the Env from a durable state directory written by an earlier (crashed) process. The
+/// canister ids, root key, time, and all state are reloaded from disk; no configure or funding is
+/// redone. Used by the crash-resume path.
+pub fn resume(state_dir: &Path, ledger: Principal, token: Principal, tree_oracle: Principal, admin: Principal, token_fee: u64, ledger_wasm: Vec<u8>) -> Env {
+    let binary = resolve_pocket_ic_server();
+    let server = std::sync::Arc::new(spawn_server(&binary));
+    let pic = PocketIcBuilder::new()
+        .with_server_url(server.url.clone())
+        .with_state_dir(state_dir.to_path_buf())
+        .with_max_request_time_ms(Some(600_000))
+        .build();
+    Env {
+        pic: Some(pic),
+        server,
+        admin,
+        ledger,
+        token,
+        tree_oracle,
+        ledger_wasm,
+        token_fee,
+        recycles: 0,
+    }
+}
+
+/// Start PocketIC, install and wire all canisters. `state_dir` is a durable directory the run
+/// checkpoints into (must be empty for a fresh run).
+pub fn setup(wasms: &BuiltWasms, transfer_vk_hex: &str, deposit_vk_hex: &str, state_dir: &Path) -> Env {
     let binary = resolve_pocket_ic_server();
     let server = std::sync::Arc::new(spawn_server(&binary));
     let pic = PocketIcBuilder::new()
         .with_server_url(server.url.clone())
         .with_nns_subnet()
-        .with_state(PocketIcState::new())
+        .with_state_dir(state_dir.to_path_buf())
         .with_max_request_time_ms(Some(600_000))
         .build();
     pic.set_time(pocket_ic::Time::from_nanos_since_unix_epoch(GENESIS_NS));
