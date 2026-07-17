@@ -2,6 +2,9 @@
 /.mops/
 /target/
 /circuit/target/
+/soak/target/
+/soak/results/
+/nns_adapter/target/
 /e2e-result.json
 __pycache__/
 node_modules/

@@ -145,6 +145,16 @@ the canister compile gates and the DEMO token API boundary; key provenance with 
 controls; and a production frontend build booted in a real browser. `--with-replica-e2e`
 additionally runs the stateful local-replica suite.
 
+## Testing
+
+Four surfaces cover this system: the offline security gate above, the stateful replica suite
+(`e2e.py`), a randomized model-checked PocketIC soak (`soak/`) that drives tens of thousands of
+seeded random operations across thousands of accounts and verifies every account balance, block
+link, and solvency invariant with an independent replayer, and the Motoko unit tests. What each
+one asserts and how to run it, including the soak tiers and how to change the seed or scale, is
+mapped in [`TESTING.md`](TESTING.md). The soak's results, including the full 10,000-account /
+100,000-operation run, are in [`docs/SOAK-RESULT.md`](docs/SOAK-RESULT.md).
+
 ## Trusted setup; read this before you trust it
 
 Groth16 requires a trusted setup, and this repository refuses to hide that behind small print.
