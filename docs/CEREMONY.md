@@ -174,11 +174,18 @@ The standalone verifier and the contributor client are Rust and wasm builds pinn
   ceremony with very few independent participants is weaker than one with many. Contribute if you can.
 - The inherited Phase-1 rests on the Zcash Sapling participant set. We verify its structure and pin
   its hash, but its 1-of-N honesty is inherited, not re-run.
-- On-chain acceptance verifies the proof of knowledge (soundness). The full parameter-consistency
-  check is off-chain. A dishonest contributor cannot forge soundness on-chain, but could upload
-  correctly-proven yet malformed parameters that break proving for later contributors. This is
-  detected by the off-chain verifier and by the final key self-check, and the affected contribution
-  can be excluded and the ceremony continued.
+- On-chain acceptance verifies STRUCTURAL validity only: each point is canonically encoded, on the
+  curve, and not the identity, the parameters actually changed, the lengths are right, and the running
+  challenge chains correctly. The coordinator records the proof into the public transcript but does
+  NOT verify it on-chain. The soundness-critical proof of knowledge (the subgroup and pairing checks)
+  AND the full parameter-consistency check across every parameter point are both performed OFF-CHAIN
+  by the standalone verifier over the published transcript. So a dishonest contributor CAN upload a
+  structurally-valid but unsound (invalid proof of knowledge) or otherwise malformed contribution and
+  have it appended on-chain; it is caught off-chain by the verifier and by the final key self-check,
+  and the affected contribution is excluded and the ceremony continued.
+- THE FINAL KEYS MUST NOT BE TRUSTED UNTIL THE OFF-CHAIN VERIFIER ACCEPTS THE FULL TRANSCRIPT.
+  Running the standalone verifier to completion on the published transcript is a required gate before
+  the keys are used with any value; on-chain acceptance alone is not sufficient assurance.
 - This repository produces the coordinator, the client, the reproducible build, the verifier, and the
   spec, and proves them on a local replica. The mainnet deployment of the coordinator and the launch
   of the ceremony against the inherited Phase-1 string are the operator's steps and are not performed
