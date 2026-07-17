@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Shielded ledger — Phase-2 trusted-setup contributor</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 15px/1.5 system-ui, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.4rem; }
+  .card { border: 1px solid #8884; border-radius: 10px; padding: 1rem 1.2rem; margin: 1rem 0; }
+  button { font: inherit; padding: .5rem 1rem; border-radius: 8px; border: 1px solid #8886; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  .row { display: flex; gap: .6rem; align-items: center; flex-wrap: wrap; }
+  .mono { font-family: ui-monospace, monospace; font-size: .82rem; word-break: break-all; }
+  .ok { color: #178a3a; } .warn { color: #b26a00; } .err { color: #c02626; }
+  #log { white-space: pre-wrap; }
+  label { display: inline-flex; gap: .4rem; align-items: center; }
+  input { font: inherit; padding: .35rem .5rem; border-radius: 6px; border: 1px solid #8886; }
+</style>
+</head>
+<body>
+  <h1>Phase-2 trusted-setup contributor</h1>
+  <p>
+    You are about to add fresh randomness to the shielded-ledger proving parameters. Your secret is
+    generated, used, and destroyed <strong>in this browser tab</strong>. Only transformed public
+    parameters and a proof of knowledge are uploaded. If even one contributor (you can be that one)
+    destroys their secret honestly, the final parameters are secure.
+  </p>
+
+  <div class="card">
+    <div class="row">
+      <label>Coordinator canister id <input id="canisterId" size="30" placeholder="aaaaa-aa" /></label>
+      <label>Host <input id="host" size="24" value="http://127.0.0.1:4945" /></label>
+    </div>
+    <div class="row" style="margin-top:.6rem">
+      <button id="connect">Connect &amp; sign in</button>
+      <span id="whoami" class="mono"></span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3 style="margin-top:0">Ceremony status</h3>
+    <div id="status" class="mono">not connected</div>
+    <div class="row" style="margin-top:.6rem">
+      <button id="join" disabled>Join the queue</button>
+      <button id="contribute" disabled>Contribute now (my turn)</button>
+      <button id="refresh" disabled>Refresh</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3 style="margin-top:0">Activity</h3>
+    <div id="log" class="mono"></div>
+  </div>
+
+  <p class="mono" style="opacity:.7">
+    Apply-and-destroy (Bowe-Gabizon-Miers 2017). The secret never leaves this tab: the wasm module
+    exposes only <code>transform_contribution</code>, which returns transformed public parameters and
+    a public proof; there is no export that carries the secret, so no network call can.
+  </p>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

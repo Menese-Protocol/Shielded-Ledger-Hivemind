@@ -1,0 +1,10 @@
+[package]
+name = "ceremony-coordinator"
+version = "0.1.0"
+description = "Phase-2 trusted-setup ceremony coordinator canister (never holds a secret)"
+
+# Pinned to the exact versions the reproducible build asserts. The coordinator reuses the
+# in-repo BLS12-381 tower under ../src/groth16 by relative import; only sha2 + core are external.
+[dependencies]
+core = "1.0.0"
+sha2 = "0.1.9"

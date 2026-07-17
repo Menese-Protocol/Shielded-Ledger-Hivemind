@@ -11,3 +11,7 @@ node_modules/
 !/vendor/verifier/verifier.wasm
 !/vendor/tree_oracle/tree_oracle.wasm
 !/vendor/tree_oracle_bls/tree_oracle_bls.wasm
+/ceremony/target/
+/coordinator/battery/target/
+/coordinator/.mops/
+/demo-frontend/contributor-wasm/target/

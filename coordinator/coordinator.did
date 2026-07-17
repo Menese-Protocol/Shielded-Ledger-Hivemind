@@ -1,0 +1,115 @@
+type R = 
+ variant {
+   err: text;
+   ok: text;
+ };
+type PokWire = 
+ record {
+   r_delta_g2: blob;
+   s_delta_g1: blob;
+   s_g1: blob;
+ };
+type ContributionMeta = 
+ record {
+   beacon: blob;
+   contributor: blob;
+   deposit_delta_hash: blob;
+   deposit_delta_len: nat;
+   deposit_pok: PokWire;
+   index: nat;
+   is_beacon: bool;
+   timestamp: int;
+   transfer_delta_hash: blob;
+   transfer_delta_len: nat;
+   transfer_pok: PokWire;
+ };
+type Circuit = 
+ variant {
+   deposit;
+   transfer;
+ };
+type CeremonyInfo = 
+ record {
+   authority: principal;
+   configured: bool;
+   contribution_count: nat;
+   current_turn: opt principal;
+   current_turn_started: int;
+   deposit_fixed_hash: blob;
+   deposit_initial_hash: blob;
+   end_time: int;
+   finalized: bool;
+   genesis_challenge: blob;
+   honest_count: nat;
+   init_done: bool;
+   now: int;
+   phase: text;
+   power: nat32;
+   queue_length: nat;
+   running_challenge: blob;
+   srs_sha256: blob;
+   start_time: int;
+   transfer_fixed_hash: blob;
+   transfer_initial_hash: blob;
+   turn_timeout: int;
+ };
+/// Phase-2 trusted-setup ceremony COORDINATOR (Deliverable D1).
+/// 
+/// THE COORDINATOR NEVER HOLDS A SECRET. Its entire state is public: the running accumulator's
+/// delta-dependent parameters (per circuit), each contribution's proof of knowledge and parameter
+/// hashes, the participant queue and log, the ceremony window, and the finalize beacon. There is no
+/// field, argument, or code path that receives, stores, or reconstructs any participant's secret.
+/// The secret is sampled, applied, and destroyed in the contributor's browser; only transformed
+/// public parameters and a proof are uploaded (apply-and-destroy, Bowe-Gabizon-Miers 2017).
+/// 
+/// On acceptance the coordinator runs the O(1)-pairing proof-of-knowledge check on-chain (soundness)
+/// and records the contribution; the full delta-division-consistency check (correctness) is run
+/// off-chain by the standalone verifier over the published transcript, which this canister serves in
+/// full. Parameters are uploaded and downloaded in <2 MB chunks (a transfer contribution is ~2.5 MB).
+service : {
+  abort_contribution: () -> (R);
+  /// The authority may open a staging slot for the beacon even though it is not "their turn".
+  begin_beacon_staging: () -> (R);
+  begin_contribution: () -> (R);
+  /// First caller becomes the authority and sets the ceremony parameters. `power`, the SRS and
+  /// fixed-params hashes, and the window come from the operator; they are all public.
+  configure: (p: nat32, srs_sha256: blob, transfer_fixed_hash: blob,
+   deposit_fixed_hash: blob, start_time: int, end_time: int, turn_timeout:
+   int) -> (R);
+  /// Freeze the initial parameters, compute their hashes and the genesis challenge.
+  finish_init: () -> (R);
+  get_ceremony_info: () -> (CeremonyInfo) query;
+  get_contribution: (i: nat) -> (opt ContributionMeta) query;
+  get_contribution_chunk: (i: nat, circuit: Circuit, offset: nat, len:
+   nat) -> (blob) query;
+  get_current_params_chunk: (circuit: Circuit, offset: nat, len: nat) ->
+   (blob) query;
+  /// Metadata of the current (base) delta parameters the next contributor transforms.
+  get_current_params_meta: () ->
+   (record {
+      deposit_hash: blob;
+      deposit_len: nat;
+      transfer_hash: blob;
+      transfer_len: nat;
+    }) query;
+  get_initial_chunk: (circuit: Circuit, offset: nat, len: nat) ->
+   (blob) query;
+  get_transcript_summary: () ->
+   (record {
+      count: nat;
+      deposit_initial_hash: blob;
+      finalized: bool;
+      genesis_challenge: blob;
+      power: nat32;
+      running_challenge: blob;
+      srs_sha256: blob;
+      transfer_initial_hash: blob;
+    }) query;
+  join_queue: () -> (R);
+  /// Finalize: the authority applies the public beacon after the window closes or the queue drains.
+  submit_beacon: (beacon: blob, transfer_pok: PokWire, deposit_pok:
+   PokWire) -> (R);
+  submit_contribution: (transfer_pok: PokWire, deposit_pok: PokWire) -> (R);
+  upload_contribution_chunk: (circuit: Circuit, chunk: blob) -> (R);
+  upload_initial_chunk: (circuit: Circuit, chunk: blob) -> (R);
+}
