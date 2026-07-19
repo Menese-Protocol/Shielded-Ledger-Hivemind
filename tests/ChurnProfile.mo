@@ -22,6 +22,7 @@ import VarArray "mo:core/VarArray";
 import Prim "mo:⛔";
 import FpM "../src/groth16/FpMont";
 import FpFlat "../src/groth16/FpFlat";
+import TF "../src/groth16/TowerFlat";
 import TM "../src/groth16/TowerMont";
 import C "../src/groth16/Curve";
 import CJ "../src/groth16/CurveJac";
@@ -302,6 +303,203 @@ persistent actor ChurnProfile {
       if (FpFlat.toNat(z, 24) != FpM.toMont(1)) return gateFail("one-mont", checked);
     };
     { pass = true; checked; detail = "FpFlat == FpMont on edge grid + random vectors" }
+  };
+
+  // ---- tower gates: arena layout A@0(144) B@144(144) aux fp2s@300..372 D@372(144), scratch S@528 ----
+  transient let TW_S : Nat = 528; // element region 0..516 (gate_fp12 D@372+144), scratch above
+
+  func twArena() : [var Nat32] { FpFlat.newBuf((TW_S + TF.SCRATCH_LIMBS + 11) / 12 + 1) };
+
+  func putFp(z : [var Nat32], off : Nat, x : Nat) { FpFlat.fromNat(x, z, off) };
+  func putFp2(z : [var Nat32], off : Nat, e : TM.Fp2M) {
+    putFp(z, off, e.c0);
+    putFp(z, off + 12, e.c1);
+  };
+  func putFp6(z : [var Nat32], off : Nat, e : TM.Fp6M) {
+    putFp2(z, off, e.c0);
+    putFp2(z, off + 24, e.c1);
+    putFp2(z, off + 48, e.c2);
+  };
+  func putFp12(z : [var Nat32], off : Nat, e : TM.Fp12M) {
+    putFp6(z, off, e.c0);
+    putFp6(z, off + 72, e.c1);
+  };
+  func getFp2(z : [var Nat32], off : Nat) : TM.Fp2M {
+    { c0 = FpFlat.toNat(z, off); c1 = FpFlat.toNat(z, off + 12) }
+  };
+  func getFp6(z : [var Nat32], off : Nat) : TM.Fp6M {
+    { c0 = getFp2(z, off); c1 = getFp2(z, off + 24); c2 = getFp2(z, off + 48) }
+  };
+  func getFp12(z : [var Nat32], off : Nat) : TM.Fp12M {
+    { c0 = getFp6(z, off); c1 = getFp6(z, off + 72) }
+  };
+  func eqFp2(a : TM.Fp2M, b : TM.Fp2M) : Bool { a.c0 == b.c0 and a.c1 == b.c1 };
+  func eqFp6(a : TM.Fp6M, b : TM.Fp6M) : Bool {
+    eqFp2(a.c0, b.c0) and eqFp2(a.c1, b.c1) and eqFp2(a.c2, b.c2)
+  };
+  func eqFp12(a : TM.Fp12M, b : TM.Fp12M) : Bool { eqFp6(a.c0, b.c0) and eqFp6(a.c1, b.c1) };
+
+  func randFp2(k : Nat) : TM.Fp2M {
+    // first vectors exercise the degenerate shapes (zero / one / single-component)
+    switch (k) {
+      case 0 { { c0 = 0; c1 = 0 } };
+      case 1 { { c0 = FpM.toMont(1); c1 = 0 } };
+      case 2 { { c0 = 0; c1 = randFp() } };
+      case 3 { { c0 = randFp(); c1 = 0 } };
+      case _ { { c0 = randFp(); c1 = randFp() } };
+    }
+  };
+  func randFp6(k : Nat) : TM.Fp6M {
+    switch (k) {
+      case 0 { { c0 = randFp2(0); c1 = randFp2(0); c2 = randFp2(0) } };
+      case 1 { { c0 = randFp2(1); c1 = randFp2(0); c2 = randFp2(0) } };
+      case _ { { c0 = randFp2(4); c1 = randFp2(4); c2 = randFp2(4) } };
+    }
+  };
+  func randFp12(k : Nat) : TM.Fp12M {
+    switch (k) {
+      case 0 { { c0 = randFp6(0); c1 = randFp6(0) } };
+      case 1 { { c0 = randFp6(1); c1 = randFp6(0) } };
+      case _ { { c0 = randFp6(2); c1 = randFp6(2) } };
+    }
+  };
+
+  /// Differential test (Fp2): flat Fp2 vs TowerMont — mul/sqrFast/add/sub/neg/nonresidue/mulByFp, inv strided.
+  public func gate_fp2_flat(iters : Nat) : async Gate {
+    let z = twArena();
+    var k = 0;
+    while (k < iters) {
+      let a = randFp2(k);
+      let b = randFp2(if (k < 5) (k + 1) % 5 else 4);
+      let fp = randFp();
+      putFp2(z, 0, a);
+      putFp2(z, 24, b);
+      putFp(z, 48, fp);
+      TF.fp2MulInto(z, 288, 0, 24, TW_S);
+      if (not eqFp2(getFp2(z, 288), TM.fp2Mul(a, b))) return gateFail("fp2Mul", k);
+      TF.fp2SqrFastInto(z, 288, 0, TW_S);
+      if (not eqFp2(getFp2(z, 288), TM.fp2SqrFast(a))) return gateFail("fp2SqrFast", k);
+      TF.fp2AddInto(z, 288, 0, 24);
+      if (not eqFp2(getFp2(z, 288), TM.fp2Add(a, b))) return gateFail("fp2Add", k);
+      TF.fp2SubInto(z, 288, 0, 24);
+      if (not eqFp2(getFp2(z, 288), TM.fp2Sub(a, b))) return gateFail("fp2Sub", k);
+      TF.fp2NegInto(z, 288, 0);
+      if (not eqFp2(getFp2(z, 288), TM.fp2Neg(a))) return gateFail("fp2Neg", k);
+      TF.fp2MulByNonresidueInto(z, 288, 0, TW_S);
+      if (not eqFp2(getFp2(z, 288), TM.fp2MulByNonresidue(a))) return gateFail("fp2Nonres", k);
+      TF.fp2MulByFpInto(z, 288, 0, 48, TW_S);
+      if (not eqFp2(getFp2(z, 288), TM.fp2MulByFp(a, fp))) return gateFail("fp2MulByFp", k);
+      // aliased mul: a := a*b in place
+      TF.fp2Copy(z, 288, 0);
+      TF.fp2MulInto(z, 288, 288, 24, TW_S);
+      if (not eqFp2(getFp2(z, 288), TM.fp2Mul(a, b))) return gateFail("fp2Mul-alias", k);
+      if (k % 128 == 0 and not (a.c0 == 0 and a.c1 == 0)) {
+        TF.fp2InvInto(z, 288, 0, TW_S);
+        if (not eqFp2(getFp2(z, 288), TM.fp2Inv(a))) return gateFail("fp2Inv", k);
+      };
+      k += 1;
+    };
+    { pass = true; checked = iters; detail = "TowerFlat fp2 == TowerMont" }
+  };
+
+  /// Differential test (Fp6): flat Fp6 vs TowerMont — mul/add/sub/neg/mulByV/mulBy1/mulBy01, inv strided.
+  public func gate_fp6_flat(iters : Nat) : async Gate {
+    let z = twArena();
+    var k = 0;
+    while (k < iters) {
+      let a = randFp6(k);
+      let b = randFp6(if (k < 2) k + 1 else 2);
+      let c0 = randFp2(4);
+      let c1 = randFp2(4);
+      putFp6(z, 0, a);
+      putFp6(z, 144, b);
+      putFp2(z, 96, c0);
+      putFp2(z, 120, c1);
+      TF.fp6MulInto(z, 288, 0, 144, TW_S);
+      if (not eqFp6(getFp6(z, 288), TM.fp6Mul(a, b))) return gateFail("fp6Mul", k);
+      TF.fp6AddInto(z, 288, 0, 144);
+      if (not eqFp6(getFp6(z, 288), TM.fp6Add(a, b))) return gateFail("fp6Add", k);
+      TF.fp6SubInto(z, 288, 0, 144);
+      if (not eqFp6(getFp6(z, 288), TM.fp6Sub(a, b))) return gateFail("fp6Sub", k);
+      TF.fp6MulByVInto(z, 288, 0, TW_S);
+      if (not eqFp6(getFp6(z, 288), TM.fp6MulByV(a))) return gateFail("fp6MulByV", k);
+      TF.fp6MulBy1Into(z, 288, 0, 120, TW_S);
+      if (not eqFp6(getFp6(z, 288), TM.fp6MulBy1(a, c1))) return gateFail("fp6MulBy1", k);
+      TF.fp6MulBy01Into(z, 288, 0, 96, 120, TW_S);
+      if (not eqFp6(getFp6(z, 288), TM.fp6MulBy01(a, c0, c1))) return gateFail("fp6MulBy01", k);
+      // aliased in-place mul
+      TF.fp6Copy(z, 288, 0);
+      TF.fp6MulInto(z, 288, 288, 288, TW_S);
+      if (not eqFp6(getFp6(z, 288), TM.fp6Mul(a, a))) return gateFail("fp6Sqr-alias", k);
+      if (k % 64 == 0 and k > 0) {
+        TF.fp6InvInto(z, 288, 0, TW_S);
+        if (not eqFp6(getFp6(z, 288), TM.fp6Inv(a))) return gateFail("fp6Inv", k);
+      };
+      k += 1;
+    };
+    { pass = true; checked = iters; detail = "TowerFlat fp6 == TowerMont" }
+  };
+
+  /// Differential test (Fp12): flat Fp12 vs TowerMont — mul/sqrFast/mulBy014/conj, inv strided, one-checks.
+  public func gate_fp12_flat(iters : Nat) : async Gate {
+    let z = twArena();
+    var k = 0;
+    while (k < iters) {
+      let a = randFp12(k);
+      let b = randFp12(if (k < 2) k + 1 else 2);
+      let c0 = randFp2(4);
+      let c1 = randFp2(4);
+      let c4 = randFp2(4);
+      putFp12(z, 0, a);
+      putFp12(z, 144, b);
+      putFp2(z, 300, c0);
+      putFp2(z, 324, c1);
+      putFp2(z, 348, c4);
+      TF.fp12MulInto(z, 372, 0, 144, TW_S);
+      if (not eqFp12(getFp12(z, 372), TM.fp12Mul(a, b))) return gateFail("fp12Mul", k);
+      TF.fp12SqrFastInto(z, 372, 0, TW_S);
+      if (not eqFp12(getFp12(z, 372), TM.fp12SqrFast(a))) return gateFail("fp12SqrFast", k);
+      TF.fp12MulBy014Into(z, 372, 0, 300, 324, 348, TW_S);
+      if (not eqFp12(getFp12(z, 372), TM.fp12MulBy014(a, c0, c1, c4))) {
+        return gateFail("fp12MulBy014", k);
+      };
+      TF.fp12ConjInto(z, 372, 0);
+      if (not eqFp12(getFp12(z, 372), TM.fp12Conj(a))) return gateFail("fp12Conj", k);
+      TF.fp12Copy(z, 372, 0);
+      TF.fp12MulInto(z, 372, 372, 372, TW_S);
+      if (not eqFp12(getFp12(z, 372), TM.fp12Mul(a, a))) return gateFail("fp12Mul-alias", k);
+      if (k % 32 == 0 and k > 0) {
+        TF.fp12InvInto(z, 372, 0, TW_S);
+        if (not eqFp12(getFp12(z, 372), TM.fp12Inv(a))) return gateFail("fp12Inv", k);
+      };
+      // one-detection parity with the verifier's target check
+      TF.fp12SetOneMont(z, 372);
+      if (not TF.fp12IsOneMont(z, 372)) return gateFail("fp12IsOneMont-true", k);
+      if (not eqFp12(getFp12(z, 372), TM.fp12OneM())) return gateFail("fp12One", k);
+      putFp12(z, 372, a);
+      if (TF.fp12IsOneMont(z, 372) != TM.fp12Eq(a, TM.fp12OneM())) {
+        return gateFail("fp12IsOneMont-false", k);
+      };
+      k += 1;
+    };
+    { pass = true; checked = iters; detail = "TowerFlat fp12 == TowerMont" }
+  };
+
+  /// Flat fp12SqrFast perf/alloc (the Miller loop workhorse — must be ~0 bytes/op).
+  public func probe_flat_fp12_sqr(iters : Nat) : async Probe {
+    let z = twArena();
+    putFp12(z, 0, randFp12(2));
+    let a0 = Prim.rts_total_allocation();
+    let c0 = Prim.performanceCounter(0);
+    var i = 0;
+    while (i < iters) {
+      TF.fp12SqrFastInto(z, 0, 0, TW_S);
+      i += 1;
+    };
+    let c1 = Prim.performanceCounter(0);
+    let a1 = Prim.rts_total_allocation();
+    sink += Nat32.toNat(z[0]) % 1024;
+    { alloc = a1 - a0 : Nat; instructions = c1 - c0; iters }
   };
 
   /// Flat montMul perf/alloc — the number that must be ~0 bytes/op.

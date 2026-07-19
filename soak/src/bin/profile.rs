@@ -204,7 +204,13 @@ fn repr_mode(root: &Path, scratch: &Path) {
         assert!(g.pass, "{method} FAILED at vector {}: {}", g.checked.0, g.detail);
     };
     gate("gate_fp_flat", 5_000);
-    for (name, method, iters) in [("FpFlat montMul (in-place)", "probe_flat_mont_mul", 20_000u64)] {
+    gate("gate_fp2_flat", 1_000);
+    gate("gate_fp6_flat", 300);
+    gate("gate_fp12_flat", 100);
+    for (name, method, iters) in [
+        ("FpFlat montMul (in-place)", "probe_flat_mont_mul", 20_000u64),
+        ("TowerFlat fp12SqrFast", "probe_flat_fp12_sqr", 500),
+    ] {
         let p = call(method, iters);
         let alloc = u128::try_from(p.alloc.0.clone()).unwrap();
         println!(
