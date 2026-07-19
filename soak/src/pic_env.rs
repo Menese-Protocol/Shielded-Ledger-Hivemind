@@ -187,7 +187,11 @@ impl Drop for ManagedServer {
 /// never hard-exits; 24h idle TTL so proving/verification gaps never idle it out).
 pub fn spawn_server(binary: &Path) -> ManagedServer {
     use std::io::Read;
-    let port_file = std::env::temp_dir().join(format!("soak_pocket_ic_{}.port", std::process::id()));
+    // Use a run-specific port-file marker so concurrent soak runs on one machine
+    // can scope cleanup (pkill by cmdline marker) to their OWN servers. With a marker
+    // shared across runs, one run's cleanup can kill another run's live server
+    // mid-soak — observed as abrupt IncompleteMessage client failures.
+    let port_file = std::env::temp_dir().join(format!("ledger_soak_pocket_ic_{}.port", std::process::id()));
     let _ = std::fs::remove_file(&port_file);
     let child = Command::new(binary)
         .arg("--port-file")
