@@ -48,15 +48,34 @@ module {
 
   /// Validate and prepare the fixed verifying key. Runs once (canister init / vk registration),
   /// so its cost is deliberately OUTSIDE the per-proof message; everything per-proof is in `verify`.
+  /// Flat point validation — same predicate order and codes as CJ.g1Validate/g2Validate
+  /// (canonical + on-curve are the unchanged L1/L2 predicates; the [r]P subgroup half runs on
+  /// the gate-proven flat backend so vk registration no longer allocates ~500 MB of Nat churn).
+  func validateG1Flat(z : [var Nat32], p : C.G1) : ?Text {
+    if (not C.g1IsCanonical(p)) { return ?"E_NONCANONICAL" };
+    if (not C.g1IsOnCurve(p)) { return ?"E_NOT_ON_CURVE" };
+    CF.g1FromAffineInto(z, 576, p, ARENA_S);
+    if (not CF.g1InSubgroup(z, 576, 0, ARENA_S)) { return ?"E_NOT_IN_SUBGROUP" };
+    null
+  };
+  func validateG2Flat(z : [var Nat32], p : C.G2) : ?Text {
+    if (not C.g2IsCanonical(p)) { return ?"E_NONCANONICAL" };
+    if (not C.g2IsOnCurve(p)) { return ?"E_NOT_ON_CURVE" };
+    CF.g2FromAffineInto(z, 240, p, ARENA_S);
+    if (not CF.g2InSubgroup(z, 240, 36, ARENA_S)) { return ?"E_NOT_IN_SUBGROUP" };
+    null
+  };
+
   public func prepareVk(
     alpha : C.G1, beta : C.G2, gamma : C.G2, delta : C.G2, gammaAbc : [C.G1]
   ) : { #ok : PreparedVk; #err : Text } {
-    switch (CJ.g1Validate(alpha)) { case (#err(e)) { return #err("alpha:" # e) }; case (#ok) {} };
-    switch (CJ.g2Validate(beta)) { case (#err(e)) { return #err("beta:" # e) }; case (#ok) {} };
-    switch (CJ.g2Validate(gamma)) { case (#err(e)) { return #err("gamma:" # e) }; case (#ok) {} };
-    switch (CJ.g2Validate(delta)) { case (#err(e)) { return #err("delta:" # e) }; case (#ok) {} };
+    let z = VarArray.repeat<Nat32>(0, 8640);
+    switch (validateG1Flat(z, alpha)) { case (?e) { return #err("alpha:" # e) }; case null {} };
+    switch (validateG2Flat(z, beta)) { case (?e) { return #err("beta:" # e) }; case null {} };
+    switch (validateG2Flat(z, gamma)) { case (?e) { return #err("gamma:" # e) }; case null {} };
+    switch (validateG2Flat(z, delta)) { case (?e) { return #err("delta:" # e) }; case null {} };
     for (p in gammaAbc.vals()) {
-      switch (CJ.g1Validate(p)) { case (#err(e)) { return #err("gamma_abc:" # e) }; case (#ok) {} };
+      switch (validateG1Flat(z, p)) { case (?e) { return #err("gamma_abc:" # e) }; case null {} };
     };
     #ok({
       alphaNeg = C.g1Neg(alpha);
@@ -201,19 +220,10 @@ module {
 
     // A/B/C validation — same order and codes as CJ.g1Validate/g2Validate (canonical and
     // on-curve halves are the unchanged L1/L2 predicates; the [r]P subgroup half is flat).
-    if (not C.g1IsCanonical(a)) { return #err("A:E_NONCANONICAL") };
-    if (not C.g1IsOnCurve(a)) { return #err("A:E_NOT_ON_CURVE") };
-    CF.g1FromAffineInto(z, 576, a, s);
-    if (not CF.g1InSubgroup(z, 576, 0, s)) { return #err("A:E_NOT_IN_SUBGROUP") };
-    if (not C.g2IsCanonical(b)) { return #err("B:E_NONCANONICAL") };
-    if (not C.g2IsOnCurve(b)) { return #err("B:E_NOT_ON_CURVE") };
-    CF.g2FromAffineInto(z, 240, b, s);
-    // (240 holds B as Jacobian here only for the subgroup check; reloaded as affine below)
-    if (not CF.g2InSubgroup(z, 240, 36, s)) { return #err("B:E_NOT_IN_SUBGROUP") };
-    if (not C.g1IsCanonical(c)) { return #err("C:E_NONCANONICAL") };
-    if (not C.g1IsOnCurve(c)) { return #err("C:E_NOT_ON_CURVE") };
-    CF.g1FromAffineInto(z, 576, c, s);
-    if (not CF.g1InSubgroup(z, 576, 0, s)) { return #err("C:E_NOT_IN_SUBGROUP") };
+    // (validateG2Flat leaves B as a Jacobian at 240 for its check; reloaded as affine below.)
+    switch (validateG1Flat(z, a)) { case (?e) { return #err("A:" # e) }; case null {} };
+    switch (validateG2Flat(z, b)) { case (?e) { return #err("B:" # e) }; case null {} };
+    switch (validateG1Flat(z, c)) { case (?e) { return #err("C:" # e) }; case null {} };
 
     // vk_x = gammaAbc[0] + Σ inputᵢ·gammaAbc[i+1] — flat Jacobian MSM (scalars mod r, as L2).
     CF.g1FromAffineInto(z, 156, vk.gammaAbc[0], s);
