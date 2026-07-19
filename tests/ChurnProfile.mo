@@ -32,6 +32,7 @@ import Dec2 "../src/groth16/DecodeG2";
 import PP "../src/groth16/PairingProjective";
 import PF "../src/groth16/PairingFinalExp";
 import GM "../src/groth16/Groth16Multi";
+import PFlat "../src/groth16/PairingFlat";
 import GW "../src/groth16/Groth16Wire";
 import ICRC3 "../src/ICRC3";
 import NoteCodec "../src/NoteCodec";
@@ -40,10 +41,14 @@ persistent actor ChurnProfile {
   public type Probe = { alloc : Nat; instructions : Nat64; iters : Nat };
 
   transient var vk : ?GM.PreparedVk = null;
+  transient var vkFlat : ?GM.FlatVk = null;
   transient var sink : Nat = 0;
 
   func requireVk() : GM.PreparedVk {
     switch (vk) { case (?v) v; case null Runtime.trap("set_vk first") }
+  };
+  func requireFlat() : GM.FlatVk {
+    switch (vkFlat) { case (?f) f; case null Runtime.trap("set_vk first") }
   };
 
   func run(iters : Nat, f : () -> ()) : Probe {
@@ -72,7 +77,15 @@ persistent actor ChurnProfile {
 
   public func set_vk(vkHex : Text) : async Bool {
     vk := GW.parseAndPrepareVk(vkHex);
+    vkFlat := switch (vk) { case (?v) ?GM.prepareFlatVk(v); case null null };
     vk != null
+  };
+
+  /// The LEDGER's exact per-proof path: cached FlatVk + verifyPreparedCached.
+  public func probe_full_verify_cached(proofHex : Text, inputsHex : Text, iters : Nat) : async Probe {
+    let v = requireVk();
+    let f = requireFlat();
+    run(iters, func() { sink += GW.verifyPreparedCached(v, f, proofHex, inputsHex).size() })
   };
 
   public query func sink_value() : async Nat { sink };
@@ -620,6 +633,207 @@ persistent actor ChurnProfile {
       idx += 1;
     };
     { pass = true; checked = iters; detail = "CurveFlat G2 == CurveJac (+subgroup, off-subgroup ctrl)" }
+  };
+
+  // ---- pairing / final-exp / full-verify gates ----
+
+  /// Differential test (prepare): flat prepareG2 vs PP.prepareG2 — all 68 coefficients (3 Fp2 each) must be
+  /// limb-identical on the fixture proof's B point.
+  public func gate_prepare_flat(proofHex : Text) : async Gate {
+    let proof = proofOf(proofHex);
+    let q = switch (proof.b) { case (#pt(v)) v; case (#inf) return gateFail("B-inf", 0) };
+    // arena: B affine mont @0(48), coeffs @48(4896), spare @4944(24) → scratch S=4980
+    let s = 4980;
+    let z = FpFlat.newBuf((s + PFlat.SCRATCH_LIMBS + 11) / 12 + 1);
+    FpFlat.fromNat(q.x.c0, z, 4944);
+    FpFlat.toMontInto(z, 0, z, 4944, z, 4956, z, s);
+    FpFlat.fromNat(q.x.c1, z, 4944);
+    FpFlat.toMontInto(z, 12, z, 4944, z, 4956, z, s);
+    FpFlat.fromNat(q.y.c0, z, 4944);
+    FpFlat.toMontInto(z, 24, z, 4944, z, 4956, z, s);
+    FpFlat.fromNat(q.y.c1, z, 4944);
+    FpFlat.toMontInto(z, 36, z, 4944, z, 4956, z, s);
+    PFlat.prepareG2Into(z, 48, 0, s);
+    let ref = PP.prepareG2(proof.b);
+    if (ref.ellCoeffs.size() != PFlat.COEFF_COUNT) return gateFail("ref-count", 0);
+    var k = 0;
+    while (k < PFlat.COEFF_COUNT) {
+      let o = 48 + 72 * k;
+      let rc = ref.ellCoeffs[k];
+      if (not eqFp2(getFp2(z, o), rc.c0)) return gateFail("prep-c0", k);
+      if (not eqFp2(getFp2(z, o + 24), rc.c1)) return gateFail("prep-c1", k);
+      if (not eqFp2(getFp2(z, o + 48), rc.c2)) return gateFail("prep-c2", k);
+      k += 1;
+    };
+    { pass = true; checked = PFlat.COEFF_COUNT; detail = "PairingFlat prepareG2 == PP.prepareG2" }
+  };
+
+  /// Differential test: flat Frobenius(1,2), cyclotomicSquare, expByX, and the assembled final
+  /// exponentiation vs PairingFinalExp, on the REAL raw multi-Miller output of the fixture
+  /// proof AND a forged (A/C-swapped) variant.
+  public func gate_finalexp_flat(proofHex : Text, inputsHex : Text) : async Gate {
+    let v = requireVk();
+    let proof = proofOf(proofHex);
+    let vkx = CJ.vkX(v.gammaAbc, inputsOf(inputsHex));
+    let bPrep = PP.prepareG2(proof.b);
+    let s = 432; // arena: in@0(144), out@144(144), tmp@288(144)
+    let z = FpFlat.newBuf((s + PFlat.SCRATCH_LIMBS + 11) / 12 + 1);
+    var round = 0;
+    while (round < 2) {
+      let raw = if (round == 0) {
+        GM.multiMillerRaw(v, proof.a, bPrep, proof.c, vkx)
+      } else {
+        GM.multiMillerRaw(v, proof.c, bPrep, proof.a, vkx) // forged: A/C swapped
+      };
+      putFp12(z, 0, raw);
+      PFlat.loadFrobConstants(z, s);
+      PFlat.fp12FrobeniusInto(z, 288, 0, 1, s);
+      if (not eqFp12(getFp12(z, 288), PF.fp12Frobenius(raw, 1))) return gateFail("frob1", round);
+      PFlat.fp12FrobeniusInto(z, 288, 0, 2, s);
+      if (not eqFp12(getFp12(z, 288), PF.fp12Frobenius(raw, 2))) return gateFail("frob2", round);
+      let easy = PF.easyPart(raw);
+      putFp12(z, 144, easy);
+      PFlat.cyclotomicSquareInto(z, 288, 144, s);
+      if (not eqFp12(getFp12(z, 288), PF.cyclotomicSquare(easy))) return gateFail("cyclo", round);
+      // in-place cyclo (the expByX usage shape)
+      PFlat.cyclotomicSquareInto(z, 144, 144, s);
+      if (not eqFp12(getFp12(z, 144), PF.cyclotomicSquare(easy))) return gateFail("cyclo-alias", round);
+      putFp12(z, 144, easy);
+      PFlat.expByXInto(z, 288, 144, s);
+      if (not eqFp12(getFp12(z, 288), PF.expByX(easy))) return gateFail("expByX", round);
+      PFlat.finalExponentiateInto(z, 144, 0, s);
+      if (not eqFp12(getFp12(z, 144), PF.finalExponentiate(raw))) return gateFail("finalexp", round);
+      round += 1;
+    };
+    { pass = true; checked = 2; detail = "PairingFlat finalexp chain == PairingFinalExp (valid + forged)" }
+  };
+
+  /// Differential test (full verify): flat verify vs the verbatim reference assembly — verdicts must be
+  /// IDENTICAL (both #ok or both the same #err code). One vector class per call.
+  public func gate_verify_flat(proofHex : Text, inputsHex : Text) : async Gate {
+    let v = requireVk();
+    let proof = proofOf(proofHex);
+    let inputs = inputsOf(inputsHex);
+    let flat = GM.verify(v, proof.a, proof.b, proof.c, inputs);
+    let ref = GM.verifyReference(v, proof.a, proof.b, proof.c, inputs);
+    let cached = GM.verifyWithFlat(v, requireFlat(), proof.a, proof.b, proof.c, inputs);
+    let same = switch (flat, ref, cached) {
+      case (#ok, #ok, #ok) true;
+      case (#err(x), #err(y), #err(w)) x == y and y == w;
+      case (_, _, _) false;
+    };
+    let text = switch (flat) { case (#ok) "ok"; case (#err(e)) e };
+    let refText = switch (ref) { case (#ok) "ok"; case (#err(e)) e };
+    {
+      pass = same;
+      checked = 1;
+      detail = "flat=" # text # " ref=" # refText;
+    }
+  };
+
+  /// Full flat verify perf/alloc through the REAL wire path (same call the ledger makes).
+  public func probe_flat_full_verify(proofHex : Text, inputsHex : Text, iters : Nat) : async Probe {
+    let v = requireVk();
+    run(iters, func() { sink += GW.verifyPrepared(v, proofHex, inputsHex).size() })
+  };
+
+  /// Stage-by-stage allocation decomposition of the FLAT verify (mirrors the engine's arena
+  /// layout) — so every remaining megabyte in the new path is accounted for, not guessed at.
+  public func probe_flat_stages(proofHex : Text, inputsHex : Text) : async [(Text, Probe)] {
+    let v = requireVk();
+    let proof = proofOf(proofHex);
+    let inputs = inputsOf(inputsHex);
+    let out = List.empty<(Text, Probe)>();
+    let s = 20232;
+    let a0 = Prim.rts_total_allocation();
+    let c0 = Prim.performanceCounter(0);
+    let z = VarArray.repeat<Nat32>(0, 23328);
+    List.add(out, ("arena-alloc", { alloc = Prim.rts_total_allocation() - a0 : Nat; instructions = Prim.performanceCounter(0) - c0; iters = 1 }));
+    let stage = func(name : Text, f : () -> ()) {
+      let x0 = Prim.rts_total_allocation();
+      let i0 = Prim.performanceCounter(0);
+      f();
+      List.add(out, (name, { alloc = Prim.rts_total_allocation() - x0 : Nat; instructions = Prim.performanceCounter(0) - i0; iters = 1 }));
+    };
+    stage("A+C-subgroup-flat", func() {
+      CF.g1FromAffineInto(z, 576, proof.a, s);
+      sink += if (CF.g1InSubgroup(z, 576, 0, s)) 1 else 0;
+      CF.g1FromAffineInto(z, 576, proof.c, s);
+      sink += if (CF.g1InSubgroup(z, 576, 0, s)) 1 else 0;
+    });
+    stage("B-subgroup-flat", func() {
+      CF.g2FromAffineInto(z, 240, proof.b, s);
+      sink += if (CF.g2InSubgroup(z, 240, 36, s)) 1 else 0;
+    });
+    stage("vkx-msm-flat", func() {
+      CF.g1FromAffineInto(z, 156, v.gammaAbc[0], s);
+      var i = 0;
+      while (i < inputs.size()) {
+        CF.g1FromAffineInto(z, 612, v.gammaAbc[i + 1], s);
+        CF.g1MulInto(z, 612, 612, CF.scalarLimbs(inputs[i] % C.R), s);
+        CF.g1AddInto(z, 156, 156, 612, s);
+        i += 1;
+      };
+    });
+    stage("load-vk-preps", func() {
+      for (base in [5544, 10440, 15336].vals()) {
+        let prep = if (base == 5544) v.betaPrep else if (base == 10440) v.gammaPrep else v.deltaPrep;
+        var k = 0;
+        for (coeff in prep.ellCoeffs.vals()) {
+          let o = base + 72 * k;
+          FpFlat.fromNat(coeff.c0.c0, z, o);
+          FpFlat.fromNat(coeff.c0.c1, z, o + 12);
+          FpFlat.fromNat(coeff.c1.c0, z, o + 24);
+          FpFlat.fromNat(coeff.c1.c1, z, o + 36);
+          FpFlat.fromNat(coeff.c2.c0, z, o + 48);
+          FpFlat.fromNat(coeff.c2.c1, z, o + 60);
+          k += 1;
+        };
+      };
+    });
+    stage("prepare-B-flat", func() {
+      switch (proof.b) {
+        case (#inf) {};
+        case (#pt(q)) {
+          FpFlat.fromNat(q.x.c0, z, 612);
+          FpFlat.toMontInto(z, 240, z, 612, z, 624, z, s);
+          FpFlat.fromNat(q.x.c1, z, 612);
+          FpFlat.toMontInto(z, 252, z, 612, z, 624, z, s);
+          FpFlat.fromNat(q.y.c0, z, 612);
+          FpFlat.toMontInto(z, 264, z, 612, z, 624, z, s);
+          FpFlat.fromNat(q.y.c1, z, 612);
+          FpFlat.toMontInto(z, 276, z, 612, z, 624, z, s);
+          PFlat.prepareG2Into(z, 648, 240, s);
+        };
+      };
+    });
+    stage("pair-G1-loads", func() {
+      switch (proof.a) { case (#pt(p)) {
+        FpFlat.fromNat(p.x, z, 612); FpFlat.toMontInto(z, 108, z, 612, z, 624, z, s);
+        FpFlat.fromNat(p.y, z, 612); FpFlat.toMontInto(z, 120, z, 612, z, 624, z, s);
+      }; case (#inf) {} };
+      switch (proof.c) { case (#pt(p)) {
+        FpFlat.fromNat(p.x, z, 612); FpFlat.toMontInto(z, 132, z, 612, z, 624, z, s);
+        FpFlat.fromNat(p.y, z, 612); FpFlat.toMontInto(z, 144, z, 612, z, 624, z, s);
+        FpFlat.negInto(z, 144, z, 144);
+      }; case (#inf) {} };
+      if (not CF.g1IsInf(z, 156)) {
+        CF.g1ToAffineInto(z, 192, 204, 156, s);
+        FpFlat.negInto(z, 204, z, 204);
+      };
+      switch (v.alphaNeg) { case (#pt(p)) {
+        FpFlat.fromNat(p.x, z, 612); FpFlat.toMontInto(z, 216, z, 612, z, 624, z, s);
+        FpFlat.fromNat(p.y, z, 612); FpFlat.toMontInto(z, 228, z, 612, z, 624, z, s);
+      }; case (#inf) {} };
+    });
+    stage("miller-flat", func() {
+      PFlat.multiMillerInto(z, 288, [true, true, true, true], [108, 192, 132, 216], [120, 204, 144, 228], [z, z, z, z], [648, 10440, 15336, 5544], s);
+    });
+    stage("finalexp-flat", func() {
+      PFlat.finalExponentiateInto(z, 432, 288, s);
+      sink += if (TF.fp12IsOneMont(z, 432)) 1 else 0;
+    });
+    List.toArray(out)
   };
 
   /// Flat G1 subgroup-check perf ([r]P, the validate workhorse) — must be ~0 bytes/op.

@@ -164,8 +164,15 @@ module {
     };
   };
 
-  /// Per-proof verify against an already-prepared vk. Same verdict strings as the Rust boundary.
+  /// Per-proof verify against an already-prepared vk. Same verdict strings as the Rust
+  /// boundary. Converts the vk's fixed pairs to flat limbs on the fly — callers that verify
+  /// repeatedly (the ledger) use `verifyPreparedCached` with a converted-once FlatVk.
   public func verifyPrepared(vk : GM.PreparedVk, proofHex : Text, inputsHex : Text) : Text {
+    verifyPreparedCached(vk, GM.prepareFlatVk(vk), proofHex, inputsHex)
+  };
+
+  /// Same wire semantics, fixed vk pairs already flat (the ledger's per-proof path).
+  public func verifyPreparedCached(vk : GM.PreparedVk, flat : GM.FlatVk, proofHex : Text, inputsHex : Text) : Text {
     let proofBytes = switch (hexToBytes(proofHex)) {
       case (null) { return "REJECT:hex" };
       case (?b) { b };
@@ -182,7 +189,7 @@ module {
       case (null) { return "REJECT:inputs-deserialize" };
       case (?xs) { xs };
     };
-    switch (GM.verify(vk, proof.a, proof.b, proof.c, inputs)) {
+    switch (GM.verifyWithFlat(vk, flat, proof.a, proof.b, proof.c, inputs)) {
       case (#ok) { "ACCEPT" };
       case (#err("E_PAIRING_FAIL")) { "REJECT:pairing-check" };
       // A:/B:/C: prefixed codes are the verifier's point-validation rejects (subgroup etc.) —

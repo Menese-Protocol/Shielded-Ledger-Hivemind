@@ -261,6 +261,12 @@ persistent actor ZkLedger {
   // per-proof path never re-validates the vk. Stable: survives upgrades with the hexes.
   var transfer_vk_prepared : ?Groth16Multi.PreparedVk = null;
   var deposit_vk_prepared : ?Groth16Multi.PreparedVk = null;
+  // Flat-limb projection of the prepared vks: rebuilding it inline cost a measured
+  // 18.7 MB of allocation per verify. TRANSIENT (wiped by upgrades, rebuilt lazily) and a pure
+  // deterministic function of the PreparedVk. INVARIANT: every write to *_vk_prepared writes
+  // the matching *_vk_flat in the same statement block (configure / rotate are the only sites).
+  transient var transfer_vk_flat : ?Groth16Multi.FlatVk = null;
+  transient var deposit_vk_flat : ?Groth16Multi.FlatVk = null;
   var tree_state : ?TreeState = null;
   var note_root : Blob = "";
   let historical_roots = StableBlobSet.newState();
@@ -756,15 +762,35 @@ persistent actor ZkLedger {
   // The verify boundary, in-process. Same verdict strings the Rust verifier canister returned
   // (ACCEPT / REJECT:hex / REJECT:proof-deserialize / REJECT:inputs-deserialize /
   // REJECT:pairing-check), so every downstream consumer and test is unchanged.
+  func depositFlatVk(vk : Groth16Multi.PreparedVk) : Groth16Multi.FlatVk {
+    switch (deposit_vk_flat) {
+      case (?value) value;
+      case null {
+        let value = Groth16Multi.prepareFlatVk(vk);
+        deposit_vk_flat := ?value;
+        value
+      };
+    }
+  };
+  func transferFlatVk(vk : Groth16Multi.PreparedVk) : Groth16Multi.FlatVk {
+    switch (transfer_vk_flat) {
+      case (?value) value;
+      case null {
+        let value = Groth16Multi.prepareFlatVk(vk);
+        transfer_vk_flat := ?value;
+        value
+      };
+    }
+  };
   func verifyShieldProof(proofHex : Text, inputsHex : Text) : Text {
     switch (deposit_vk_prepared) {
-      case (?vk) Groth16Wire.verifyPrepared(vk, proofHex, inputsHex);
+      case (?vk) Groth16Wire.verifyPreparedCached(vk, depositFlatVk(vk), proofHex, inputsHex);
       case null "REJECT:unconfigured";
     }
   };
   func verifyTransferProof(proofHex : Text, inputsHex : Text) : Text {
     switch (transfer_vk_prepared) {
-      case (?vk) Groth16Wire.verifyPrepared(vk, proofHex, inputsHex);
+      case (?vk) Groth16Wire.verifyPreparedCached(vk, transferFlatVk(vk), proofHex, inputsHex);
       case null "REJECT:unconfigured";
     }
   };
@@ -874,6 +900,8 @@ persistent actor ZkLedger {
     deposit_vk_hex := depositVkHex;
     transfer_vk_prepared := ?transferPrepared;
     deposit_vk_prepared := ?depositPrepared;
+    transfer_vk_flat := ?Groth16Multi.prepareFlatVk(transferPrepared);
+    deposit_vk_flat := ?Groth16Multi.prepareFlatVk(depositPrepared);
     transfer_statement_version := 2;
     tree_state := ?initial;
     note_root := switch (hexToBlob(initial.root)) { case (?root) root; case null Runtime.trap("validated root") };
@@ -910,6 +938,8 @@ persistent actor ZkLedger {
     deposit_vk_hex := newDepositVkHex;
     transfer_vk_prepared := ?transferPrepared;
     deposit_vk_prepared := ?depositPrepared;
+    transfer_vk_flat := ?Groth16Multi.prepareFlatVk(transferPrepared);
+    deposit_vk_flat := ?Groth16Multi.prepareFlatVk(depositPrepared);
     transfer_statement_version := 2;
     #ok(statusValue())
   };

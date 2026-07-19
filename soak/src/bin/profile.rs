@@ -266,8 +266,159 @@ fn repr_mode(root: &Path, scratch: &Path) {
         );
         assert!(g.pass, "{method} FAILED at vector {}: {}", g.checked.0, g.detail);
     };
-    gate_pts("gate_g1_flat", off_subgroup_g1_hex(), 3);
-    gate_pts("gate_g2_flat", off_subgroup_g2_hex(), 2);
+    let off_g1 = off_subgroup_g1_hex();
+    let off_g2 = off_subgroup_g2_hex();
+    gate_pts("gate_g1_flat", off_g1.clone(), 3);
+    gate_pts("gate_g2_flat", off_g2.clone(), 2);
+
+    // ---- pairing / final-exp gates (need the frozen vk on the actor) ----
+    let set_vk = |vk_hex: &str| {
+        let payload = candid::encode_args((vk_hex.to_string(),)).unwrap();
+        let raw = pic
+            .update_call(canister, admin, "set_vk", payload)
+            .unwrap_or_else(|e| panic!("set_vk: {e:?}"));
+        let ok: bool = candid::decode_one(&raw).unwrap();
+        assert!(ok, "set_vk rejected");
+    };
+    let f = |n: &str| fixture_field(root, n);
+    let n64 = |n: &str| nat64_field_bytes(fixture_u64(root, n));
+    let transfer_fields: Vec<[u8; 32]> = vec![
+        f("anchor.hex"), f("nf1.hex"), f("nf2.hex"), f("cm_out1.hex"), f("cm_out2.hex"),
+        n64("fee.txt"), n64("v_pub_out.txt"), f("recipient_binding.hex"),
+    ];
+    let fake_fields: Vec<[u8; 32]> = vec![
+        f("fake_anchor.hex"), f("fake_nf1.hex"), f("fake_nf2.hex"), f("fake_cm_out1.hex"),
+        f("fake_cm_out2.hex"), n64("fee.txt"), n64("v_pub_out.txt"), f("recipient_binding.hex"),
+    ];
+    let withdraw_fields: Vec<[u8; 32]> = vec![
+        f("withdraw_anchor.hex"), f("withdraw_nf1.hex"), f("withdraw_nf2.hex"),
+        f("withdraw_cm_out1.hex"), f("withdraw_cm_out2.hex"), n64("withdraw_fee.txt"),
+        n64("withdraw_v_pub_out.txt"), f("withdraw_recipient_binding.hex"),
+    ];
+    let mut bad_fee_fields = transfer_fields.clone();
+    bad_fee_fields[5] = nat64_field_bytes(fixture_u64(root, "fee.txt") + 1);
+    let transfer_inputs = inputs_hex(&transfer_fields);
+    let deposit_fields: Vec<[u8; 32]> = vec![f("deposit1_cm.hex"), n64("deposit1_v.txt")];
+    let mut deposit_lie_fields = deposit_fields.clone();
+    deposit_lie_fields[1] = nat64_field_bytes(fixture_u64(root, "deposit1_v.txt") + 1);
+
+    set_vk(&read_fixture(root, "transfer_vk.hex"));
+    let gate1s = |method: &str, arg: String| {
+        let payload = candid::encode_args((arg,)).unwrap();
+        let raw = pic
+            .update_call(canister, admin, method, payload)
+            .unwrap_or_else(|e| panic!("{method}: {e:?}"));
+        let g: GateResult = candid::decode_one(&raw).unwrap();
+        println!("{method:<24} {}  checked={} {}", if g.pass { "PASS" } else { "FAIL" }, g.checked.0, g.detail);
+        assert!(g.pass, "{method} FAILED: {}", g.detail);
+    };
+    gate1s("gate_prepare_flat", transfer_proof_hex.clone());
+    {
+        let payload =
+            candid::encode_args((transfer_proof_hex.clone(), transfer_inputs.clone())).unwrap();
+        let raw = pic
+            .update_call(canister, admin, "gate_finalexp_flat", payload)
+            .unwrap_or_else(|e| panic!("gate_finalexp_flat: {e:?}"));
+        let g: GateResult = candid::decode_one(&raw).unwrap();
+        println!("gate_finalexp_flat       {}  checked={} {}", if g.pass { "PASS" } else { "FAIL" }, g.checked.0, g.detail);
+        assert!(g.pass, "gate_finalexp_flat FAILED: {}", g.detail);
+    }
+
+    // ---- GM-1: verdict parity classes (flat verify vs verbatim reference) ----
+    println!("\n== GM-1 verdict parity (flat verify vs reference assembly) ==");
+    let splice = |replacement_hex: &str, at: usize| -> String {
+        let mut bytes = hex::decode(&transfer_proof_hex).unwrap();
+        let rep = hex::decode(replacement_hex).unwrap();
+        bytes[at..at + rep.len()].copy_from_slice(&rep);
+        hex::encode(bytes)
+    };
+    let gm1 = |label: &str, proof_hex: String, inputs_hexv: String, expect: &str| {
+        let payload = candid::encode_args((proof_hex, inputs_hexv)).unwrap();
+        match pic.update_call(canister, admin, "gate_verify_flat", payload) {
+            Ok(raw) => {
+                let g: GateResult = candid::decode_one(&raw).unwrap();
+                println!("GM-1 {label:<24} {}  {}", if g.pass { "PARITY" } else { "DIVERGED" }, g.detail);
+                assert!(g.pass, "GM-1 {label} verdicts diverged: {}", g.detail);
+                assert!(
+                    g.detail.starts_with(&format!("flat={expect} ")),
+                    "GM-1 {label}: expected flat={expect}, got {}",
+                    g.detail
+                );
+            }
+            Err(e) => {
+                let msg = format!("{e:?}");
+                assert!(
+                    msg.contains("bad proof") || msg.contains("bad inputs"),
+                    "GM-1 {label}: unexpected reject {msg}"
+                );
+                println!("GM-1 {label:<24} SKIP (rejected at unchanged parse layer)");
+            }
+        }
+    };
+    gm1("transfer-valid", transfer_proof_hex.clone(), transfer_inputs.clone(), "ok");
+    gm1("bad-fee", transfer_proof_hex.clone(), inputs_hex(&bad_fee_fields), "E_PAIRING_FAIL");
+    gm1("seven-inputs", transfer_proof_hex.clone(), inputs_hex(&transfer_fields[0..7].to_vec()), "E_BAD_LENGTH");
+    gm1("fake-tree-C2", read_fixture(root, "fake_proof.hex"), inputs_hex(&fake_fields), "ok");
+    gm1("withdraw-valid", read_fixture(root, "withdraw_proof.hex"), inputs_hex(&withdraw_fields), "ok");
+    gm1("bad-proof-bitflip", read_fixture(root, "transfer_badproof.hex"), transfer_inputs.clone(), "E_PAIRING_FAIL");
+    gm1("offsub-A-splice", splice(&off_g1, 0), transfer_inputs.clone(), "A:E_NOT_IN_SUBGROUP");
+    gm1("offsub-B-splice", splice(&off_g2, 48), transfer_inputs.clone(), "B:E_NOT_IN_SUBGROUP");
+    let flat_full = {
+        let payload = candid::encode_args((
+            transfer_proof_hex.clone(),
+            transfer_inputs.clone(),
+            candid::Nat::from(1u64),
+        ))
+        .unwrap();
+        let raw = pic
+            .update_call(canister, admin, "probe_full_verify", payload)
+            .unwrap_or_else(|e| panic!("probe_full_verify: {e:?}"));
+        let p: Probe = candid::decode_one(&raw).unwrap();
+        p
+    };
+    println!(
+        "\nFLAT full verifyPrepared uncached (transfer): {:.2} MB, {} instr (was 462.53 MB / 12.52B)",
+        u128::try_from(flat_full.alloc.0.clone()).unwrap() as f64 / (1024.0 * 1024.0),
+        flat_full.instructions
+    );
+    let flat_cached = {
+        let payload = candid::encode_args((
+            transfer_proof_hex.clone(),
+            transfer_inputs.clone(),
+            candid::Nat::from(1u64),
+        ))
+        .unwrap();
+        let raw = pic
+            .update_call(canister, admin, "probe_full_verify_cached", payload)
+            .unwrap_or_else(|e| panic!("probe_full_verify_cached: {e:?}"));
+        let p: Probe = candid::decode_one(&raw).unwrap();
+        p
+    };
+    println!(
+        "FLAT full verify CACHED (ledger path): {:.2} MB, {} instr",
+        u128::try_from(flat_cached.alloc.0.clone()).unwrap() as f64 / (1024.0 * 1024.0),
+        flat_cached.instructions
+    );
+    // stage decomposition of the flat verify (transfer vector)
+    {
+        let payload =
+            candid::encode_args((transfer_proof_hex.clone(), transfer_inputs.clone())).unwrap();
+        let raw = pic
+            .update_call(canister, admin, "probe_flat_stages", payload)
+            .unwrap_or_else(|e| panic!("probe_flat_stages: {e:?}"));
+        let stages: Vec<(String, Probe)> = candid::decode_one(&raw).unwrap();
+        println!("\n== flat verify stage decomposition ==");
+        for (name, p) in &stages {
+            println!(
+                "{name:<20} {:>10.3} MB {:>14} instr",
+                u128::try_from(p.alloc.0.clone()).unwrap() as f64 / (1024.0 * 1024.0),
+                p.instructions
+            );
+        }
+    }
+    set_vk(&read_fixture(root, "deposit_vk.hex"));
+    gm1("deposit1-valid", read_fixture(root, "deposit1_proof.hex"), inputs_hex(&deposit_fields), "ok");
+    gm1("deposit-amount-lie", read_fixture(root, "deposit1_proof.hex"), inputs_hex(&deposit_lie_fields), "E_PAIRING_FAIL");
     for (name, method, iters) in [
         ("FpFlat montMul (in-place)", "probe_flat_mont_mul", 20_000u64),
         ("TowerFlat fp12SqrFast", "probe_flat_fp12_sqr", 500),

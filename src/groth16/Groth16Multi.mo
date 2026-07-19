@@ -23,12 +23,17 @@
 
 import List "mo:core/List";
 import Runtime "mo:core/Runtime";
+import VarArray "mo:core/VarArray";
 import FpM "FpMont";
 import TM "TowerMont";
 import C "Curve";
+import CF "CurveFlat";
 import CJ "CurveJac";
+import FF "FpFlat";
+import PFl "PairingFlat";
 import PP "PairingProjective";
 import PF "PairingFinalExp";
+import TFl "TowerFlat";
 
 module {
   public type Verdict = { #ok; #err : Text };
@@ -112,9 +117,179 @@ module {
     ]);
   };
 
+  /// The COMPLETE per-proof verifier — allocation-flat pipeline.
+  ///
+  /// Same statement, same validation order, same verdict codes, same pair schedule and final
+  /// exponentiation as `verifyReference` below (the original record-based L2 assembly, kept
+  /// verbatim as the in-repo differential anchor). The only change is HOW values are stored:
+  /// one arena allocation per call, every field/curve/pairing operation in place via the L3
+  /// flat backend (FpFlat/TowerFlat/CurveFlat/PairingFlat), each layer of which is
+  /// differential-gated against its L2 anchor. A full-verify differential test additionally proves verdict parity
+  /// of THIS function against `verifyReference` on the frozen fixture + adversarial classes.
+  //
+  // Arena layout (limb offsets; scratch base S = 20232, total 23328 limbs ≈ one ~190 KB
+  // allocation per verify — replacing ~460 MB of immutable-record churn):
+  //   0     G1 subgroup scratch point (36)      36    G2 subgroup scratch point (72)
+  //   108   A affine Mont px/py (24)            132   −C affine Mont px/py (24)
+  //   156   vk_x Jacobian (36)                  192   −vk_x affine Mont px/py (24)
+  //   216   alphaNeg affine Mont px/py (24)     240   B affine Mont (48)
+  //   288   Miller f (144)                      432   final-exp output (144)
+  //   576   MSM accumulator Jacobian (36)       612   MSM point / conversion spare (36)
+  //   648   B prepared (4896)
+  //   (beta/gamma/delta prepared limbs live in the FlatVk cache arrays, not the arena)
+  let ARENA_S : Nat = 5544;
+
+  func loadG1AffineMont(z : [var Nat32], d : Nat, p : { x : Nat; y : Nat }) {
+    FF.fromNat(p.x, z, 612);
+    FF.toMontInto(z, d, z, 612, z, 624, z, ARENA_S);
+    FF.fromNat(p.y, z, 612);
+    FF.toMontInto(z, d + 12, z, 612, z, 624, z, ARENA_S);
+  };
+
+  /// The fixed verifying-key preparations converted ONCE to flat limbs (18.7 MB of Nat→limb
+  /// conversion per verify when done inline — measured). An empty array marks an
+  /// infinity preparation (dead pair). Held by the ledger actor in a TRANSIENT cache that is
+  /// invalidated at every vk write site and wiped by upgrades — it is a pure deterministic
+  /// function of the PreparedVk, never persisted.
+  public type FlatVk = {
+    beta : [var Nat32];
+    gamma : [var Nat32];
+    delta : [var Nat32];
+  };
+
+  func prepToLimbs(prep : PP.G2Prepared) : [var Nat32] {
+    if (prep.infinity) { return VarArray.repeat<Nat32>(0, 0) };
+    if (prep.ellCoeffs.size() != PFl.COEFF_COUNT) { Runtime.trap("E_MULTI_COEFF_COUNT") };
+    let out = VarArray.repeat<Nat32>(0, PFl.PREPARED_LIMBS);
+    var k = 0;
+    for (coeff in prep.ellCoeffs.vals()) {
+      let o = 72 * k;
+      FF.fromNat(coeff.c0.c0, out, o);
+      FF.fromNat(coeff.c0.c1, out, o + 12);
+      FF.fromNat(coeff.c1.c0, out, o + 24);
+      FF.fromNat(coeff.c1.c1, out, o + 36);
+      FF.fromNat(coeff.c2.c0, out, o + 48);
+      FF.fromNat(coeff.c2.c1, out, o + 60);
+      k += 1;
+    };
+    out
+  };
+
+  /// Convert a PreparedVk's fixed pairs to flat limb arrays — run once per vk registration
+  /// (or once per post-upgrade lazy rebuild), never per proof.
+  public func prepareFlatVk(vk : PreparedVk) : FlatVk {
+    {
+      beta = prepToLimbs(vk.betaPrep);
+      gamma = prepToLimbs(vk.gammaPrep);
+      delta = prepToLimbs(vk.deltaPrep);
+    }
+  };
+
   /// The COMPLETE per-proof verifier: A/B/C validation (subgroup checks included), vk_x MSM,
   /// per-proof B preparation, interleaved multi-Miller, ONE shared final exponentiation.
+  /// Uncached form — converts the fixed vk pairs on the fly. The ledger uses
+  /// `verifyWithFlat` with its transient FlatVk cache instead.
   public func verify(vk : PreparedVk, a : C.G1, b : C.G2, c : C.G1, inputs : [Nat]) : Verdict {
+    verifyWithFlat(vk, prepareFlatVk(vk), a, b, c, inputs)
+  };
+
+  public func verifyWithFlat(vk : PreparedVk, flat : FlatVk, a : C.G1, b : C.G2, c : C.G1, inputs : [Nat]) : Verdict {
+    if (vk.gammaAbc.size() != inputs.size() + 1) { return #err("E_BAD_LENGTH") };
+
+    let z = VarArray.repeat<Nat32>(0, 8640); // ARENA_S + PairingFlat scratch (5544 + 3096)
+    let s = ARENA_S;
+
+    // A/B/C validation — same order and codes as CJ.g1Validate/g2Validate (canonical and
+    // on-curve halves are the unchanged L1/L2 predicates; the [r]P subgroup half is flat).
+    if (not C.g1IsCanonical(a)) { return #err("A:E_NONCANONICAL") };
+    if (not C.g1IsOnCurve(a)) { return #err("A:E_NOT_ON_CURVE") };
+    CF.g1FromAffineInto(z, 576, a, s);
+    if (not CF.g1InSubgroup(z, 576, 0, s)) { return #err("A:E_NOT_IN_SUBGROUP") };
+    if (not C.g2IsCanonical(b)) { return #err("B:E_NONCANONICAL") };
+    if (not C.g2IsOnCurve(b)) { return #err("B:E_NOT_ON_CURVE") };
+    CF.g2FromAffineInto(z, 240, b, s);
+    // (240 holds B as Jacobian here only for the subgroup check; reloaded as affine below)
+    if (not CF.g2InSubgroup(z, 240, 36, s)) { return #err("B:E_NOT_IN_SUBGROUP") };
+    if (not C.g1IsCanonical(c)) { return #err("C:E_NONCANONICAL") };
+    if (not C.g1IsOnCurve(c)) { return #err("C:E_NOT_ON_CURVE") };
+    CF.g1FromAffineInto(z, 576, c, s);
+    if (not CF.g1InSubgroup(z, 576, 0, s)) { return #err("C:E_NOT_IN_SUBGROUP") };
+
+    // vk_x = gammaAbc[0] + Σ inputᵢ·gammaAbc[i+1] — flat Jacobian MSM (scalars mod r, as L2).
+    CF.g1FromAffineInto(z, 156, vk.gammaAbc[0], s);
+    var i = 0;
+    while (i < inputs.size()) {
+      CF.g1FromAffineInto(z, 612, vk.gammaAbc[i + 1], s);
+      CF.g1MulInto(z, 612, 612, CF.scalarLimbs(inputs[i] % C.R), s);
+      CF.g1AddInto(z, 156, 156, 612, s);
+      i += 1;
+    };
+
+    // Pair schedule (order identical to multiMillerRaw):
+    //   0: (A, B)   1: (−vk_x, gamma)   2: (−C, delta)   3: (alphaNeg, beta)
+    var liveA = false;
+    switch (a) {
+      case (#inf) {};
+      case (#pt(p)) { loadG1AffineMont(z, 108, p); liveA := true };
+    };
+    var liveB = true;
+    switch (b) {
+      case (#inf) { liveB := false };
+      case (#pt(q)) {
+        // B affine Montgomery (x,y as Fp2) at 240, then flat preparation into 648.
+        FF.fromNat(q.x.c0, z, 612);
+        FF.toMontInto(z, 240, z, 612, z, 624, z, s);
+        FF.fromNat(q.x.c1, z, 612);
+        FF.toMontInto(z, 252, z, 612, z, 624, z, s);
+        FF.fromNat(q.y.c0, z, 612);
+        FF.toMontInto(z, 264, z, 612, z, 624, z, s);
+        FF.fromNat(q.y.c1, z, 612);
+        FF.toMontInto(z, 276, z, 612, z, 624, z, s);
+        PFl.prepareG2Into(z, 648, 240, s);
+      };
+    };
+    var liveVkx = false;
+    if (not CF.g1IsInf(z, 156)) {
+      CF.g1ToAffineInto(z, 192, 204, 156, s);
+      FF.negInto(z, 204, z, 204); // −vk_x
+      liveVkx := true;
+    };
+    var liveC = false;
+    switch (c) {
+      case (#inf) {};
+      case (#pt(p)) {
+        loadG1AffineMont(z, 132, p);
+        FF.negInto(z, 144, z, 144); // −C
+        liveC := true;
+      };
+    };
+    var liveAlpha = false;
+    switch (vk.alphaNeg) {
+      case (#inf) {};
+      case (#pt(p)) { loadG1AffineMont(z, 216, p); liveAlpha := true };
+    };
+    let liveBeta = flat.beta.size() != 0;
+    let liveGamma = flat.gamma.size() != 0;
+    let liveDelta = flat.delta.size() != 0;
+
+    PFl.multiMillerInto(
+      z,
+      288,
+      [liveA and liveB, liveVkx and liveGamma, liveC and liveDelta, liveAlpha and liveBeta],
+      [108, 192, 132, 216],
+      [120, 204, 144, 228],
+      [z, flat.gamma, flat.delta, flat.beta],
+      [648, 0, 0, 0],
+      s,
+    );
+    PFl.finalExponentiateInto(z, 432, 288, s);
+    if (TFl.fp12IsOneMont(z, 432)) { #ok } else { #err("E_PAIRING_FAIL") };
+  };
+
+  /// The ORIGINAL record-based assembly, kept verbatim as the differential anchor for the flat
+  /// `verify` above (the differential tests prove verdict parity; the per-layer tests prove value
+  /// identity). Not called by the ledger.
+  public func verifyReference(vk : PreparedVk, a : C.G1, b : C.G2, c : C.G1, inputs : [Nat]) : Verdict {
     if (vk.gammaAbc.size() != inputs.size() + 1) { return #err("E_BAD_LENGTH") };
     switch (CJ.g1Validate(a)) { case (#err(e)) { return #err("A:" # e) }; case (#ok) {} };
     switch (CJ.g2Validate(b)) { case (#err(e)) { return #err("B:" # e) }; case (#ok) {} };
