@@ -264,6 +264,25 @@ module {
     montPowInto(z, zo, a, ao, PM2_LIMBS, work, wo, t, to);
   };
 
+  /// R² mod P, little-endian limbs (python-generated from FpMont.RR; gate-validated).
+  let RR_LIMBS : [Nat32] = [
+    0x1c341746, 0xf4df1f34, 0x09d104f1, 0x0a76e6a6, 0x4c95b6d5, 0x8de5476c,
+    0x939d83c0, 0x67eb88a9, 0xb519952d, 0x9a793e85, 0x92cae3aa, 0x11988fe5,
+  ];
+
+  /// z := toMont(a) = a·R mod P, in place (montMul by R² without leaving the arena).
+  /// `rr` is one spare element slot the caller provides for the RR constant.
+  public func toMontInto(
+    z : [var Nat32], zo : Nat,
+    a : [var Nat32], ao : Nat,
+    rr : [var Nat32], ro : Nat,
+    t : [var Nat32], to : Nat,
+  ) {
+    var j = 0;
+    while (j < N) { rr[ro + j] := RR_LIMBS[j]; j += 1 };
+    montMulInto(z, zo, a, ao, rr, ro, t, to);
+  };
+
   // ---- boundary conversions (allocate; used only at the arena boundary, never in hot loops) ----
 
   /// Load a Nat (any form — caller decides normal vs Montgomery semantics) into limbs.

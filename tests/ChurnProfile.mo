@@ -25,7 +25,10 @@ import FpFlat "../src/groth16/FpFlat";
 import TF "../src/groth16/TowerFlat";
 import TM "../src/groth16/TowerMont";
 import C "../src/groth16/Curve";
+import CF "../src/groth16/CurveFlat";
 import CJ "../src/groth16/CurveJac";
+import Dec "../src/groth16/Decode";
+import Dec2 "../src/groth16/DecodeG2";
 import PP "../src/groth16/PairingProjective";
 import PF "../src/groth16/PairingFinalExp";
 import GM "../src/groth16/Groth16Multi";
@@ -483,6 +486,158 @@ persistent actor ChurnProfile {
       k += 1;
     };
     { pass = true; checked = iters; detail = "TowerFlat fp12 == TowerMont" }
+  };
+
+  // ---- curve gates: separate arena, elements 0..216, curve scratch base 240 ----
+  transient let CV_S : Nat = 240; // element region 0..216 (G2 gate uses three 72-limb points)
+
+  func cvArena() : [var Nat32] { FpFlat.newBuf((CV_S + CF.SCRATCH_LIMBS + 11) / 12 + 1) };
+
+  /// Read a flat Jacobian G1 point back as the L2 record for exact coordinate comparison.
+  func getG1J(z : [var Nat32], off : Nat) : CJ.G1J {
+    { x = FpFlat.toNat(z, off); y = FpFlat.toNat(z, off + 12); z = FpFlat.toNat(z, off + 24) }
+  };
+  func eqG1J(a : CJ.G1J, b : CJ.G1J) : Bool { a.x == b.x and a.y == b.y and a.z == b.z };
+  func getG2J(z : [var Nat32], off : Nat) : CJ.G2J {
+    { x = getFp2(z, off); y = getFp2(z, off + 24); z = getFp2(z, off + 48) }
+  };
+  func eqG2J(a : CJ.G2J, b : CJ.G2J) : Bool {
+    eqFp2(a.x, b.x) and eqFp2(a.y, b.y) and eqFp2(a.z, b.z)
+  };
+  func decodeG1Hex(hex : Text) : C.G1 {
+    switch (Dec.decodeG1(bytesOf(hex))) {
+      case (#ok(p)) p;
+      case (#err(e)) Runtime.trap("decodeG1: " # e);
+    }
+  };
+  func decodeG2Hex(hex : Text) : C.G2 {
+    switch (Dec2.decodeG2(bytesOf(hex))) {
+      case (#ok(p)) p;
+      case (#err(e)) Runtime.trap("decodeG2: " # e);
+    }
+  };
+  func randScalar() : Nat {
+    var v : Nat = 0;
+    var i = 0;
+    while (i < 8) { v := v * 0x100000000 + Nat64.toNat(rnd() & 0xFFFFFFFF); i += 1 };
+    v % C.R
+  };
+
+  /// Differential test (G1): flat G1 vs CurveJac — add/dbl/mul EXACT Jacobian coordinates, edge scalars,
+  /// toAffine, and subgroup verdict parity on generator multiples, the fixture proof's A point,
+  /// and an ark-generated on-curve-but-OFF-subgroup point (must be false on BOTH sides).
+  public func gate_g1_flat(proofHex : Text, offSubG1Hex : Text, iters : Nat) : async Gate {
+    let z = cvArena();
+    let proof = proofOf(proofHex);
+    let offSub = decodeG1Hex(offSubG1Hex);
+    var k = 0;
+    while (k < iters) {
+      let k1 = randScalar();
+      let k2 = randScalar();
+      let p1 = CJ.g1ToAffine(CJ.g1Mul(CJ.g1FromAffine(C.g1Gen), k1));
+      let p2 = CJ.g1ToAffine(CJ.g1Mul(CJ.g1FromAffine(C.g1Gen), k2));
+      CF.g1FromAffineInto(z, 0, p1, CV_S);
+      CF.g1FromAffineInto(z, 36, p2, CV_S);
+      let j1 = CJ.g1FromAffine(p1);
+      let j2 = CJ.g1FromAffine(p2);
+      CF.g1AddInto(z, 72, 0, 36, CV_S);
+      if (not eqG1J(getG1J(z, 72), CJ.g1Add(j1, j2))) return gateFail("g1Add", k);
+      CF.g1DblInto(z, 72, 0, CV_S);
+      if (not eqG1J(getG1J(z, 72), CJ.g1Dbl(j1))) return gateFail("g1Dbl", k);
+      // aliased in-place add/dbl
+      CF.g1Copy(z, 72, 0);
+      CF.g1AddInto(z, 72, 72, 36, CV_S);
+      if (not eqG1J(getG1J(z, 72), CJ.g1Add(j1, j2))) return gateFail("g1Add-alias", k);
+      // add degeneracies: P + P (branch to dbl), P + (−P)? via mul edges below; inf handling
+      CF.g1AddInto(z, 72, 0, 0, CV_S);
+      if (not eqG1J(getG1J(z, 72), CJ.g1Add(j1, j1))) return gateFail("g1Add-self", k);
+      let e = randScalar();
+      CF.g1MulInto(z, 72, 0, CF.scalarLimbs(e), CV_S);
+      if (not eqG1J(getG1J(z, 72), CJ.g1Mul(j1, e))) return gateFail("g1Mul", k);
+      k += 1;
+    };
+    // edge scalars on the generator (0,1,2,r−1,r,r+1) — exact Jacobian coords each
+    let gj = CJ.g1FromAffine(C.g1Gen);
+    CF.g1FromAffineInto(z, 0, C.g1Gen, CV_S);
+    for (e in [0, 1, 2, C.R - 1, C.R, C.R + 1].vals()) {
+      CF.g1MulInto(z, 72, 0, CF.scalarLimbs(e), CV_S);
+      if (not eqG1J(getG1J(z, 72), CJ.g1Mul(gj, e))) return gateFail("g1Mul-edge", e % 7);
+    };
+    // toAffine parity (normal-form comparison against L2, which converts out of Montgomery)
+    CF.g1MulInto(z, 72, 0, CF.scalarLimbs(12345), CV_S);
+    switch (CJ.g1ToAffine(CJ.g1Mul(gj, 12345))) {
+      case (#pt(exp)) {
+        CF.g1ToAffineInto(z, 108, 120, 72, CV_S);
+        if (FpM.montMul(FpFlat.toNat(z, 108), 1) != exp.x) return gateFail("g1ToAffine-x", 0);
+        if (FpM.montMul(FpFlat.toNat(z, 120), 1) != exp.y) return gateFail("g1ToAffine-y", 0);
+      };
+      case (#inf) return gateFail("g1ToAffine-inf", 0);
+    };
+    // subgroup verdict parity: generator TRUE, proof A TRUE, off-subgroup FALSE (both sides)
+    var idx = 0;
+    for ((p, expect) in [(C.g1Gen, true), (proof.a, true), (proof.c, true), (offSub, false)].vals()) {
+      let cj = CJ.g1IsInSubgroup(p);
+      if (cj != expect) return gateFail("g1Subgroup-CJ-expect", idx);
+      CF.g1FromAffineInto(z, 0, p, CV_S);
+      if (CF.g1InSubgroup(z, 0, 72, CV_S) != cj) return gateFail("g1Subgroup-flat", idx);
+      idx += 1;
+    };
+    { pass = true; checked = iters; detail = "CurveFlat G1 == CurveJac (+edges, subgroup, off-subgroup ctrl)" }
+  };
+
+  /// Differential test (G2): flat G2 vs CurveJac — same battery on the twist, incl. the fixture proof's B
+  /// and an ark-generated off-subgroup G2 point.
+  public func gate_g2_flat(proofHex : Text, offSubG2Hex : Text, iters : Nat) : async Gate {
+    let z = cvArena();
+    let proof = proofOf(proofHex);
+    let offSub = decodeG2Hex(offSubG2Hex);
+    let g2gen : C.G2 = switch (proof.b) { case (#pt(_)) proof.b; case (#inf) return gateFail("B-inf", 0) };
+    var k = 0;
+    while (k < iters) {
+      let k1 = randScalar();
+      let p1 = CJ.g2ToAffine(CJ.g2Mul(CJ.g2FromAffine(g2gen), k1));
+      let p2 = CJ.g2ToAffine(CJ.g2Mul(CJ.g2FromAffine(g2gen), randScalar()));
+      CF.g2FromAffineInto(z, 0, p1, CV_S);
+      CF.g2FromAffineInto(z, 72, p2, CV_S);
+      let j1 = CJ.g2FromAffine(p1);
+      let j2 = CJ.g2FromAffine(p2);
+      CF.g2AddInto(z, 144, 0, 72, CV_S);
+      if (not eqG2J(getG2J(z, 144), CJ.g2Add(j1, j2))) return gateFail("g2Add", k);
+      CF.g2DblInto(z, 144, 0, CV_S);
+      if (not eqG2J(getG2J(z, 144), CJ.g2Dbl(j1))) return gateFail("g2Dbl", k);
+      let e = randScalar();
+      CF.g2MulInto(z, 144, 0, CF.scalarLimbs(e), CV_S);
+      if (not eqG2J(getG2J(z, 144), CJ.g2Mul(j1, e))) return gateFail("g2Mul", k);
+      k += 1;
+    };
+    // subgroup verdicts: fixture B TRUE, off-subgroup FALSE, both sides agree
+    var idx = 0;
+    for ((p, expect) in [(proof.b, true), (offSub, false)].vals()) {
+      let cj = CJ.g2IsInSubgroup(p);
+      if (cj != expect) return gateFail("g2Subgroup-CJ-expect", idx);
+      CF.g2FromAffineInto(z, 0, p, CV_S);
+      if (CF.g2InSubgroup(z, 0, 144, CV_S) != cj) return gateFail("g2Subgroup-flat", idx);
+      idx += 1;
+    };
+    { pass = true; checked = iters; detail = "CurveFlat G2 == CurveJac (+subgroup, off-subgroup ctrl)" }
+  };
+
+  /// Flat G1 subgroup-check perf ([r]P, the validate workhorse) — must be ~0 bytes/op.
+  public func probe_flat_g1_subgroup(iters : Nat) : async Probe {
+    let z = cvArena();
+    CF.g1FromAffineInto(z, 0, C.g1Gen, CV_S);
+    let a0 = Prim.rts_total_allocation();
+    let c0 = Prim.performanceCounter(0);
+    var i = 0;
+    var all = true;
+    while (i < iters) {
+      all := all and CF.g1InSubgroup(z, 0, 72, CV_S);
+      i += 1;
+    };
+    let c1 = Prim.performanceCounter(0);
+    let a1 = Prim.rts_total_allocation();
+    sink += if (all) 1 else 0;
+    { alloc = a1 - a0 : Nat; instructions = c1 - c0; iters }
   };
 
   /// Flat fp12SqrFast perf/alloc (the Miller loop workhorse — must be ~0 bytes/op).

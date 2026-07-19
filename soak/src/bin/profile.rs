@@ -133,6 +133,43 @@ fn inputs_hex(fields: &[[u8; 32]]) -> String {
     hex::encode(b)
 }
 
+/// On-curve, canonical, but OFF-subgroup points — the adversarial controls for the flat
+/// subgroup-check gates. ark's `get_point_from_x_unchecked` skips subgroup checks and
+/// `serialize_compressed` writes any affine point, so these decode fine and MUST validate false.
+fn off_subgroup_g1_hex() -> String {
+    use ark_ec::AffineRepr;
+    use ark_serialize::CanonicalSerialize;
+    let mut x = ark_bls12_381::Fq::from(1u64);
+    loop {
+        if let Some(p) = ark_bls12_381::G1Affine::get_point_from_x_unchecked(x, false) {
+            if !p.is_in_correct_subgroup_assuming_on_curve() {
+                let mut b = Vec::new();
+                p.serialize_compressed(&mut b).unwrap();
+                return hex::encode(b);
+            }
+        }
+        x += ark_bls12_381::Fq::from(1u64);
+    }
+}
+
+fn off_subgroup_g2_hex() -> String {
+    use ark_ec::AffineRepr;
+    use ark_ff::Zero;
+    use ark_serialize::CanonicalSerialize;
+    let mut i = 1u64;
+    loop {
+        let x = ark_bls12_381::Fq2::new(ark_bls12_381::Fq::from(i), ark_bls12_381::Fq::zero());
+        if let Some(p) = ark_bls12_381::G2Affine::get_point_from_x_unchecked(x, false) {
+            if !p.is_in_correct_subgroup_assuming_on_curve() {
+                let mut b = Vec::new();
+                p.serialize_compressed(&mut b).unwrap();
+                return hex::encode(b);
+            }
+        }
+        i += 1;
+    }
+}
+
 /// Fast lane: install ONLY the profiling actor on a throwaway instance and run the
 /// representation probes (no keys, no ledger, no proofs). Used to decide/verify the Phase-2
 /// limb representation and to gate new limb-layer differential probes during development.
@@ -207,9 +244,34 @@ fn repr_mode(root: &Path, scratch: &Path) {
     gate("gate_fp2_flat", 1_000);
     gate("gate_fp6_flat", 300);
     gate("gate_fp12_flat", 100);
+    // curve gates need the fixture proof + ark-generated off-subgroup adversarial points
+    let transfer_proof_hex = read_fixture(root, "transfer_proof.hex");
+    let gate_pts = |method: &str, adversarial_hex: String, iters: u64| {
+        let payload = candid::encode_args((
+            transfer_proof_hex.clone(),
+            adversarial_hex,
+            candid::Nat::from(iters),
+        ))
+        .unwrap();
+        let raw = pic
+            .update_call(canister, admin, method, payload)
+            .unwrap_or_else(|e| panic!("{method}: {e:?}"));
+        let g: GateResult =
+            candid::decode_one(&raw).unwrap_or_else(|e| panic!("decode {method}: {e}"));
+        let verdict = if g.pass { "PASS" } else { "FAIL" };
+        println!(
+            "{method:<24} {verdict}  checked={} {}",
+            u128::try_from(g.checked.0.clone()).unwrap(),
+            g.detail
+        );
+        assert!(g.pass, "{method} FAILED at vector {}: {}", g.checked.0, g.detail);
+    };
+    gate_pts("gate_g1_flat", off_subgroup_g1_hex(), 3);
+    gate_pts("gate_g2_flat", off_subgroup_g2_hex(), 2);
     for (name, method, iters) in [
         ("FpFlat montMul (in-place)", "probe_flat_mont_mul", 20_000u64),
         ("TowerFlat fp12SqrFast", "probe_flat_fp12_sqr", 500),
+        ("CurveFlat g1 [r]P subgroup", "probe_flat_g1_subgroup", 20),
     ] {
         let p = call(method, iters);
         let alloc = u128::try_from(p.alloc.0.clone()).unwrap();
