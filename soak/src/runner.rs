@@ -223,6 +223,68 @@ fn now_stamp() -> String {
     format!("t{}", d.as_secs())
 }
 
+fn gib(n: &candid::Nat) -> f64 {
+    u128::try_from(n.0.clone()).expect("rts counter fits u128") as f64 / (1u64 << 30) as f64
+}
+
+/// Directory holding atomic checkpoint pairs, next to the legacy checkpoint file.
+fn pairs_root(checkpoint_file: &std::path::Path) -> std::path::PathBuf {
+    checkpoint_file.with_file_name(format!(
+        "{}-pairs",
+        checkpoint_file.file_name().expect("checkpoint file name").to_string_lossy()
+    ))
+}
+
+/// Remove all committed `pair-<op>` dirs except the `keep` with the highest op.
+fn prune_pairs(root: &std::path::Path, keep: usize) {
+    let Ok(entries) = std::fs::read_dir(root) else { return };
+    let mut ops: Vec<(u64, std::path::PathBuf)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let op = name.strip_prefix("pair-")?.parse::<u64>().ok()?;
+            Some((op, e.path()))
+        })
+        .collect();
+    ops.sort_by_key(|(op, _)| std::cmp::Reverse(*op));
+    for (_, path) in ops.into_iter().skip(keep) {
+        let _ = std::fs::remove_dir_all(path);
+    }
+}
+
+/// Locate the newest atomic checkpoint pair, set the crashed live state dir aside for
+/// forensics, and materialize the pair's state snapshot as the live state dir — so canister
+/// state and model agree by construction. Falls back to the legacy single checkpoint file
+/// (paired with the live state dir, the pre-pair layout) when no pair exists.
+fn prepare_resume(tier: &TierConfig) -> Option<crate::checkpoint::Checkpoint> {
+    let root = pairs_root(&tier.checkpoint_file);
+    if let Ok(name) = std::fs::read_to_string(root.join("LATEST")) {
+        let pair = root.join(name.trim());
+        let model = pair.join("model.ckpt");
+        let state = pair.join("state");
+        if model.is_file() && state.is_dir() {
+            if let Some(ckpt) = crate::checkpoint::load(&model) {
+                let crashed = tier.state_dir.with_file_name(format!(
+                    "{}-crashed",
+                    tier.state_dir.file_name().expect("state dir name").to_string_lossy()
+                ));
+                let _ = std::fs::remove_dir_all(&crashed);
+                if tier.state_dir.exists() {
+                    std::fs::rename(&tier.state_dir, &crashed).expect("set aside crashed state dir");
+                }
+                pic_env::copy_dir_recursive(&state, &tier.state_dir);
+                println!(
+                    "[resume] materialized live state from atomic pair {} (crashed live dir set aside)",
+                    pair.display()
+                );
+                return Some(ckpt);
+            }
+        }
+        println!("[resume] LATEST pair incomplete or unreadable; trying legacy checkpoint file");
+    }
+    crate::checkpoint::load(&tier.checkpoint_file)
+}
+
 pub struct Runner {
     pub tier: TierConfig,
     pub keys: Keyset,
@@ -281,7 +343,7 @@ impl Runner {
 
         // RESUME PATH: a matching checkpoint (same seed) means a prior process was interrupted.
         if tier.checkpoint_ops > 0 {
-            if let Some(ckpt) = crate::checkpoint::load(&tier.checkpoint_file) {
+            if let Some(ckpt) = prepare_resume(&tier) {
                 if ckpt.seed == tier.seed && ckpt.accounts == tier.accounts {
                     println!(
                         "[resume] found checkpoint at op {} (seed {}); reloading PocketIC state + model...",
@@ -364,6 +426,7 @@ impl Runner {
         // FRESH PATH: clear any stale durable state, set up, and fund.
         let _ = std::fs::remove_file(&tier.checkpoint_file);
         let _ = std::fs::remove_dir_all(&tier.state_dir);
+        let _ = std::fs::remove_dir_all(pairs_root(&tier.checkpoint_file));
         std::fs::create_dir_all(&tier.state_dir).expect("create state dir");
         std::fs::create_dir_all(tier.checkpoint_file.parent().unwrap()).ok();
         let env = pic_env::setup(wasms, &keys.transfer_vk_hex, &keys.deposit_vk_hex, &tier.state_dir);
@@ -411,12 +474,23 @@ impl Runner {
         }
     }
 
-    /// Persist a durable checkpoint: flush PocketIC state to the state dir (via recycle) and write
-    /// the model + planner state to the checkpoint file. Returns the recycle wall-time.
+    /// Persist a durable checkpoint as an ATOMIC PAIR: while the instance is dropped mid-recycle
+    /// (state dir flushed and quiescent), snapshot the state dir into `pair-<op>/state`, then
+    /// write the model + planner state to `pair-<op>/model.ckpt` and flip the `LATEST` pointer.
+    /// The live state dir keeps advancing after this returns; pairing IT with a model file is
+    /// exactly the Jul-18 wedge (canister ahead of model, resume assert loops forever) — resume
+    /// loads the pair instead. Returns the recycle+snapshot wall-time.
     fn checkpoint(&mut self, executed: u64, next_upgrade: usize, last_recycle: u64, last_checkpoint: u64) -> f64 {
         let t = Instant::now();
-        // recycle persists the PocketIC instance to the durable state dir and frees server memory
-        self.env.recycle();
+        let root = pairs_root(&self.tier.checkpoint_file);
+        let pair_tmp = root.join(format!("pair-{executed}.tmp"));
+        let pair_dir = root.join(format!("pair-{executed}"));
+        let _ = std::fs::remove_dir_all(&pair_tmp);
+        std::fs::create_dir_all(&pair_tmp).expect("create pair tmp dir");
+        // recycle persists the PocketIC instance to the durable state dir and frees server
+        // memory; the snapshot is taken inside the drop-rebuild window
+        self.env
+            .recycle_with_snapshot(Some((&self.tier.state_dir, &pair_tmp.join("state"))));
         let model_part = crate::checkpoint::Checkpoint::from_model(&self.model);
         let last_private = self
             .last_accepted_private
@@ -446,7 +520,15 @@ impl Runner {
             serde_json::to_string(&self.report_injections).unwrap(),
             last_private,
         );
+        crate::checkpoint::save(&ckpt, &pair_tmp.join("model.ckpt"));
+        // legacy single-file location too, for older tooling that inspects it
         crate::checkpoint::save(&ckpt, &self.tier.checkpoint_file);
+        let _ = std::fs::remove_dir_all(&pair_dir);
+        std::fs::rename(&pair_tmp, &pair_dir).expect("commit checkpoint pair");
+        let latest_tmp = root.join("LATEST.tmp");
+        std::fs::write(&latest_tmp, format!("pair-{executed}")).expect("write LATEST.tmp");
+        std::fs::rename(&latest_tmp, root.join("LATEST")).expect("commit LATEST");
+        prune_pairs(&root, 2);
         t.elapsed().as_secs_f64()
     }
 
@@ -1123,7 +1205,15 @@ impl Runner {
     }
 
     fn upgrade(&mut self, at_op: u64) {
-        self.progress(&format!("upgrade #{} at op {} (mode upgrade, same wasm)", self.upgrades_done.len() + 1, at_op));
+        let rts = self.env.ledger_rts();
+        self.progress(&format!(
+            "upgrade #{} at op {} (mode upgrade, same wasm) | pre-upgrade rts: mem {:.2}GiB heap {:.2}GiB max-live {:.2}GiB",
+            self.upgrades_done.len() + 1,
+            at_op,
+            gib(&rts.memory_size),
+            gib(&rts.heap_size),
+            gib(&rts.max_live_size)
+        ));
         let pre = self.env.ledger_status();
         // moc 1.4.1 compiles with enhanced orthogonal persistence: the upgrade must carry
         // wasm_memory_persistence = keep (the state-preserving option; `replace` would wipe).
@@ -1212,7 +1302,15 @@ impl Runner {
                 last_durable_ckpt = executed;
                 upgrade_since_recycle = false;
                 self.cheap_invariants();
-                self.progress(&format!("durable checkpoint at op {executed} in {secs:.1}s (state persisted, resumable)"));
+                let rts = self.env.ledger_rts();
+                self.progress(&format!(
+                    "durable checkpoint at op {executed} in {secs:.1}s (state persisted, resumable) | ledger rts: mem {:.2}GiB heap {:.2}GiB max-live {:.2}GiB alloc {:.1}GiB reclaimed {:.1}GiB",
+                    gib(&rts.memory_size),
+                    gib(&rts.heap_size),
+                    gib(&rts.max_live_size),
+                    gib(&rts.total_allocation),
+                    gib(&rts.reclaimed)
+                ));
             }
             if executed - last_checkpoint >= 5000 || executed >= total {
                 let rate = executed as f64 / self.started.elapsed().as_secs_f64();

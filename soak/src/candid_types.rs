@@ -57,6 +57,15 @@ pub struct LedgerStatus {
 }
 
 #[derive(CandidType, Deserialize, Clone, Debug)]
+pub struct RtsStatus {
+    pub memory_size: Nat,
+    pub heap_size: Nat,
+    pub total_allocation: Nat,
+    pub reclaimed: Nat,
+    pub max_live_size: Nat,
+}
+
+#[derive(CandidType, Deserialize, Clone, Debug)]
 pub struct MutationResult {
     pub outcome: String,
     pub verifier_outcome: String,

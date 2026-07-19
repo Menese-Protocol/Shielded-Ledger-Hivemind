@@ -32,6 +32,27 @@ fn sha_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
+/// Copy a directory tree (`cp -a`): `dest` must not exist and ends up an exact copy of `src`.
+pub fn copy_dir_recursive(src: &Path, dest: &Path) {
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).expect("create snapshot parent dir");
+    }
+    let out = Command::new("cp")
+        .arg("-a")
+        .arg(src)
+        .arg(dest)
+        .output()
+        .expect("spawn cp -a");
+    if !out.status.success() {
+        panic!(
+            "state snapshot copy {} -> {} failed: {}",
+            src.display(),
+            dest.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
 fn resolve_moc() -> PathBuf {
     if let Ok(p) = std::env::var("SOAK_MOC") {
         return PathBuf::from(p);
@@ -223,12 +244,23 @@ impl Env {
     /// server memory the old instance held is released. Canister ids, root key, time, and all
     /// state are preserved exactly.
     pub fn recycle(&mut self) {
+        self.recycle_with_snapshot(None);
+    }
+
+    /// Like `recycle`, but between drop and rebuild — the only window where the state dir is
+    /// flushed and nothing is writing to it — copy `state_dir` to `dest`. The copy forms an
+    /// immutable pair with the model checkpoint the caller writes; the live dir advances past
+    /// the pair as soon as the run continues, so resume must load the pair, never the live dir.
+    pub fn recycle_with_snapshot(&mut self, snapshot: Option<(&Path, &Path)>) {
         let state = self
             .pic
             .take()
             .expect("instance present")
             .drop_and_take_state()
             .expect("state dir configured");
+        if let Some((state_dir, dest)) = snapshot {
+            copy_dir_recursive(state_dir, dest);
+        }
         let pic = PocketIcBuilder::new()
             .with_server_url(self.server.url.clone())
             .with_state(state)
@@ -273,6 +305,10 @@ impl Env {
 
     pub fn ledger_status(&self) -> ct::LedgerStatus {
         self.query(self.ledger, "status", ()).expect("status query")
+    }
+
+    pub fn ledger_rts(&self) -> ct::RtsStatus {
+        self.query(self.ledger, "rts_status", ()).expect("rts_status query")
     }
 
     pub fn token_balance(&self, account: &ct::Account) -> u128 {
@@ -338,6 +374,20 @@ pub fn setup(wasms: &BuiltWasms, transfer_vk_hex: &str, deposit_vk_hex: &str, st
     pic.install_canister(token, wasms.token.clone(), candid::encode_args(()).unwrap(), Some(admin));
     pic.install_canister(tree_oracle, wasms.tree_oracle.clone(), candid::encode_args(()).unwrap(), Some(admin));
     pic.install_canister(ledger, wasms.ledger.clone(), candid::encode_args(()).unwrap(), Some(admin));
+
+    // The ledger is a wasm64/EOP module whose wasm-memory high-water mark ratchets under
+    // per-op verification churn (grows, never shrinks). The IC default limit (3 GiB) trapped
+    // upgrade #1 of the Jul-18 full tier at ~52k notes; 8 GiB matches what the settings allow
+    // on mainnet for wasm64 canisters and is headroom, not the fix (see rts telemetry).
+    pic.update_canister_settings(
+        ledger,
+        Some(admin),
+        pocket_ic::CanisterSettings {
+            wasm_memory_limit: Some(candid::Nat::from(8u64 * 1024 * 1024 * 1024)),
+            ..Default::default()
+        },
+    )
+    .expect("raise ledger wasm_memory_limit");
 
     let env = Env {
         pic: Some(pic),

@@ -150,6 +150,13 @@ persistent actor ZkLedger {
     completed_unshield_region_bytes : Nat;
     completed_unshield_digest : Blob;
   };
+  public type RtsStatus = {
+    memory_size : Nat;
+    heap_size : Nat;
+    total_allocation : Nat;
+    reclaimed : Nat;
+    max_live_size : Nat;
+  };
   public type PendingShield = {
     intent_id : Blob;
     caller : Principal;
@@ -1023,6 +1030,19 @@ persistent actor ZkLedger {
   };
 
   public query func storage_status() : async StorageStatus { storageStatusValue() };
+
+  /// Runtime-system memory counters, for soak/ops telemetry. `memory_size` is the wasm
+  /// memory high-water mark (EOP memory grows and never shrinks); `heap_size` is the live
+  /// heap after the last GC increment. Diverging curves = allocation churn, not retention.
+  public query func rts_status() : async RtsStatus {
+    {
+      memory_size = Prim.rts_memory_size();
+      heap_size = Prim.rts_heap_size();
+      total_allocation = Prim.rts_total_allocation();
+      reclaimed = Prim.rts_reclaimed();
+      max_live_size = Prim.rts_max_live_size();
+    }
+  };
 
   public query func validate_stable_state() : async Result<StorageStatus> {
     switch (validateStableState()) {
