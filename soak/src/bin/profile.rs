@@ -35,6 +35,13 @@ struct Probe {
     iters: candid::Nat,
 }
 
+#[derive(CandidType, Deserialize, Debug)]
+struct GateResult {
+    pass: bool,
+    checked: candid::Nat,
+    detail: String,
+}
+
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf()
 }
@@ -126,12 +133,101 @@ fn inputs_hex(fields: &[[u8; 32]]) -> String {
     hex::encode(b)
 }
 
+/// Fast lane: install ONLY the profiling actor on a throwaway instance and run the
+/// representation probes (no keys, no ledger, no proofs). Used to decide/verify the Phase-2
+/// limb representation and to gate new limb-layer differential probes during development.
+fn repr_mode(root: &Path, scratch: &Path) {
+    use sha2::Digest;
+    let wasm_dir = scratch.join("wasms");
+    std::fs::create_dir_all(&wasm_dir).expect("create wasm dir");
+    let profile_wasm = compile_profile_wasm(root, &wasm_dir);
+    println!("[build] churn_profile.wasm compiled ({} bytes)", profile_wasm.len());
+    let server = pic_env::spawn_server(&pic_env::resolve_pocket_ic_server());
+    let pic = pocket_ic::PocketIcBuilder::new()
+        .with_server_url(server.url.clone())
+        .with_application_subnet()
+        .with_max_request_time_ms(Some(600_000))
+        .build();
+    let admin = Principal::self_authenticating(sha2::Sha256::digest(b"churn-profile-admin"));
+    let canister = pic.create_canister_with_settings(Some(admin), None);
+    pic.add_cycles(canister, 100_000_000_000_000);
+    pic.install_canister(canister, profile_wasm, candid::encode_args(()).unwrap(), Some(admin));
+    pic.update_canister_settings(
+        canister,
+        Some(admin),
+        pocket_ic::CanisterSettings {
+            wasm_memory_limit: Some(candid::Nat::from(8u64 * 1024 * 1024 * 1024)),
+            ..Default::default()
+        },
+    )
+    .expect("wasm_memory_limit");
+
+    let call = |method: &str, iters: u64| -> Probe {
+        let payload = candid::encode_args((candid::Nat::from(iters),)).unwrap();
+        let raw = pic
+            .update_call(canister, admin, method, payload)
+            .unwrap_or_else(|e| panic!("{method}: {e:?}"));
+        candid::decode_one(&raw).unwrap_or_else(|e| panic!("decode {method}: {e}"))
+    };
+
+    println!("\n== representation probes (bytes/op must be ~0 for the chosen limb form) ==");
+    println!("{:<28} {:>12} {:>12}", "form", "bytes/op", "instr/op");
+    for (name, method, iters) in [
+        ("Nat32 [var] store", "probe_nat32_array_store", 100_000u64),
+        ("Nat64 [var] store (full)", "probe_nat64_array_store", 100_000),
+        ("Nat64 local arith (CIOS)", "probe_nat64_local_arith", 100_000),
+        ("Nat64 captured-var store", "probe_nat64_capture_store", 100_000),
+        ("montMul (baseline)", "probe_mont_mul", 20_000),
+    ] {
+        let p = call(method, iters);
+        let alloc = u128::try_from(p.alloc.0.clone()).unwrap();
+        println!(
+            "{name:<28} {:>12.2} {:>12}",
+            alloc as f64 / iters as f64,
+            p.instructions / iters
+        );
+    }
+    println!("\n== L3 differential gates (flat backend vs L2 anchor) ==");
+    let gate = |method: &str, iters: u64| {
+        let payload = candid::encode_args((candid::Nat::from(iters),)).unwrap();
+        let raw = pic
+            .update_call(canister, admin, method, payload)
+            .unwrap_or_else(|e| panic!("{method}: {e:?}"));
+        let g: GateResult =
+            candid::decode_one(&raw).unwrap_or_else(|e| panic!("decode {method}: {e}"));
+        let verdict = if g.pass { "PASS" } else { "FAIL" };
+        println!(
+            "{method:<24} {verdict}  checked={} {}",
+            u128::try_from(g.checked.0.clone()).unwrap(),
+            g.detail
+        );
+        assert!(g.pass, "{method} FAILED at vector {}: {}", g.checked.0, g.detail);
+    };
+    gate("gate_fp_flat", 5_000);
+    for (name, method, iters) in [("FpFlat montMul (in-place)", "probe_flat_mont_mul", 20_000u64)] {
+        let p = call(method, iters);
+        let alloc = u128::try_from(p.alloc.0.clone()).unwrap();
+        println!(
+            "{name:<28} {:>12.2} bytes/op {:>12} instr/op",
+            alloc as f64 / iters as f64,
+            p.instructions / iters
+        );
+    }
+
+    println!("\n[repr] done.");
+}
+
 fn main() {
     let root = repo_root();
     let scratch = PathBuf::from(
         std::env::var("PROFILE_SCRATCH").expect("set PROFILE_SCRATCH to a fresh scratch dir"),
     );
     std::fs::create_dir_all(&scratch).expect("create scratch");
+
+    if std::env::args().nth(1).as_deref() == Some("repr") {
+        repr_mode(&root, &scratch);
+        return;
+    }
 
     // B1a gate: the keys the environment is configured with are the proven pinned setup.
     let manifest_json =

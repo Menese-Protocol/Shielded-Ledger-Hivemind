@@ -15,10 +15,13 @@ import Array "mo:core/Array";
 import Blob "mo:core/Blob";
 import List "mo:core/List";
 import Nat8 "mo:core/Nat8";
+import Nat32 "mo:core/Nat32";
 import Nat64 "mo:core/Nat64";
 import Runtime "mo:core/Runtime";
+import VarArray "mo:core/VarArray";
 import Prim "mo:⛔";
 import FpM "../src/groth16/FpMont";
+import FpFlat "../src/groth16/FpFlat";
 import TM "../src/groth16/TowerMont";
 import C "../src/groth16/Curve";
 import CJ "../src/groth16/CurveJac";
@@ -222,6 +225,168 @@ persistent actor ChurnProfile {
     var acc = CJ.g1FromAffine(C.g1Gen);
     let p = run(iters, func() { acc := CJ.g1Dbl(acc) });
     sink += acc.x % 1024;
+    p
+  };
+
+  // ---- L3 differential gates (flat backend vs its L2 anchor), oracle-methodology §3 ----
+
+  public type Gate = { pass : Bool; checked : Nat; detail : Text };
+
+  transient var rngState : Nat64 = 0x243F6A8885A308D3; // pi digits; deterministic across runs
+
+  func rnd() : Nat64 {
+    var x = rngState;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    rngState := x;
+    x *% 0x2545F4914F6CDD1D
+  };
+
+  /// Uniform-enough Nat < P for differential vectors (build 12 random limbs, reduce mod P).
+  func randFp() : Nat {
+    var v : Nat = 0;
+    var i = 0;
+    while (i < 12) { v := v * 0x100000000 + Nat64.toNat(rnd() & 0xFFFFFFFF); i += 1 };
+    v % FpM.P
+  };
+
+  func gateFail(what : Text, i : Nat) : Gate {
+    { pass = false; checked = i; detail = what }
+  };
+
+  /// Differential test (Fp): FpFlat vs FpMont — montMul/add/sub/neg on the edge grid + `iters` random pairs,
+  /// inv every 64th vector. Byte-identity: FpFlat limb results converted back must equal the
+  /// FpMont Nat results EXACTLY, per vector (stronger than a digest — first divergence returned).
+  public func gate_fp_flat(iters : Nat) : async Gate {
+    let z = FpFlat.newBuf(8); // A=0 B=12 R=24 W=36 R2=48 (spare 60) T=72 (needs 14 of the 24 left)
+    let edges : [Nat] = [0, 1, FpM.P - 1, FpM.P - 2, FpM.toMont(1)];
+    var checked = 0;
+    let total = iters + edges.size() * edges.size();
+    var k = 0;
+    while (k < total) {
+      let (a, b) = if (k < edges.size() * edges.size()) {
+        (edges[k / edges.size()], edges[k % edges.size()])
+      } else { (randFp(), randFp()) };
+      FpFlat.fromNat(a, z, 0);
+      FpFlat.fromNat(b, z, 12);
+      FpFlat.montMulInto(z, 24, z, 0, z, 12, z, 72);
+      if (FpFlat.toNat(z, 24) != FpM.montMul(a, b)) return gateFail("montMul", k);
+      FpFlat.addInto(z, 24, z, 0, z, 12);
+      if (FpFlat.toNat(z, 24) != FpM.add(a, b)) return gateFail("add", k);
+      FpFlat.subInto(z, 24, z, 0, z, 12);
+      if (FpFlat.toNat(z, 24) != FpM.sub(a, b)) return gateFail("sub", k);
+      FpFlat.negInto(z, 24, z, 0);
+      if (FpFlat.toNat(z, 24) != FpM.sub(0, a)) return gateFail("neg", k);
+      // aliasing forms: z := z * b and z := z + z must match the non-aliased results
+      FpFlat.copy(z, 48, z, 0);
+      FpFlat.montMulInto(z, 48, z, 48, z, 12, z, 72);
+      if (FpFlat.toNat(z, 48) != FpM.montMul(a, b)) return gateFail("montMul-alias", k);
+      FpFlat.copy(z, 48, z, 0);
+      FpFlat.addInto(z, 48, z, 48, z, 48);
+      if (FpFlat.toNat(z, 48) != FpM.add(a, a)) return gateFail("add-alias", k);
+      // Fermat inv is ~770 muls on BOTH sides (the L2 side in slow normal-form pow), so it is
+      // strided to keep the gate inside one message's instruction budget.
+      if (k % 512 == 0 and a != 0) {
+        // montInv(â) must equal toMont(inv(fromMont(â))) — the exact L2 inversion semantics.
+        FpFlat.montInvInto(z, 24, z, 0, z, 36, z, 72);
+        if (FpFlat.toNat(z, 24) != FpM.toMont(FpM.inv(FpM.montMul(a, 1)))) {
+          return gateFail("inv", k);
+        };
+      };
+      checked += 1;
+      k += 1;
+    };
+    if (not FpFlat.isOneMont(z, 24)) {
+      FpFlat.oneMontInto(z, 24);
+      if (FpFlat.toNat(z, 24) != FpM.toMont(1)) return gateFail("one-mont", checked);
+    };
+    { pass = true; checked; detail = "FpFlat == FpMont on edge grid + random vectors" }
+  };
+
+  /// Flat montMul perf/alloc — the number that must be ~0 bytes/op.
+  public func probe_flat_mont_mul(iters : Nat) : async Probe {
+    let z = FpFlat.newBuf(8);
+    FpFlat.fromNat(FpM.toMont(A_N), z, 0);
+    FpFlat.fromNat(FpM.toMont(B_N), z, 12);
+    let a0 = Prim.rts_total_allocation();
+    let c0 = Prim.performanceCounter(0);
+    var i = 0;
+    while (i < iters) {
+      FpFlat.montMulInto(z, 0, z, 0, z, 12, z, 72);
+      i += 1;
+    };
+    let c1 = Prim.performanceCounter(0);
+    let a1 = Prim.rts_total_allocation();
+    sink += Nat32.toNat(z[0]) % 1024;
+    { alloc = a1 - a0 : Nat; instructions = c1 - c0; iters }
+  };
+
+  // ---- representation probes: which storage forms are zero-alloc on wasm64/EOP ----
+  // These decide the Phase-2 limb representation (measured, not assumed). Loops are written
+  // INLINE (no closure) so capture-cell boxing cannot pollute the local-arithmetic numbers.
+
+  public func probe_nat32_array_store(iters : Nat) : async Probe {
+    let arr : [var Nat32] = VarArray.repeat<Nat32>(0, 16);
+    let a0 = Prim.rts_total_allocation();
+    let c0 = Prim.performanceCounter(0);
+    var x : Nat32 = 0x9e3779b9;
+    var i = 0;
+    while (i < iters) {
+      x := x *% 0x85ebca6b +% 1;
+      arr[Nat32.toNat(x % 16)] := x;
+      i += 1;
+    };
+    let c1 = Prim.performanceCounter(0);
+    let a1 = Prim.rts_total_allocation();
+    sink += Nat32.toNat(arr[0]) % 1024;
+    { alloc = a1 - a0 : Nat; instructions = c1 - c0; iters }
+  };
+
+  public func probe_nat64_array_store(iters : Nat) : async Probe {
+    let arr : [var Nat64] = VarArray.repeat<Nat64>(0, 16);
+    let a0 = Prim.rts_total_allocation();
+    let c0 = Prim.performanceCounter(0);
+    var x : Nat64 = 0x9e3779b97f4a7c15; // full-width 64-bit values
+    var i = 0;
+    while (i < iters) {
+      x := x *% 0xbf58476d1ce4e5b9 +% 1;
+      arr[Nat64.toNat(x % 16)] := x;
+      i += 1;
+    };
+    let c1 = Prim.performanceCounter(0);
+    let a1 = Prim.rts_total_allocation();
+    sink += Nat64.toNat(arr[0] % 1024);
+    { alloc = a1 - a0 : Nat; instructions = c1 - c0; iters }
+  };
+
+  /// One simulated CIOS inner step (32x32->64 split mul + carry adds) purely in Nat64 locals.
+  public func probe_nat64_local_arith(iters : Nat) : async Probe {
+    let a0 = Prim.rts_total_allocation();
+    let c0 = Prim.performanceCounter(0);
+    var a : Nat64 = 0x123456789abcdef0;
+    var b : Nat64 = 0x9abcdef012345678;
+    var carry : Nat64 = 0;
+    var i = 0;
+    while (i < iters) {
+      let lo = (a & 0xFFFFFFFF) *% (b & 0xFFFFFFFF);
+      let hi = (a >> 32) *% (b & 0xFFFFFFFF);
+      carry := (lo >> 32) +% (hi & 0xFFFFFFFF);
+      a := (lo & 0xFFFFFFFF) +% (carry << 32) +% 1;
+      b := b +% a;
+      i += 1;
+    };
+    let c1 = Prim.performanceCounter(0);
+    let a1 = Prim.rts_total_allocation();
+    sink += Nat64.toNat((a +% carry) % 1024);
+    { alloc = a1 - a0 : Nat; instructions = c1 - c0; iters }
+  };
+
+  /// Same arithmetic but through a closure-captured `var` (does capture-cell update box?).
+  public func probe_nat64_capture_store(iters : Nat) : async Probe {
+    var x : Nat64 = 0x9e3779b97f4a7c15;
+    let p = run(iters, func() { x := x *% 0xbf58476d1ce4e5b9 +% 1 });
+    sink += Nat64.toNat(x % 1024);
     p
   };
 
