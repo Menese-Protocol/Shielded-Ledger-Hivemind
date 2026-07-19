@@ -143,7 +143,13 @@ pub fn build_wasms(repo_root: &Path, out_dir: &Path) -> BuiltWasms {
         std::fs::read(&out_path).expect("read compiled wasm")
     };
 
-    let ledger = compile("src/Main.mo", "zk_ledger.wasm");
+    // Behavior-identity override: run the SAME harness against a
+    // pre-built ledger wasm (e.g. compiled from the pre-fix commit) so the only variable
+    // between two runs is the ledger module itself.
+    let ledger = match std::env::var("SOAK_LEDGER_WASM") {
+        Ok(p) => std::fs::read(&p).unwrap_or_else(|e| panic!("read SOAK_LEDGER_WASM {p}: {e}")),
+        Err(_) => compile("src/Main.mo", "zk_ledger.wasm"),
+    };
     let token = compile("tests/IcpLedgerFixture.mo", "icp_ledger_fixture.wasm");
 
     let tree_oracle = std::fs::read(repo_root.join("vendor/tree_oracle_bls/tree_oracle_bls.wasm"))

@@ -1342,6 +1342,45 @@ impl Runner {
         let t0 = Instant::now();
         self.progress("final verification: fetching complete block log...");
         let blocks = replayer::fetch_all_blocks(&self.env);
+        // Behavior-identity dump: every SEMANTIC block field on `SEM` lines,
+        // the timing-derived fields (timestamp; phash/hash, which chain over timestamps) on
+        // `TIME` lines. Two runs of DIFFERENT wasms on a DTS chain cannot see identical
+        // `Time.now()` (round counts differ with instruction counts), so the identity contract
+        // is: all SEM lines byte-identical; TIME lines may differ only in the timing channel.
+        if let Ok(path) = std::env::var("SOAK_DUMP_BLOCKS") {
+            use std::io::Write;
+            let mut fh = std::fs::File::create(&path).expect("create block dump");
+            for b in &blocks {
+                writeln!(
+                    fh,
+                    "SEM {} {} v{} cm {} eph {} ct {} nfs {} anchor {} root {} origin {}",
+                    b.position,
+                    b.btype,
+                    b.encoding_version,
+                    hex::encode(b.commitment),
+                    hex::encode(&b.ephemeral_key),
+                    hex::encode(&b.note_ciphertext),
+                    b.nullifiers.iter().map(hex::encode).collect::<Vec<_>>().join(","),
+                    hex::encode(b.anchor_before),
+                    hex::encode(b.note_root_after),
+                    origin = b.origin,
+                )
+                .unwrap();
+                writeln!(
+                    fh,
+                    "TIME {} ts {} phash {} hash {}",
+                    b.position,
+                    b.timestamp,
+                    b.phash.map(hex::encode).unwrap_or_default(),
+                    hex::encode(b.hash)
+                )
+                .unwrap();
+            }
+            writeln!(fh, "SEM semantic-state-hash {}", self.model.state_hash(b"")).unwrap();
+            writeln!(fh, "SEM block-count {}", blocks.len()).unwrap();
+            writeln!(fh, "SEM note-root {}", hex::encode(f_bytes(&self.model.mirror.root()))).unwrap();
+            writeln!(fh, "SEM pool-value {} epoch {}", self.model.pool_value, self.model.epoch).unwrap();
+        }
         self.progress(&format!("fetched {} blocks in {:.1}s", blocks.len(), t0.elapsed().as_secs_f64()));
 
         // model vs actual block log, field by field
