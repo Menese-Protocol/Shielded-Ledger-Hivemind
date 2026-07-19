@@ -1459,8 +1459,15 @@ impl Runner {
             format!("PASS ({} injected, 100% rejected, all {} classes exercised)",
                 self.counters.injections, ALL_INJECTIONS.len()));
 
-        // B7 count part
-        assert!(self.upgrades_done.len() >= 3, "B7: fewer than 3 upgrades performed");
+        // B7 count part: the tier's configured upgrade count must all have landed (the full
+        // tier configures >= 3; smoke tiers may configure fewer — the requirement is the
+        // tier's, not a hard-coded 3, so a 1-upgrade smoke doesn't fail its own battery)
+        assert!(
+            self.upgrades_done.len() >= self.tier.upgrades,
+            "B7: {} upgrades performed, tier requires {}",
+            self.upgrades_done.len(),
+            self.tier.upgrades
+        );
         push(&mut battery, "B7-upgrades-under-load",
             format!("PASS ({} upgrades at ops {:?})", self.upgrades_done.len(), self.upgrades_done));
 
