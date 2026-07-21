@@ -34,6 +34,13 @@ ORACLE = HERE / "target" / "debug" / "icrc3-oracle"
 CERT_ORACLE = HERE / "target" / "debug" / "cert-oracle"
 LOCAL_REPLICA = os.environ.get("ZK_LEDGER_REPLICA_URL", "http://127.0.0.1:4945")
 EMPTY_ARCHIVE_MANIFEST = hashlib.sha256(b"").digest()
+# The certified `audit` leaf on a healthy ledger: ICRC-3 map hash of {state: "pass"}
+# (single-entry map: sha256(keyhash || valuehash)). The audit leaf is a pure function of
+# the audit VERDICT — wait_audit_pass() below is called after every upgrade so all
+# hash-tree captures compare like-for-like.
+AUDIT_PASS_DIGEST = hashlib.sha256(
+    hashlib.sha256(b"state").digest() + hashlib.sha256(b"pass").digest()
+).digest()
 TREE_ORACLE_WASM_SHA256 = "271b4f029e6f3e506667321d5b2a4c7b44aeb3fbf0d6248a2be0029401fe307e"
 ICP_DECIMALS = 8
 ICP_FEE_E8S = 10_000
@@ -246,6 +253,8 @@ def cert_command(
         "1",
         "--archive-manifest",
         EMPTY_ARCHIVE_MANIFEST.hex(),
+        "--audit-digest",
+        AUDIT_PASS_DIGEST.hex(),
         "--minimum-tip",
         str(minimum_tip),
     ]
@@ -407,6 +416,27 @@ def order_sensitive_map_hash(entries: list[dict[str, Any]]) -> bytes:
 
 def candid_blob(value: bytes) -> str:
     return 'blob "' + "".join(f"\\{byte:02x}" for byte in value) + '"'
+
+
+def wait_audit_pass(context: str, attempts: int = 240) -> None:
+    """Poll the background stable-state audit to PASS (the replica's timers drive the
+    chunks autonomously). Called after EVERY zk_ledger upgrade, before any snapshot or
+    further install: the G2/G3/G4 gates compare certified hash trees across upgrades
+    (the audit leaf must be back to "pass"), and an upgrade landing on an in-flight
+    audit chunk is rejected by the moc EOP runtime (outstanding callbacks)."""
+    status = None
+    for _ in range(attempts):
+        status = call("zk_ledger", "audit_status", query=True)
+        state = status["state"]
+        if isinstance(state, dict):
+            if "pass" in state:
+                return
+            if "fail" in state:
+                raise RuntimeError(f"stable-state audit FAILED ({context}): {state}")
+        elif state == "pass":
+            return
+        time.sleep(0.5)
+    raise RuntimeError(f"audit did not complete within bound ({context}): {status}")
 
 
 def call(canister: str, method: str, argument: str = "()", *, query: bool = False) -> Any:
@@ -1403,6 +1433,7 @@ def main() -> None:
     )
     if pending_upgrade.returncode != 0:
         raise RuntimeError(f"pending ledger upgrade failed: {pending_upgrade.stderr.strip()}")
+    wait_audit_pass("pending-shield upgrade")
     pending_post_upgrade_status = call("zk_ledger", "status", query=True)
     pending_post_upgrade_atomicity = call("zk_ledger", "atomicity_status", query=True)
     pending_post_upgrade_storage = call("zk_ledger", "storage_status", query=True)
@@ -1506,6 +1537,7 @@ def main() -> None:
     )
     if upgrade.returncode != 0:
         raise RuntimeError(f"ledger upgrade failed: {upgrade.stderr.strip()}")
+    wait_audit_pass("gate3 upgrade")
     post_upgrade_status = call("zk_ledger", "status", query=True)
     post_upgrade_storage = call("zk_ledger", "storage_status", query=True)
     post_upgrade_validation = call("zk_ledger", "validate_stable_state", query=True)

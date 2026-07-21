@@ -23,6 +23,9 @@ struct ExpectedTuple {
     note_root: Vec<u8>,
     encoding_version: u64,
     archive_manifest: Vec<u8>,
+    /// digest of the background audit verdict leaf (ICRC-3 map hash of {state:"pass"}
+    /// on a healthy ledger); callers assert audit PASS before fetching
+    audit_digest: Vec<u8>,
     minimum_tip: u64,
 }
 
@@ -77,6 +80,7 @@ fn expected(args: &[String]) -> Result<ExpectedTuple, String> {
             .map_err(|e| format!("encoding version: {e}"))?,
         archive_manifest: hex::decode(argument(args, "--archive-manifest")?)
             .map_err(|e| e.to_string())?,
+        audit_digest: hex::decode(argument(args, "--audit-digest")?).map_err(|e| e.to_string())?,
         minimum_tip: argument(args, "--minimum-tip")?
             .parse()
             .map_err(|e| format!("minimum tip: {e}"))?,
@@ -103,10 +107,13 @@ fn canonical_tree(tuple: &ExpectedTuple, tip_index_leaf: Vec<u8>, note_root: Vec
             fork(
                 labeled("archive_manifest", leaf(tuple.archive_manifest.clone())),
                 fork(
-                    labeled("encoding_version", leaf(leb128(tuple.encoding_version))),
+                    labeled("audit", leaf(tuple.audit_digest.clone())),
                     fork(
-                        labeled("note_count", leaf(leb128(tuple.note_count))),
-                        labeled("note_root", leaf(note_root)),
+                        labeled("encoding_version", leaf(leb128(tuple.encoding_version))),
+                        fork(
+                            labeled("note_count", leaf(leb128(tuple.note_count))),
+                            labeled("note_root", leaf(note_root)),
+                        ),
                     ),
                 ),
             ),
@@ -176,6 +183,7 @@ fn verify_bundle(
     let tip_hash = found(&tree, &[b"tip", b"last_block_hash"])?;
     let tip_index = found(&tree, &[b"tip", b"last_block_index"])?;
     let archive_manifest = found(&tree, &[b"zk", b"archive_manifest"])?;
+    let audit_digest = found(&tree, &[b"zk", b"audit"])?;
     let encoding_version = found(&tree, &[b"zk", b"encoding_version"])?;
     let note_count = found(&tree, &[b"zk", b"note_count"])?;
     let note_root = found(&tree, &[b"zk", b"note_root"])?;
@@ -185,6 +193,7 @@ fn verify_bundle(
     exact_uleb(&note_count, tuple.note_count, "note_count")?;
     if tip_hash != tuple.tip_hash
         || archive_manifest != tuple.archive_manifest
+        || audit_digest != tuple.audit_digest
         || note_root != tuple.note_root
     {
         return Err("tuple leaf differs from independent expected value".into());
