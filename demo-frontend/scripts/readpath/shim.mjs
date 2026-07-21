@@ -42,8 +42,14 @@ export function makeAccount(nacl, seedByte, custody = "ii-vetkey") {
     encSk: pair.secretKey,
     custody,
   };
-  // Only vetKey-backed accounts get a persistent cache key (throwaway accounts stay memory-only).
-  if (custody === "ii-vetkey") account.cacheKey = new Uint8Array(h("cache-seed", Uint8Array.of(seedByte)));
+  // Only vetKey-backed accounts get a persistent cache key (throwaway accounts stay memory-only)
+  // and a birthday key (distinct derivation, mirroring the /cache/v1 vs /birthday/v1 info-string
+  // domain separation in auth.js).
+  if (custody === "ii-vetkey") {
+    account.cacheKey = new Uint8Array(h("cache-seed", Uint8Array.of(seedByte)));
+    account.birthdayKey = new Uint8Array(h("birthday-seed", Uint8Array.of(seedByte)));
+    account.principalText = `mock-principal-${seedByte}`;
+  }
   return account;
 }
 

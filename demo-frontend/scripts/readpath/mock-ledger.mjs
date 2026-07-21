@@ -107,9 +107,11 @@ export class MockLedger {
   }
 
   _getBlocks(args) {
-    // Record the exact ranges requested (for page-accounting + privacy assertions).
+    // Record the exact ranges requested (for page-accounting + privacy assertions), plus the log
+    // length AT REQUEST TIME so the isolation oracle can distinguish a legitimate last partial
+    // page from a truncated-length fetch even after the log grows.
     const ranges = args.map((r) => ({ start: Number(r.start), length: Number(r.length) }));
-    this.requestLog.push({ method: "icrc3_get_blocks", ranges });
+    this.requestLog.push({ method: "icrc3_get_blocks", ranges, n: this.records.length });
     const blocks = [];
     let emitted = 0;
     const n = this.records.length;
@@ -159,14 +161,20 @@ export class MockLedger {
     return this._noteRoot;
   }
 
-  // Count the block fetches in the request log that are NOT 512-page-aligned single ranges — the
-  // B-P5 privacy assertion (any position-isolating fetch is a leak).
+  // Count the block fetches in the request log that could isolate a position — the B-P5 privacy
+  // assertion. A fetch is non-isolating ONLY if it is a single 512-aligned range that is either a
+  // FULL page (length == 512) or the true last partial page at request time (start + length ==
+  // log_length, which reveals only the public tip). A truncated-length page fetch like
+  // {start: 512, length: 128} pinpoints position start+length to the byte and is flagged even
+  // though it is page-aligned.
   positionIsolatingFetches() {
-    return this.requestLog.filter(
-      (e) =>
-        e.method === "icrc3_get_blocks" &&
-        !(e.ranges.length === 1 && e.ranges[0].start % MAX_BLOCKS_PER_CALL === 0 && e.ranges[0].length <= MAX_BLOCKS_PER_CALL)
-    );
+    return this.requestLog.filter((e) => {
+      if (e.method !== "icrc3_get_blocks") return false;
+      if (e.ranges.length !== 1) return true;
+      const r = e.ranges[0];
+      if (r.start % MAX_BLOCKS_PER_CALL !== 0 || r.length > MAX_BLOCKS_PER_CALL) return true;
+      return r.length !== MAX_BLOCKS_PER_CALL && r.start + r.length !== e.n;
+    });
   }
 
   // Any block fetch whose single range covers positions strictly below `birthday` (B-P2).
