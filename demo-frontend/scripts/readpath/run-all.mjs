@@ -9,7 +9,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 // whole graph statically, so an in-battery side-effect import runs too late on a fresh
 // worktree) — generate them in a separate process first.
 execFileSync(process.execPath, [resolve(here, "setup-declarations.mjs")], { stdio: "inherit" });
-const items = ["b-p1", "b-p2", "b-p3", "b-p4", "b-p5", "b-birthday"];
+const items = ["b-p1", "b-p2", "b-p3", "b-p4", "b-p5", "b-birthday", "b-p12-pir"];
 let failed = 0;
 for (const item of items) {
   console.log(`\n===== ${item} =====`);
