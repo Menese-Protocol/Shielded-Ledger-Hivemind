@@ -19,6 +19,7 @@ pub mod mint_guard;
 pub mod model;
 pub mod observer;
 pub mod pic_env;
+pub mod pir2;
 pub mod prover;
 pub mod replayer;
 pub mod runner;
