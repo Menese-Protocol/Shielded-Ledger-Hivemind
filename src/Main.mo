@@ -1590,6 +1590,34 @@ persistent actor ZkLedger {
     { blocks = List.toArray(result); log_length = noteCount(); archived_blocks = [] }
   };
 
+  // Compact detection stream for light-client note recognition. Returns densely packed
+  // 48-byte entries `(note_position : 8B big-endian) || note_ciphertext[0..40]` — the envelope's
+  // ephemeral X25519 key (32B) plus its 8-byte view tag (new-format envelopes) or the first 8 nonce
+  // bytes (legacy, which a client ignores below its format cutover). It slices the stored envelope
+  // bytes and performs NO envelope crypto or parsing beyond the note decode. Additive and read-only
+  // (changes no existing behavior); same 512-block TOTAL cap and per-message bound as
+  // icrc3_get_blocks (measured: ~418k instr/note, a 512-note call ~24× under the query budget).
+  public query func detection_stream(start : Nat, count : Nat) : async Blob {
+    let out = List.empty<Nat8>();
+    let n = noteCount();
+    if (start < n) {
+      let end = Nat.min(start + Nat.min(count, MAX_BLOCKS_PER_CALL), n);
+      var i = start;
+      while (i < end) {
+        var k : Nat = 8;
+        while (k > 0) { k -= 1; List.add(out, Nat8.fromNat((i / (256 ** k)) % 256)) };
+        let ct = Blob.toArray(blockAt(i).note_ciphertext);
+        var j = 0;
+        while (j < 40) {
+          List.add(out, if (j < ct.size()) ct[j] else (0 : Nat8));
+          j += 1;
+        };
+        i += 1;
+      };
+    };
+    Blob.fromArray(List.toArray(out))
+  };
+
   func pendingById(intentId : Blob) : ?PendingShield {
     switch (pending_shield) {
       case (?pending) { if (Blob.equal(pending.intent_id, intentId)) ?pending else null };
