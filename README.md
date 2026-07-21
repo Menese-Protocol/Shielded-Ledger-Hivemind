@@ -42,6 +42,12 @@ anyone watch it work.
   WebAssembly: note secrets, commitment and nullifier derivation, the Merkle tree rebuilt from
   the public commitment log, Groth16 proving, and the PIR client. Shielded keys derive from
   Internet Identity through vetKeys and live only in memory.
+- **`soak/`**: the randomized, model-checked PocketIC soak harness. Seeded random operation
+  streams over thousands of accounts, an independent block replayer, adversarial injection
+  classes, upgrades under load, and a battery of solvency, certification, and leakage audits.
+- **`ceremony/`, `coordinator/`**: the multi-party trusted-setup tooling; a coordinator
+  canister that never holds a secret, the contributor client, a reproducible contributor
+  build, and the transcript verifier.
 - **`scripts/security-gate.sh`**: one command that re-runs the full offline security battery.
 - **`nns_adapter/`, `tree_oracle/`, `icrc3_oracle/`, `cert_oracle/`, `cross_oracle/`**: the
   certified NNS-to-ICRC-3 adapter and the native Rust oracles the tests compare against,
@@ -113,6 +119,12 @@ final exponentiation across all four pairings. Every L2 module is differentially
 L1 on the same inputs, with live formula mutants that must turn the tests red before the
 optimization is accepted. Optimizations earn their place by measurement, not by argument.
 
+On top of L2 sits a zero-allocation engine: in-place Montgomery field, tower, curve, and
+pairing arithmetic over preallocated scratch buffers, differentially tested byte-identical
+against L2 at every layer. Verification allocation drops from 462.5 MB to 9.3 MB of garbage
+per proof, the ledger's memory high-water at startup falls from 960 MB to 256 MB, and
+verification runs 13% faster.
+
 Verdicts are anchored to two reference implementations with unrelated lineages. Every frozen
 fixture must produce the identical accept or reject decision in arkworks, in blst
 (`cross_oracle/`), and in the Motoko verifier; a specification misreading has to be shared by
@@ -168,9 +180,11 @@ undetectably. The policy here is explicit:
   that is exactly as far as trust should stretch.
 - A real-value launch requires a **multi-party ceremony**: many independent contributors, each
   mixing in secret randomness and destroying it, so that a single honest participant makes
-  forgery impossible forever. Our team is actively working through that ceremony's design now;
-  participant recruitment, tooling, the public transcript, and how the final verifying key is
-  ratified on-chain. The full acceptance checklist a production keyset must pass is in
+  forgery impossible forever. The ceremony tooling ships in this repository (`ceremony/`,
+  `coordinator/`): a coordinator canister that never holds a secret, a contributor client, a
+  reproducible contributor build, and a transcript verifier. What remains is the ceremony
+  itself: independent participants, the public transcript, and on-chain ratification of the
+  final verifying key. The full acceptance checklist a production keyset must pass is in
   [`docs/TRUSTED-SETUP-POLICY.md`](docs/TRUSTED-SETUP-POLICY.md), and the production key gate
   in this repository intentionally fails until a reviewed ceremony transcript exists.
 
