@@ -1,0 +1,60 @@
+[package]
+name = "fortress-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+blst = "0.3"
+ark-bls12-381 = "0.5"
+ark-groth16 = "0.5"
+ark-serialize = "0.5"
+ark-ec = "0.5"
+
+[[bin]]
+name = "decode_g1"
+path = "fuzz_targets/decode_g1.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "decode_g2"
+path = "fuzz_targets/decode_g2.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "decode_proof"
+path = "fuzz_targets/decode_proof.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "decode_vk"
+path = "fuzz_targets/decode_vk.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "decode_fr"
+path = "fuzz_targets/decode_fr.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "teeth_planted_panic"
+path = "fuzz_targets/teeth_planted_panic.rs"
+test = false
+doc = false
+
+[workspace]
+
+[[bin]]
+name = "decode_vk_raw"
+path = "fuzz_targets/decode_vk_raw.rs"
+test = false
+doc = false
