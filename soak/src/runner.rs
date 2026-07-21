@@ -1204,16 +1204,64 @@ impl Runner {
         );
     }
 
+    fn audit_status(&self) -> ct::AuditStatus {
+        self.env
+            .query(self.env.ledger, "audit_status", ())
+            .expect("audit_status query")
+    }
+
+    /// Drive PocketIC rounds until the background audit reaches a terminal state, with a
+    /// HARD BOUND committed up front (bounded-verification: a stalled tick chain must
+    /// fail the run loudly, never hang the poll). Returns the terminal status.
+    fn await_audit_terminal(&self, label: &str) -> ct::AuditStatus {
+        let notes = u64::try_from(self.env.ledger_status().note_count.0.clone()).unwrap();
+        // K=4096 notes/chunk + one chunk per set/log phase + margin; each chunk needs a
+        // handful of rounds (timer tick + self-call + reply). 16 ticks/chunk is ~5x the
+        // observed need; the bound exists to convert a dead tick chain into a loud panic.
+        let max_ticks = (notes / 4_096 + 16) * 16 + 256;
+        let mut ticks: u64 = 0;
+        loop {
+            let status = self.audit_status();
+            match status.state {
+                ct::AuditState::running => {}
+                _ => return status,
+            }
+            if ticks >= max_ticks {
+                panic!(
+                    "audit poll bound exhausted ({label}): {max_ticks} ticks, still running at phase {:?} cursor {} of {} (epoch {}, retries {}) — tick chain presumed dead",
+                    status.phase, status.cursor, status.total, status.audit_epoch, status.chunk_retries
+                );
+            }
+            if ticks % 64 == 0 {
+                self.progress(&format!(
+                    "audit poll ({label}): phase {:?} cursor {}/{} epoch {}",
+                    status.phase, status.cursor, status.total, status.audit_epoch
+                ));
+            }
+            self.env.pic().advance_time(std::time::Duration::from_secs(1));
+            self.env.pic().tick();
+            ticks += 1;
+        }
+    }
+
     fn upgrade(&mut self, at_op: u64) {
         let rts = self.env.ledger_rts();
         self.progress(&format!(
-            "upgrade #{} at op {} (mode upgrade, same wasm) | pre-upgrade rts: mem {:.2}GiB heap {:.2}GiB max-live {:.2}GiB",
+            "upgrade #{} at op {} STARTING (mode upgrade, same wasm) | pre-upgrade rts: mem {:.2}GiB heap {:.2}GiB max-live {:.2}GiB",
             self.upgrades_done.len() + 1,
             at_op,
             gib(&rts.memory_size),
             gib(&rts.heap_size),
             gib(&rts.max_live_size)
         ));
+        // DRAIN: an open audit-chunk self-call makes the moc EOP runtime reject the
+        // upgrade ("canister_pre_upgrade attempted with outstanding message callbacks",
+        // TX probe). The audit must be terminal before install_code. A pre-existing
+        // FAIL is ledger-implicated: stop loudly.
+        let drained = self.await_audit_terminal("pre-upgrade drain");
+        if let ct::AuditState::fail { code, index } = &drained.state {
+            panic!("audit FAILED before upgrade #{}: {code} at index {index}", self.upgrades_done.len() + 1);
+        }
         let pre = self.env.ledger_status();
         // moc 1.4.1 compiles with enhanced orthogonal persistence: the upgrade must carry
         // wasm_memory_persistence = keep (the state-preserving option; `replace` would wipe).
@@ -1223,39 +1271,58 @@ impl Runner {
             .unwrap_or_else(|e| panic!("upgrade failed: {e:?}"));
         // free any WASM chunk storage the upgrade left resident
         let _ = self.env.pic().clear_chunk_store(self.env.ledger, Some(self.env.admin));
+        // COMMITTED postupgrade cost bounds (the fix's contract): the old full walk cost
+        // ~3.0M instr + 180KB alloc PER NOTE (154B instr / 9.3GB at 51,411 notes — the
+        // measured OOM wall). The bounded postupgrade decodes ONE block: 2B instructions
+        // and 256 MiB heap growth are ~75x/~36x under the old wall at this tier and
+        // catch any O(n) regression loudly.
+        let stats: ct::PostupgradeStats = self
+            .env
+            .query(self.env.ledger, "postupgrade_stats", ())
+            .expect("postupgrade_stats");
+        assert!(
+            stats.instructions < 2_000_000_000,
+            "postupgrade used {} instructions — O(n) regression (bound 2B)",
+            stats.instructions
+        );
+        let heap_before = u128::try_from(stats.heap_before.0.clone()).unwrap();
+        let heap_after = u128::try_from(stats.heap_after.0.clone()).unwrap();
+        let heap_delta = heap_after.saturating_sub(heap_before);
+        assert!(
+            heap_delta < 256 * 1024 * 1024,
+            "postupgrade heap delta {heap_delta}B — allocation regression (bound 256MiB)"
+        );
         let post = self.env.ledger_status();
         assert_eq!(pre.note_root, post.note_root, "upgrade lost note_root");
         assert_eq!(pre.note_count, post.note_count, "upgrade lost note_count");
         assert_eq!(pre.nullifier_count, post.nullifier_count, "upgrade lost nullifiers");
         assert_eq!(pre.pool_value, post.pool_value, "upgrade lost pool_value");
         assert_eq!(pre.epoch, post.epoch, "upgrade lost epoch");
-        // validate_stable_state walks EVERY note (decode + canonical re-encode + ICRC-3 hash,
-        // ~3M instr/note measured) inside one 5B-instruction query budget, so it cannot
-        // complete above ~1.6k notes on ANY wasm — the walk code is byte-identical to the
-        // pre-fix module (verified by empty diffs for NoteCodec/ICRC3/StableLog/
-        // StableBlobSet and no validate hunks in Main.mo). Prior green runs were <=541 notes;
-        // the one prior at-scale attempt died of the memory wall before reaching this check.
-        // The at-scale stable-state validation is the end-of-run B2/B3 wire battery (block log
-        // vs model field-by-field + independent replayer). A real #err verdict, or a limit hit
-        // BELOW the known ceiling, still fails the run loudly.
-        match self.env.query::<ct::MotokoResult<candid::Reserved>>(self.env.ledger, "validate_stable_state", ()) {
-            Ok(v) => {
-                v.into_result().expect("stable state invalid after upgrade");
-            }
-            Err(e) if e.contains("CanisterInstructionLimitExceeded") => {
-                let notes = u64::try_from(post.note_count.0.clone()).unwrap_or(0);
-                assert!(
-                    notes > 1500,
-                    "validate_stable_state hit the query instruction limit at only {notes} notes — NOT the known scale ceiling; investigate: {e}"
-                );
-                self.progress(&format!(
-                    "upgrade at op {at_op}: validate_stable_state query exceeds the 5B budget at {notes} notes (known diagnostic-endpoint scale ceiling, walk code identical to pre-fix wasm; full-state validation via end-of-run B2/B3 battery)"
-                ));
-            }
-            Err(e) => panic!("validate_stable_state: {e}"),
+        // bounded O(k) validation answers immediately (the full walk is the audit's job)
+        let validated: ct::MotokoResult<candid::Reserved> = self
+            .env
+            .query(self.env.ledger, "validate_stable_state", ())
+            .expect("validate_stable_state");
+        validated.into_result().expect("stable state invalid after upgrade");
+        // SAME end-to-end assurance as the old blocking walk, amortized: poll the
+        // background audit to completion and require PASS before declaring the upgrade
+        // complete. Instructions/alloc stay bounded PER MESSAGE; the verdict is whole-state.
+        let audited = self.await_audit_terminal("post-upgrade audit");
+        match &audited.state {
+            ct::AuditState::pass => {}
+            other => panic!(
+                "audit did not PASS after upgrade #{}: {other:?}",
+                self.upgrades_done.len() + 1
+            ),
         }
         self.cheap_invariants();
-        self.progress(&format!("upgrade #{} complete, invariants green", self.upgrades_done.len() + 1));
+        self.progress(&format!(
+            "upgrade #{} complete, audit PASS (epoch {}), invariants green | postupgrade {} instr, heap delta {}B",
+            self.upgrades_done.len() + 1,
+            audited.audit_epoch,
+            stats.instructions,
+            heap_delta
+        ));
         self.upgrades_done.push(at_op);
     }
 
@@ -1481,6 +1548,19 @@ impl Runner {
             Some(replayer_tip_hash.as_slice()),
             "B6: certified last_block_hash != replayer chain tip"
         );
+        // the certified audit leaf: assert the audit is PASS, then expect its digest —
+        // the ICRC-3 map hash of {state: "pass"} — computed INDEPENDENTLY here
+        let audit = self.audit_status();
+        assert!(
+            matches!(audit.state, ct::AuditState::pass),
+            "B6: audit not PASS at certification time: {:?}",
+            audit.state
+        );
+        let audit_digest = crate::icrc3_hash::hash_value(&ct::Value::Map(vec![(
+            "state".into(),
+            crate::icrc3_hash::text("pass"),
+        )]))
+        .to_vec();
         let tuple = cert::ExpectedTuple {
             tip_index: blocks.len() as u64 - 1,
             tip_hash: replayer_tip_hash,
@@ -1488,6 +1568,7 @@ impl Runner {
             note_root: f_bytes(&self.model.mirror.root()),
             encoding_version: 1,
             archive_manifest,
+            audit_digest,
         };
         let report = cert::verify_tip_certificate(
             &tip.certificate,
@@ -1561,7 +1642,7 @@ impl Runner {
         // (a) and (b) are PASS/FAIL: a beat-chance result is a real leak finding, surfaced by a
         // panic here (that is a success of the harness, never softened).
         crate::linkage::verdict(&link).unwrap_or_else(|e| {
-            panic!("B11 LINKAGE FINDING (investigate before weakening anything): {e}")
+            panic!("B11 LINKAGE FINDING (a beat-chance score is a real leak — investigate, do NOT weaken): {e}")
         });
         push(&mut battery, "B11-linkage-cryptanalysis",
             format!(

@@ -65,6 +65,48 @@ pub struct RtsStatus {
     pub max_live_size: Nat,
 }
 
+// Motoko `AuditState = variant { running; pass; fail : record { code; index } }`
+#[derive(CandidType, Deserialize, Clone, Debug, PartialEq)]
+#[allow(non_camel_case_types)]
+pub enum AuditState {
+    running,
+    pass,
+    fail { code: String, index: Nat },
+}
+
+#[derive(CandidType, Deserialize, Clone, Debug, PartialEq)]
+#[allow(non_camel_case_types)]
+pub enum AuditPhase {
+    log_index,
+    set_roots,
+    set_nullifiers,
+    set_shields,
+    set_unshields,
+    notes,
+    tail,
+}
+
+#[derive(CandidType, Deserialize, Clone, Debug)]
+pub struct AuditStatus {
+    pub state: AuditState,
+    pub phase: AuditPhase,
+    pub cursor: Nat,
+    pub total: Nat,
+    pub audit_epoch: Nat,
+    pub last_completed_at: Option<u64>,
+    pub last_chunk_at: Option<u64>,
+    pub chunk_retries: Nat,
+    pub guard: Option<String>,
+    pub guard_epoch: Nat,
+}
+
+#[derive(CandidType, Deserialize, Clone, Debug)]
+pub struct PostupgradeStats {
+    pub instructions: u64,
+    pub heap_before: Nat,
+    pub heap_after: Nat,
+}
+
 #[derive(CandidType, Deserialize, Clone, Debug)]
 pub struct MutationResult {
     pub outcome: String,

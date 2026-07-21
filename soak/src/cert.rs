@@ -17,6 +17,9 @@ pub struct ExpectedTuple {
     pub note_root: [u8; 32],
     pub encoding_version: u64,
     pub archive_manifest: Vec<u8>,
+    /// digest of the background audit verdict — the runner asserts audit PASS before
+    /// fetching the certificate, then expects the ICRC-3 map hash of {state: "pass"}
+    pub audit_digest: Vec<u8>,
 }
 
 fn leb128(value: u64) -> Vec<u8> {
@@ -39,10 +42,13 @@ fn canonical_tree(t: &ExpectedTuple, tip_index_leaf: Vec<u8>, note_root: Vec<u8>
             fork(
                 labeled("archive_manifest", leaf(t.archive_manifest.clone())),
                 fork(
-                    labeled("encoding_version", leaf(leb128(t.encoding_version))),
+                    labeled("audit", leaf(t.audit_digest.clone())),
                     fork(
-                        labeled("note_count", leaf(leb128(t.note_count))),
-                        labeled("note_root", leaf(note_root)),
+                        labeled("encoding_version", leaf(leb128(t.encoding_version))),
+                        fork(
+                            labeled("note_count", leaf(leb128(t.note_count))),
+                            labeled("note_root", leaf(note_root)),
+                        ),
                     ),
                 ),
             ),
