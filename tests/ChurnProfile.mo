@@ -245,7 +245,7 @@ persistent actor ChurnProfile {
     p
   };
 
-  // ---- L3 differential gates (flat backend vs its L2 anchor), oracle-methodology §3 ----
+  // ---- L3 differential gates (flat backend vs its L2 anchor) ----
 
   public type Gate = { pass : Bool; checked : Nat; detail : Text };
 

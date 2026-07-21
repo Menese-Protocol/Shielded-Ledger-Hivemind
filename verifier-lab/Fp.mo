@@ -1,6 +1,6 @@
 /// G1 / **L1 REFERENCE** — BLS12-381 base field Fq, in pure arbitrary-precision `Nat`.
 ///
-/// Menese DeFi Team. Per `ORACLE-METHODOLOGY-motoko-verifier.md` §1: L1 is the **correctness anchor** —
+/// Menese DeFi Team. L1 is the **correctness anchor** —
 /// maximally literal transcription of the mathematics, ZERO optimization, no limbs, no Montgomery.
 /// It must byte-match the arkworks oracle (L0) on every vector class BEFORE any optimized L2 exists.
 /// Then L2 is written as a diff against a green L1, so an L2 divergence localizes to the optimization

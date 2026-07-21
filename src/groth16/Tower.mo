@@ -1,6 +1,6 @@
 /// G2 / **L1 REFERENCE** — BLS12-381 extension tower Fp2 → Fp6 → Fp12, in pure `Nat`.
 ///
-/// Menese DeFi Team. Per `ORACLE-METHODOLOGY-motoko-verifier.md` §1: L1 is the **correctness anchor**.
+/// Menese DeFi Team. L1 is the **correctness anchor**.
 /// Maximally literal transcription of the mathematics. ZERO optimization. **Do not optimize this file.**
 ///
 /// Tower:
