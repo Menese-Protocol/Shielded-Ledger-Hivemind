@@ -153,8 +153,12 @@ identical state hash.
    expected block, pool value, and an independent Merkle tree; after every accepted operation
    the canister's reported state must match the model exactly.
 7. **Upgrades**: at least 3 canister upgrades at seeded random points mid-run (mode upgrade,
-   `wasm_memory_persistence = keep`); all invariants re-checked after each; the block chain must
-   link across every boundary.
+   `wasm_memory_persistence = keep`). The harness drains any in-flight background audit before
+   upgrading, asserts the postupgrade hook stays inside committed bounds (2B instructions /
+   256 MiB heap delta), then polls the ledger's background stable-state audit and counts the
+   upgrade complete only when the audit reports PASS with its verdict published as a certified
+   audit leaf; all invariants are re-checked after each, and the block chain must link across
+   every boundary.
 8. **Full-population verification** (no sampling): for ALL N accounts, the model balance must
    equal (a) a wallet-style trial-recognition scan over the public block log minus spent
    nullifiers, and (b) the balance computed by an **independent replayer** that reconstructs
@@ -185,6 +189,27 @@ identical state hash.
     keyless-observer audit, they empirically confirm cryptographic unlinkability for this
     dataset and are a regression guard; they are not a substitute for the circuit's
     unlinkability argument.
+
+### The postupgrade audit and scale batteries
+
+The ledger's `postupgrade` is O(1)/O(k): it validates structure headers and the tail block
+only, and hands full-state validation to a timer-driven chunked background audit whose verdict
+is published as a certified audit leaf. Any audit failure fail-closes every update endpoint
+until an admin-triggered re-audit passes. `soak/src/bin/scale_tests.rs` proves this protocol
+at scale on synthetic states built through the real codec and chain code
+(`tests/ScaleFixture.mo`):
+
+- **Fixture selftest**: every corruption primitive produces its exact reference-walk error code.
+- **Flat postupgrade cost**: postupgrade instructions stay flat (within a committed threshold)
+  across 1k/20k/200k-note states, with the audit passing at every size.
+- **Differential equivalence**: the chunked audit and the verbatim single-message reference
+  walk agree case-by-case on the same valid and corrupted states.
+- **Fail-closed drill**: six corruption classes injected into a RUNNING canister (via the
+  admin-gated hook wasm from `scripts/build-test-wasm.sh`, never present in the shipped wasm)
+  must each produce an audit FAIL record, guarded update endpoints, live queries, rejection of
+  premature guard clears, and a full recovery: un-corrupt, re-audit green, guard cleared.
+
+Run with `cd soak && cargo run --release --bin scale_tests`.
 
 ### Scope notes
 
