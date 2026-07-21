@@ -45,13 +45,17 @@ fn compile(source: &str, out_name: &str) -> Vec<u8> {
 }
 
 struct Ctx {
+    // field order is load-bearing: struct fields drop in DECLARATION order, so the
+    // PocketIc instance (which sends a delete request on drop) must precede the
+    // ManagedServer (which kills the server child on drop)
     pic: PocketIc,
+    _server: pic_env::ManagedServer,
     admin: Principal,
     canister: Principal,
 }
 
 impl Ctx {
-    fn new(wasm: Vec<u8>) -> (Self, pic_env::ManagedServer) {
+    fn new(wasm: Vec<u8>) -> Self {
         let server = pic_env::spawn_server(&pic_env::resolve_pocket_ic_server());
         let pic = PocketIcBuilder::new()
             .with_server_url(server.url.clone())
@@ -72,7 +76,7 @@ impl Ctx {
             },
         )
         .expect("raise wasm_memory_limit");
-        (Ctx { pic, admin, canister }, server)
+        Ctx { pic, _server: server, admin, canister }
     }
 
     fn call_raw(&self, method: &str, args: Vec<u8>) -> Vec<u8> {
@@ -134,19 +138,19 @@ fn fixture_selftest() -> bool {
     let mut ok = true;
 
     // one instance per corruption case: corruption primitives are destructive
-    let fresh = |notes: u64| -> (Ctx, pic_env::ManagedServer) {
-        let (ctx, server) = Ctx::new(fixture_wasm.clone());
+    let fresh = |notes: u64| -> Ctx {
+        let ctx = Ctx::new(fixture_wasm.clone());
         ctx.call0("configure_fixture");
         let _ = ctx.call_raw(
             "configure_token_fixture",
             candid::encode_args((ctx.canister, ctx.canister)).unwrap(),
         );
         ctx.bulk_to(notes);
-        (ctx, server)
+        ctx
     };
 
     println!("== fixture selftest: valid 1k state old-walks to #ok ==");
-    let (ctx, _s1) = fresh(1_000);
+    let ctx = fresh(1_000);
     match ctx.old_walk() {
         Ok(()) => println!("  PASS: valid state -> #ok"),
         Err(e) => {
@@ -156,7 +160,7 @@ fn fixture_selftest() -> bool {
     }
 
     println!("== corruption: note byte, checksum NOT fixed -> note-codec:checksum ==");
-    let (ctx, _s2) = fresh(1_000);
+    let ctx = fresh(1_000);
     let _ = ctx.call_raw(
         "corrupt_note_byte",
         candid::encode_args((candid::Nat::from(500u64), candid::Nat::from(60u64), false)).unwrap(),
@@ -164,7 +168,7 @@ fn fixture_selftest() -> bool {
     ok &= expect_code("checksum-stale corrupt", ctx.old_walk(), "note-codec:checksum");
 
     println!("== corruption: commitment byte, checksum fixed -> phash break at next note ==");
-    let (ctx, _s3) = fresh(1_000);
+    let ctx = fresh(1_000);
     // payload layout: frame 48 + btype len4+7 + phash tag1(+32) + ver8 + pos8 + commitment...
     // note 500 has a phash (position>0): commitment begins at 48+4+7+1+32+8+8 = 108
     let _ = ctx.call_raw(
@@ -174,7 +178,7 @@ fn fixture_selftest() -> bool {
     ok &= expect_code("tamper+fixed-checksum", ctx.old_walk(), "stable-state:phash");
 
     println!("== corruption: stored phash byte, checksum fixed -> phash at that index ==");
-    let (ctx, _s4) = fresh(1_000);
+    let ctx = fresh(1_000);
     // phash bytes begin at frame 48 + 4 + 7 + 1 = 60
     let _ = ctx.call_raw(
         "corrupt_note_byte",
@@ -183,14 +187,14 @@ fn fixture_selftest() -> bool {
     ok &= expect_code("stored-phash tamper", ctx.old_walk(), "stable-state:phash");
 
     println!("== corruption: tamper a historical-root key -> missing-historical-root ==");
-    let (ctx, _s5) = fresh(1_000);
+    let ctx = fresh(1_000);
     let raw = ctx.call_raw("nth_root", candid::encode_args((candid::Nat::from(500u64),)).unwrap());
     let (root,): (serde_bytes::ByteBuf,) = candid::decode_args(&raw).expect("root");
     let _ = ctx.call_raw("tamper_set_key", candid::encode_args(("roots", root)).unwrap());
     ok &= expect_code("root-key tamper", ctx.old_walk(), "stable-state:missing-historical-root");
 
     println!("== corruption: tamper a nullifier key -> missing-nullifier ==");
-    let (ctx, _s6) = fresh(1_000);
+    let ctx = fresh(1_000);
     // note positions %3 != 0 are transfers; position 500 (500*2=1000th nullifier index)
     let raw = ctx.call_raw("nth_nullifier", candid::encode_args((candid::Nat::from(1_000u64),)).unwrap());
     let (nf,): (serde_bytes::ByteBuf,) = candid::decode_args(&raw).expect("nf");
@@ -198,14 +202,14 @@ fn fixture_selftest() -> bool {
     ok &= expect_code("nullifier-key tamper", ctx.old_walk(), "stable-state:missing-nullifier");
 
     println!("== corruption: zero a roots slot tag -> roots:stable-set:observed-count ==");
-    let (ctx, _s7) = fresh(1_000);
+    let ctx = fresh(1_000);
     let raw = ctx.call_raw("nth_root", candid::encode_args((candid::Nat::from(700u64),)).unwrap());
     let (root,): (serde_bytes::ByteBuf,) = candid::decode_args(&raw).expect("root");
     let _ = ctx.call_raw("zero_set_slot_tag", candid::encode_args(("roots", root)).unwrap());
     ok &= expect_code("slot-tag zero", ctx.old_walk(), "roots:stable-set:observed-count");
 
     println!("== corruption: tree root mismatch -> stable-state:tree-root ==");
-    let (ctx, _s8) = fresh(1_000);
+    let ctx = fresh(1_000);
     let _ = ctx.call_raw(
         "set_tree_root_hex",
         candid::encode_args(("00".repeat(32),)).unwrap(),
@@ -213,7 +217,7 @@ fn fixture_selftest() -> bool {
     ok &= expect_code("tree-root mismatch", ctx.old_walk(), "stable-state:tree-root");
 
     println!("== corruption: tampered last_block_hash -> stable-state:last-block-hash ==");
-    let (ctx, _s9) = fresh(1_000);
+    let ctx = fresh(1_000);
     let _ = ctx.call_raw(
         "set_last_block_hash",
         candid::encode_args((Some(serde_bytes::ByteBuf::from(vec![0u8; 32])),)).unwrap(),
@@ -221,7 +225,7 @@ fn fixture_selftest() -> bool {
     ok &= expect_code("last-block-hash tamper", ctx.old_walk(), "stable-state:last-block-hash");
 
     println!("== NoteAudit parity: fast Checker vs verbatim reference, valid 1k state ==");
-    let (ctx, _p1) = fresh(1_000);
+    let ctx = fresh(1_000);
     let parity = |ctx: &Ctx, label: &str| -> bool {
         let raw = ctx.call_raw("parity_check", candid::encode_args((candid::Nat::from(1_000u64),)).unwrap());
         let (r,): (soak::candid_types::MotokoResult<(candid::Nat, u64, candid::Nat, u64, candid::Nat)>,) =
@@ -249,13 +253,13 @@ fn fixture_selftest() -> bool {
     ok &= parity(&ctx, "valid-state parity + measurement");
 
     println!("== NoteAudit parity on corrupted states (fallback verdict identity) ==");
-    let (ctx, _p2) = fresh(1_000);
+    let ctx = fresh(1_000);
     let _ = ctx.call_raw(
         "corrupt_note_byte",
         candid::encode_args((candid::Nat::from(500u64), candid::Nat::from(60u64), false)).unwrap(),
     );
     ok &= parity(&ctx, "checksum-stale parity");
-    let (ctx, _p3) = fresh(1_000);
+    let ctx = fresh(1_000);
     let _ = ctx.call_raw(
         "corrupt_note_byte",
         candid::encode_args((candid::Nat::from(500u64), candid::Nat::from(60u64), true)).unwrap(),
@@ -263,7 +267,7 @@ fn fixture_selftest() -> bool {
     ok &= parity(&ctx, "phash-tamper parity");
 
     println!("== pending_unshield: valid populates -> #ok; corrupted binding -> binding code ==");
-    let (ctx, _s10) = fresh(1_000);
+    let ctx = fresh(1_000);
     let _ = ctx.call_raw("populate_pending_unshield", candid::encode_args((false,)).unwrap());
     match ctx.old_walk() {
         Ok(()) => println!("  PASS: valid pending_unshield -> #ok"),
@@ -272,7 +276,7 @@ fn fixture_selftest() -> bool {
             ok = false;
         }
     }
-    let (ctx, _s11) = fresh(1_000);
+    let ctx = fresh(1_000);
     let _ = ctx.call_raw("populate_pending_unshield", candid::encode_args((true,)).unwrap());
     ok &= expect_code(
         "corrupt recipient_binding",
@@ -343,15 +347,15 @@ impl Ctx {
     }
 }
 
-fn build_fixture_at(fixture_wasm: &[u8], notes: u64) -> (Ctx, pic_env::ManagedServer) {
-    let (ctx, server) = Ctx::new(fixture_wasm.to_vec());
+fn build_fixture_at(fixture_wasm: &[u8], notes: u64) -> Ctx {
+    let ctx = Ctx::new(fixture_wasm.to_vec());
     ctx.call0("configure_fixture");
     let _ = ctx.call_raw(
         "configure_token_fixture",
         candid::encode_args((ctx.canister, ctx.canister)).unwrap(),
     );
     ctx.bulk_to(notes);
-    (ctx, server)
+    ctx
 }
 
 // ==== T1 — postupgrade cost is flat (1k / 20k / 200k) ====
@@ -365,7 +369,7 @@ fn t1() -> bool {
     for notes in [1_000u64, 20_000, 200_000] {
         println!("== T1 @ {notes} notes: build fixture state, upgrade to REAL wasm ==");
         let t0 = std::time::Instant::now();
-        let (ctx, _server) = build_fixture_at(&fixture_wasm, notes);
+        let ctx = build_fixture_at(&fixture_wasm, notes);
         println!("  [t1] state built in {:.1}s", t0.elapsed().as_secs_f64());
         let raw = ctx.call_raw("fixture_status", candid::encode_args(()).unwrap());
         let (fx_notes, _roots, _nfs, fx_root, _lbh): (candid::Nat, candid::Nat, candid::Nat, serde_bytes::ByteBuf, Option<serde_bytes::ByteBuf>) =
@@ -537,7 +541,7 @@ fn t2() -> bool {
                 }
             }
             println!("== T2 @ {sizes} notes: {} ==", case.label);
-            let (ctx, _server) = build_fixture_at(&fixture_wasm, sizes);
+            let ctx = build_fixture_at(&fixture_wasm, sizes);
             (case.corrupt)(&ctx);
             // OLD verdict: verbatim chunked walk on the SAME state
             let old = ctx.old_walk();
@@ -640,7 +644,7 @@ fn t3() -> bool {
 
     for (label, corrupt, want_code) in &cases {
         println!("== T3: {label} -> audit FAIL({want_code}) -> guard ==");
-        let (ctx, _server) = build_fixture_at(&fixture_wasm, 1_000);
+        let ctx = build_fixture_at(&fixture_wasm, 1_000);
         if let Err(e) = ctx.upgrade_to(test_wasm.clone()) {
             println!("  FAIL: upgrade to test wasm: {e}");
             ok = false;
@@ -782,7 +786,7 @@ fn t3() -> bool {
 
     // recovery drill: un-corrupt -> restart_audit -> PASS -> clear_audit_guard -> endpoint unblocked
     println!("== T3 recovery: un-corrupt, green re-audit, guard clear ==");
-    let (ctx, _server) = build_fixture_at(&fixture_wasm, 1_000);
+    let ctx = build_fixture_at(&fixture_wasm, 1_000);
     ctx.upgrade_to(test_wasm.clone()).expect("upgrade to test wasm");
     let first = ctx.poll_audit_terminal();
     assert!(matches!(first.state, ct::AuditState::pass), "clean audit");
