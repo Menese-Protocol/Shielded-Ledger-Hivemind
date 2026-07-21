@@ -34,6 +34,7 @@ import ICRC2Block "ICRC2Block";
 import ICRC3 "ICRC3";
 import NoteAudit "NoteAudit";
 import NoteCodec "NoteCodec";
+import Pir2 "Pir2";
 import StableBlobSet "StableBlobSet";
 import StableLog "StableLog";
 
@@ -277,6 +278,19 @@ persistent actor ZkLedger {
   let completed_shield_intents = StableBlobSet.newState();
   let completed_unshield_intents = StableBlobSet.newState();
   let note_log = StableLog.newState();
+
+  // ==== PIR v2 query layer (default OFF; src/Pir2.mo) ====
+  // Additive and gated: while `pir2_state.enabled` is false the append path skips all v2
+  // maintenance and every v2 endpoint rejects, so an unset deployment is byte-identical to
+  // the pre-v2 ledger. `pir2_enable` arms it and, on a non-empty log, drives a chunked
+  // timer backfill that folds the existing note log into the matrix and hint before v2
+  // queries are answered. Cursor + flag are stable (survive upgrades; backfill resumes).
+  let pir2_state = Pir2.newState();
+  var pir2_backfilling : Bool = false;
+  var pir2_backfill_cursor : Nat = 0;
+  // Records per backfill tick — the per-record fold is ~176M instr (measured), so a chunk of
+  // 20 stays well under the 5B/message budget with headroom for the tick's own overhead.
+  let PIR2_BACKFILL_PER_TICK : Nat = 20;
   var last_block_hash : ?Blob = null;
   var pool_value : Nat = 0;
   var epoch : Nat = 0;
@@ -1039,6 +1053,122 @@ persistent actor ZkLedger {
     #ok(auditStatusValue())
   };
 
+  // ==== PIR v2 admin + backfill + query surface (all additive) ====
+
+  public type Pir2Status = {
+    enabled : Bool;
+    backfilling : Bool;
+    backfill_cursor : Nat;
+    shard_size : Nat;
+    record_count : Nat;
+    note_count : Nat;
+  };
+  public type Pir2Params = {
+    lwe_dimension : Nat;
+    record_bytes : Nat;
+    shard_size : Nat;
+    records_per_column : Nat;
+    m_rows : Nat;
+    m_cols : Nat;
+    a_domain : Blob;
+  };
+
+  func pir2StatusValue() : Pir2Status {
+    {
+      enabled = pir2_state.enabled;
+      backfilling = pir2_backfilling;
+      backfill_cursor = pir2_backfill_cursor;
+      shard_size = pir2_state.shard_size;
+      record_count = pir2_state.record_count;
+      note_count = noteCount();
+    }
+  };
+
+  /// One-shot arm of the PIR v2 layer (admin). Sets the shard size (immutable thereafter),
+  /// initializes the v2 regions, and — if the note log is non-empty — starts a chunked
+  /// backfill; v2 queries reject until it completes.
+  public shared ({ caller }) func pir2_enable(shardSize : Nat) : async Result<Pir2Status> {
+    if (not isAdministrator(caller)) return #err("REJECT:not-administrator");
+    switch (guardRejection()) { case (?message) return #err(message); case null {} };
+    if (pir2_state.enabled) return #err("REJECT:pir2-already-enabled");
+    if (shardSize == 0) return #err("REJECT:pir2-shard-size-zero");
+    Pir2.enable(pir2_state, shardSize);
+    if (noteCount() > 0) {
+      pir2_backfilling := true;
+      pir2_backfill_cursor := 0;
+      ignore Timer.setTimer<system>(#seconds 0, pir2BackfillTick);
+    };
+    #ok(pir2StatusValue())
+  };
+
+  /// One backfill chunk: fold up to PIR2_BACKFILL_PER_TICK log records into the matrix + hint,
+  /// then re-arm until the cursor catches the (possibly growing) tail. Uses the exact live
+  /// fold (Pir2.append reads commitment + ciphertext from the decoded block), so a
+  /// backfilled state is bit-identical to one built incrementally.
+  func pir2BackfillTick() : async () {
+    if (not pir2_backfilling) return;
+    var processed = 0;
+    label chunk while (processed < PIR2_BACKFILL_PER_TICK and pir2_state.record_count < noteCount()) {
+      let block = blockAt(pir2_state.record_count);
+      Pir2.append(pir2_state, block.commitment, block.note_ciphertext);
+      pir2_backfill_cursor := pir2_state.record_count;
+      processed += 1;
+    };
+    if (pir2_state.record_count >= noteCount()) {
+      pir2_backfilling := false;
+    } else {
+      ignore Timer.setTimer<system>(#seconds 0, pir2BackfillTick);
+    };
+  };
+
+  public query func pir2_status() : async Pir2Status { pir2StatusValue() };
+
+  public query func pir2_params() : async Result<Pir2Params> {
+    if (not pir2_state.enabled) return #err("REJECT:pir2-not-enabled");
+    let g = Pir2.geometry(pir2_state.shard_size);
+    #ok({
+      lwe_dimension = Pir2.LWE_N;
+      record_bytes = Pir2.RECORD_BYTES;
+      shard_size = pir2_state.shard_size;
+      records_per_column = g.records_per_column;
+      m_rows = g.m_rows;
+      m_cols = g.m_cols;
+      a_domain = Pir2.A_DOMAIN;
+    })
+  };
+
+  /// One stripe of the matvec. Rejects while backfilling (state incomplete) or disabled.
+  public query func pir2_query(shard : Nat, fill : Nat, stripe : Nat, kCols : Nat, qu : Blob)
+    : async Result<(Blob, Pir2.StripeTrace)> {
+    if (not pir2_state.enabled) return #err("REJECT:pir2-not-enabled");
+    if (pir2_backfilling) return #err("REJECT:pir2-backfilling");
+    #ok(Pir2.answerStripe(pir2_state, shard, fill, stripe, kCols, qu))
+  };
+
+  /// Densely packed record stream (position 8B BE ‖ 288 cells per record) for tail-hint
+  /// self-computation; capped at MAX_BLOCKS_PER_CALL records per call.
+  public query func pir2_record_stream(start : Nat, count : Nat) : async Result<Blob> {
+    if (not pir2_state.enabled) return #err("REJECT:pir2-not-enabled");
+    if (pir2_backfilling) return #err("REJECT:pir2-backfilling");
+    #ok(Pir2.recordStream(pir2_state, start, Nat.min(count, MAX_BLOCKS_PER_CALL)))
+  };
+
+  /// Hint bytes for a FROZEN shard (traps for the mutable tail — clients self-compute it).
+  public query func pir2_hint_chunk(shard : Nat, offset : Nat, len : Nat) : async Result<Blob> {
+    if (not pir2_state.enabled) return #err("REJECT:pir2-not-enabled");
+    if (pir2_backfilling) return #err("REJECT:pir2-backfilling");
+    #ok(Pir2.hintChunk(pir2_state, shard, offset, len))
+  };
+
+  /// Latest certified record-stream boundary digest (anchor for a streaming client's chain).
+  public query func pir2_stream_boundary() : async Result<{ digest : Blob; covered : Nat }> {
+    if (not pir2_state.enabled) return #err("REJECT:pir2-not-enabled");
+    switch (Pir2.latestBoundary(pir2_state)) {
+      case (?(digest, covered)) #ok({ digest; covered });
+      case null #err("REJECT:pir2-no-boundary");
+    }
+  };
+
   /// Fail-closed rejection for every state-mutating endpoint while the guard is set.
   func guardRejection() : ?Text {
     switch (guard_code) {
@@ -1054,6 +1184,9 @@ persistent actor ZkLedger {
       case (#ok(_)) {};
       case (#err(message)) Runtime.trap("postupgrade:" # message);
     };
+    if (not Pir2.headersValid(pir2_state)) Runtime.trap("postupgrade:pir2-headers");
+    // A backfill interrupted by the upgrade resumes from its stable cursor.
+    if (pir2_backfilling) ignore Timer.setTimer<system>(#seconds 0, pir2BackfillTick);
     refreshCertification();
     resetAudit<system>();
     postupgrade_heap_before := heap_before;
@@ -1258,6 +1391,13 @@ persistent actor ZkLedger {
     chain.writeBlob(encoded);
     note_log_chain_digest := chain.sum();
     last_block_hash := ?ICRC3.hashValue(NoteAudit.blockValue(block));
+    // PIR v2 live maintenance: fold this record into the matrix + hint. Skipped while a
+    // backfill is catching up (the backfill walks the whole log including this record, so
+    // its cursor chases the growing tail); once caught up the hook maintains every new note.
+    if (pir2_state.enabled and not pir2_backfilling) {
+      if (pir2_state.record_count != position) Runtime.trap("stable-state:pir2-position");
+      Pir2.append(pir2_state, output.commitment, output.note_ciphertext);
+    };
   };
 
   func validateOutput(output : OutputRecord) : ?Text {
