@@ -1,5 +1,5 @@
 [workspace]
-members = ["tree_oracle", "icrc3_oracle", "cert_oracle", "cross_oracle", "vendor/tree_common"]
+members = ["tree_oracle", "icrc3_oracle", "cert_oracle", "cross_oracle", "vendor/tree_common", "fortress"]
 resolver = "2"
 
 [workspace.dependencies]

@@ -1,0 +1,19 @@
+[package]
+name = "fortress"
+version = "0.1.0"
+edition = "2021"
+description = "Deterministic verification fortress: cross-implementation differential batteries, taxonomy gate, reference-model drivers"
+
+[dependencies]
+ark-bls12-381 = { workspace = true }
+ark-ff = { workspace = true }
+ark-serialize = { workspace = true }
+ark-std = { workspace = true }
+ark-ec = "0.5"
+num-bigint = "0.4"
+sha2 = "0.10"
+blst = "0.3"
+
+[[bin]]
+name = "arith_oracle"
+path = "src/bin/arith_oracle.rs"
