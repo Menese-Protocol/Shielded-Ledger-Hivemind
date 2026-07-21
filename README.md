@@ -29,7 +29,8 @@ anyone watch it work.
 - **`src/`**: the shielded ledger canister (Motoko). Verified shield deposits, 2-in/2-out
   confidential transfers, nullifier replay protection, recipient-bound withdrawals reconciled
   against the exact ICRC-1 payout block, certified root publication, opaque `zknote1` ICRC-3
-  blocks, and an LWE PIR query endpoint.
+  blocks, a packed per-note detection stream for light-client scanning, and an LWE PIR query
+  endpoint.
 - **`src/groth16/`**: a complete Groth16 verifier over BLS12-381, written in Motoko. Field
   tower, curve operations, subgroup validation, compressed-point decoding, an inversion-free
   multi-Miller loop, and a cyclotomic final exponentiation. No FFI, no precompile, no host
@@ -83,8 +84,35 @@ directory canister issues a deterministic, principal-bound vetKey, encrypted to 
 transport key the browser generates for that session. The browser verifies the encrypted key
 and derives the spend and note-opening keys in memory. Close the tab and the keys are gone;
 sign in with the same Internet Identity on any device and the identical keys derive again, and
-a rescan of the public commitment log recovers every note you own. Instant trial identities are
-memory-only by design and vanish with the tab.
+a scan of the public commitment log recovers every note you own; starting from your wallet's
+sealed birthday, not from block zero. Instant trial identities are memory-only by design and
+vanish with the tab.
+
+## Finding your notes; the read path
+
+A shielded pool has no balance table to consult, so every wallet must recognize its own notes
+in the public log. Done naively that is the second privacy leak: the fetch pattern of a wallet
+looking for its money can reveal which notes it found. This read path is built so it cannot.
+
+The ledger exposes a packed **detection stream**: 48 bytes per note; the note's position, its
+ephemeral key, and an 8-byte view tag in the style of Zcash's Orchard view tags. One shared-key
+derivation per note replaces a full trial decryption, and only tag matches are fetched further,
+always as whole 512-note pages, so two wallets with different keys produce byte-identical fetch
+transcripts on the same ledger. Between sessions the wallet keeps an encrypted, principal-bound
+cache, so a warm open scans only the tail past its cursor.
+
+The last gap is the first sync on a new device: with no local state, a wallet would have to
+scan from genesis. Instead, at registration the wallet seals its **birthday**, the height below
+which it can own nothing, into a fixed 113-byte ciphertext under a vetKey-derived key the
+directory canister never holds, bound to the ledger's identity and anchored to its chain. A
+fresh device recovers it with one certified call and scans `[birthday, tip]`; at a hundred
+million notes that is the difference between seconds and hours. The record is publish-floored
+so no correct client can ever overstate it, every malformed or stale record fails safe to a
+full genesis scan, and the ciphertext's size is the same at every height, so the directory
+learns nothing; not even roughly how old a wallet is. The wire formats, the privacy
+assertions, and the stated boundaries are in [`docs/READ-PATH-SPEC.md`](docs/READ-PATH-SPEC.md).
+
+*Your wallet remembers where it was born; nobody else can read the certificate.*
 
 ## What the node provider sees
 
@@ -159,12 +187,15 @@ additionally runs the stateful local-replica suite.
 
 ## Testing
 
-Four surfaces cover this system: the offline security gate above, the stateful replica suite
+Five surfaces cover this system: the offline security gate above, the stateful replica suite
 (`e2e.py`), a randomized model-checked PocketIC soak (`soak/`) that drives tens of thousands of
 seeded random operations across thousands of accounts and verifies every account balance, block
-link, and solvency invariant with an independent replayer, and the Motoko unit tests. What each
-one asserts and how to run it, including the soak tiers and how to change the seed or scale, is
-mapped in [`TESTING.md`](TESTING.md). The soak's results, including the full 10,000-account /
+link, and solvency invariant with an independent replayer, the wallet read-path battery
+(`cd demo-frontend && npm run test:readpath`; 75 checks over pagination, view tags, the
+encrypted cache, birthday recovery, and the fetch-transcript privacy oracles, with real
+envelope cryptography against a byte-faithful mock ledger and an adversary-capable mock
+directory), and the Motoko unit tests. What each one asserts and how to run it, including the
+soak tiers and how to change the seed or scale, is mapped in [`TESTING.md`](TESTING.md). The soak's results, including the full 10,000-account /
 100,000-operation run, are in [`docs/SOAK-RESULT.md`](docs/SOAK-RESULT.md).
 
 ## Trusted setup; read this before you trust it

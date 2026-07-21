@@ -1,14 +1,16 @@
 # Testing map
 
-Everything in this repository that asserts something, what it asserts, and how to run it. Four
+Everything in this repository that asserts something, what it asserts, and how to run it. Five
 independent surfaces cover the system: an offline security battery, a stateful replica suite, a
-randomized model-checked soak under PocketIC, and the Motoko unit tests the first two drive.
+randomized model-checked soak under PocketIC, the wallet read-path battery, and the Motoko unit
+tests the first two drive.
 
 | Surface | Command | What it proves |
 |---|---|---|
 | Offline security battery | `./scripts/security-gate.sh` | Fixtures, circuit, verifier, oracles, key provenance, frontend build. No canister installs. |
 | Stateful replica suite | `dfx start --clean` then `dfx deploy && python3 e2e.py` | The deployed ledger's gates: ICRC-3 conformance, certified tuple, stable upgrade, token atomicity, PIR. |
 | Randomized soak (this document, `soak/`) | `cargo run --release --manifest-path soak/Cargo.toml -- run` | Tens of thousands of seeded random operations against a reference model, with full-population verification. |
+| Wallet read-path battery | `cd demo-frontend && npm run test:readpath` | Pagination, view tags, encrypted cache, birthday recovery, fetch-transcript privacy oracles. 75 checks. |
 | Motoko unit tests | driven by the two suites above | Codec, stable storage, block matching. |
 
 ## 1. The offline security battery: `scripts/security-gate.sh`
@@ -232,7 +234,36 @@ Run with `cd soak && cargo run --release --bin scale_tests`.
 - `tests/IcpLedgerFixture.mo`, `tests/NnsArchiveFixture.mo`: the ICRC-1/2 token fixture (with
   test-only balance/allowance/clock hooks) and the NNS archive fixture the suites run against.
 
-## 5. Reading a soak report
+## 5. The wallet read-path battery: `demo-frontend/scripts/readpath/`
+
+```bash
+cd demo-frontend && npm install   # once
+npm run test:readpath
+```
+
+Node-only; no canister installs. Six items, 75 checks, two seeds each, with committed
+thresholds. All envelope cryptography is real `tweetnacl`; the transport is mocked at the actor
+boundary by a mock ledger modelled byte-for-byte on `src/Main.mo` (request-logged, so the
+batteries assert exactly what a wallet fetched) and an adversary-capable mock directory
+(replay, inflated records, malformed ciphertexts).
+
+- **B-P1..B-P5** (40 checks): correct-and-complete paginated scanning against an exhaustive
+  genesis oracle; view-tag detection with zero misses; cursor/cache warm opens that fetch only
+  the tail; cache integrity (wrong key, wrong ledger, stale root all fail safe to rescan); the
+  keyless-observer property; wallets with different keys produce byte-identical fetch
+  transcripts, and any position-isolating fetch shape fails the battery.
+- **B-B** (35 checks): birthday round-trip on both publish paths; ciphertext-only at rest with
+  size invariance (every record exactly 113 bytes); caller-keyed writes with on-chain-mirrored
+  guards; the publish-floor invariant plus replay and inflated-record adversaries, including
+  the `fullRescan` heal; the 8-mode fail-safe matrix (every bad record falls back to a genesis
+  scan with an oracle-equal balance); and the gating proof that the recovery surface stays
+  additive.
+- `soak/src/bin/probe_readpath_cost.rs` and `soak/src/bin/probe_birthday_directory.rs` run the
+  on-chain counterparts under PocketIC: wire bytes/note and instructions/note for
+  `detection_stream`, and the directory's old-to-new upgrade with stable-map survival and
+  guard re-verification.
+
+## 6. Reading a soak report
 
 `soak/results/<label>-seed<seed>.json` contains: the seed and tier, every wasm SHA-256 and the
 `moc` version, operation counts by type, rejection counts by adversarial class with one
