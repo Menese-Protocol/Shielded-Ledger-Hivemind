@@ -117,7 +117,12 @@ fn main() {
             std::fs::write(&out_path, serde_json::to_string_pretty(&report).unwrap())
                 .expect("write report");
 
-            // the run completed: clear the durable checkpoint so a future rerun starts fresh
+            // the run completed: tear down the PocketIC instance and its server FIRST
+            // (deleting the state dir under a live instance crashes the server, and the
+            // instance's own drop then panics on the dead connection — the historical
+            // "teardown flake", now deterministic-ordered away), THEN clear the durable
+            // checkpoint so a future rerun starts fresh
+            drop(r);
             let _ = std::fs::remove_file(&tier.checkpoint_file);
             let _ = std::fs::remove_dir_all(&tier.state_dir);
 
