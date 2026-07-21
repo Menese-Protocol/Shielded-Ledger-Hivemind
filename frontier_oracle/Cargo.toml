@@ -1,0 +1,15 @@
+[package]
+name = "frontier-oracle"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+common = { path = "../../vendor/tree_common", features = ["bls12-381"] }
+ark-bls12-381 = { workspace = true }
+ark-ff = { workspace = true }
+ark-serialize = { workspace = true }
+ark-crypto-primitives = { workspace = true }
+
+[[bin]]
+name = "frontier-oracle"
+path = "src/main.rs"
