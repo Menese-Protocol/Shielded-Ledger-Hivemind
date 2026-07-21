@@ -20,3 +20,9 @@ export const VIEW_TAG_ENABLED = false;
 export const VIEW_TAG_CUTOVER = null;
 // ICRC-3 response cap (mirrors src/Main.mo MAX_BLOCKS_PER_CALL) — the pagination page size.
 export const BLOCKS_PER_PAGE = 512;
+
+// ---- device-portable wallet birthday ----
+// The SINGLE switch for birthday recovery + publish (and the product cache store that rides on
+// it). Unset (false) ⇒ exactly today's behavior: zero calls to the directory's birthday
+// endpoints, no cache store in the app, birthday-less full-history scan on a fresh device.
+export const BIRTHDAY_RECOVERY_ENABLED = false;

@@ -9,7 +9,7 @@
 // and can open none of it.
 import nacl from "tweetnacl";
 import { hexToBytes, bytesToHex } from "./ic.js";
-import { CANISTERS, BASE, HOST, VIEW_TAG_ENABLED, VIEW_TAG_CUTOVER, BLOCKS_PER_PAGE } from "./config.js";
+import { CANISTERS, BASE, HOST, VIEW_TAG_ENABLED, VIEW_TAG_CUTOVER, BLOCKS_PER_PAGE, BIRTHDAY_RECOVERY_ENABLED } from "./config.js";
 import { Principal } from "@dfinity/principal";
 
 export const TOKEN_FEE = 10_000n; // 0.0001 DEMO, charged by the token ledger per approve/transfer
@@ -315,9 +315,14 @@ function cacheable(account) {
 }
 
 // Anchor = note_root_after of the last block below the cursor (the chain state the cache reflects).
+// Fetches the FULL 512-aligned page containing cursor-1 and selects locally: a truncated-length
+// range `{pageStart, cursor-pageStart}` would tell a transport observer the exact cursor/birthday
+// position (start+length), where a full-page request reveals only the page — the same camouflage
+// contract as retrieveMatchedPage. (Enforced by the battery's position-isolation oracle.)
 async function anchorAt(actors, cursor) {
   if (cursor <= 0) return "genesis";
-  const page = await readNotes(actors, { from: cursor - 1, to: cursor });
+  const pageStart = Math.floor((cursor - 1) / BLOCKS_PER_PAGE) * BLOCKS_PER_PAGE;
+  const page = await readNotes(actors, { from: pageStart, to: pageStart + BLOCKS_PER_PAGE });
   const rec = page.find((r) => r.position === cursor - 1);
   return rec && rec.noteRootAfter ? rec.noteRootAfter : null;
 }
@@ -367,17 +372,160 @@ export async function loadCache(actors, account, store) {
   return { notes: record.notes.map(deserializeNote), cursor: record.cursor, birthday: record.birthday };
 }
 
-// One-call wallet sync: load the encrypted cache if present, scan only the tail past the
-// cursor, persist the updated cache. A cache miss / stale cache falls back to a scan from `birthday`
-// (or genesis). Returns owned-unspent notes and the new cursor.
-export async function syncWallet(actors, wasm, account, { store = null, birthday = 0 } = {}) {
-  const cached = store ? await loadCache(actors, account, store) : null;
+// ---- device-portable wallet birthday (vetKey-sealed directory record) ----
+// The birthday is an untrusted OPTIMISATION hint (Zcash ZIP-307 semantics): correctness never
+// depends on it. Every value this client ever publishes is a PROVEN floor on the account's first
+// owned position — either a creation sample taken at/before `register` (senders can only discover
+// the pk via `lookup` after registration) or `B* = min owned position (else scan tip)` derived
+// from a genesis-complete ownership scan over the immutable log. Floors are permanent (positions
+// and ciphertexts are append-only), so replaying ANY genuine historical record is still correct.
+// The sealed record is FIXED-WIDTH binary — ciphertext length is identical for every account at
+// every height, so the directory operator cannot bucket principals by birthday magnitude:
+//   plaintext(73) = version(1)=0x01 ‖ height(8 BE) ‖ binding(32) ‖ anchor(32)
+//   ct(113)       = nonce(24) ‖ secretbox(plaintext)
+// binding = H("picp-birthday-binding/v1" ‖ ledgerCanisterId ‖ 0x00 ‖ host)[0..32] ties the record
+// to this ledger deployment; anchor = note_root_after at height-1 (zero bytes for height 0 or an
+// anchorless ledger) ties it to this chain's actual prefix. H is SHA-512 (nacl.hash) truncated.
+export const BIRTHDAY_CT_SIZE = 113;
+const BIRTHDAY_PT_SIZE = 73;
+const BIRTHDAY_VERSION = 1;
+const BIRTHDAY_BINDING_DOMAIN = new TextEncoder().encode("picp-birthday-binding/v1");
+const ZERO32 = new Uint8Array(32);
+
+export function birthdayBinding(canisterId = CANISTERS.zk_ledger, host = HOST) {
+  const c = new TextEncoder().encode(canisterId);
+  const h = new TextEncoder().encode(host);
+  const buf = new Uint8Array(BIRTHDAY_BINDING_DOMAIN.length + c.length + 1 + h.length);
+  buf.set(BIRTHDAY_BINDING_DOMAIN, 0);
+  buf.set(c, BIRTHDAY_BINDING_DOMAIN.length);
+  buf[BIRTHDAY_BINDING_DOMAIN.length + c.length] = 0;
+  buf.set(h, BIRTHDAY_BINDING_DOMAIN.length + c.length + 1);
+  return nacl.hash(buf).slice(0, 32);
+}
+
+const anchorBytes = (anchor) =>
+  anchor && anchor !== "genesis" ? hexToBytes(anchor) : new Uint8Array(32);
+
+export function sealBirthdayRecord(birthdayKey, b, anchor, { binding = birthdayBinding() } = {}) {
+  const pt = new Uint8Array(BIRTHDAY_PT_SIZE);
+  pt[0] = BIRTHDAY_VERSION;
+  for (let k = 0; k < 8; k++) pt[1 + k] = Math.floor(b / 256 ** (7 - k)) % 256;
+  pt.set(binding, 9);
+  pt.set(anchorBytes(anchor), 41);
+  const nonce = randomBytes(24);
+  const boxed = nacl.secretbox(pt, nonce, birthdayKey);
+  const ct = new Uint8Array(24 + boxed.length);
+  ct.set(nonce, 0);
+  ct.set(boxed, 24);
+  return ct; // always exactly BIRTHDAY_CT_SIZE
+}
+
+export function openBirthdayRecord(birthdayKey, ct) {
+  if (!(ct instanceof Uint8Array) || ct.length !== BIRTHDAY_CT_SIZE) return null;
+  const pt = nacl.secretbox.open(ct.slice(24), ct.slice(0, 24), birthdayKey);
+  if (!pt || pt.length !== BIRTHDAY_PT_SIZE || pt[0] !== BIRTHDAY_VERSION) return null;
+  let b = 0;
+  for (let k = 0; k < 8; k++) b = b * 256 + pt[1 + k];
+  return { b, binding: pt.slice(9, 41), anchor: pt.slice(41, 73) };
+}
+
+// An account participates in birthday recovery only with vetKey custody AND the /birthday/v1 key
+// (throwaway + legacy accounts never touch the directory's birthday endpoints).
+function birthdayCapable(account) {
+  return cacheable(account) && account.birthdayKey instanceof Uint8Array && account.birthdayKey.length === 32;
+}
+
+// Fetch + decrypt + VERIFY the caller's sealed birthday. Every failure mode — absent record,
+// undecryptable/foreign/corrupt ciphertext, wrong ledger deployment, height beyond the tip,
+// chain-anchor mismatch (fork/reinstall below b), or an unreachable directory — degrades to
+// { birthday: 0 } (full-history scan): fail-safe, never fail-to-wrong-balance.
+export async function recoverBirthday(actors, account) {
+  if (!birthdayCapable(account) || !actors.directory) return { birthday: 0, status: "no-key" };
+  try {
+    const resp = await actors.directory.get_birthday(); // certified read (update call)
+    const ct = Array.isArray(resp) ? (resp.length ? new Uint8Array(resp[0]) : null) : resp;
+    if (!ct) return { birthday: 0, status: "absent" };
+    const rec = openBirthdayRecord(account.birthdayKey, ct);
+    if (!rec) return { birthday: 0, status: "undecryptable" };
+    if (!bytesEqual(rec.binding, birthdayBinding())) return { birthday: 0, status: "wrong-ledger" };
+    const total = Number((await actors.ledger.status()).log_length);
+    if (rec.b > total) return { birthday: 0, status: "beyond-tip" };
+    const expect = rec.b === 0 ? ZERO32 : anchorBytes(await anchorAt(actors, rec.b));
+    if (!bytesEqual(rec.anchor, expect)) return { birthday: 0, status: "anchor-mismatch" };
+    return { birthday: rec.b, status: "recovered" };
+  } catch {
+    return { birthday: 0, status: "unreachable" };
+  }
+}
+
+// Seal + publish a PROVEN floor for the caller's own record. Best-effort: a failed publish only
+// costs a future fresh device a longer scan, never correctness.
+export async function publishBirthday(actors, account, b) {
+  if (!birthdayCapable(account) || !actors.directory) return false;
+  try {
+    const anchor = b > 0 ? await anchorAt(actors, b) : "genesis";
+    const ct = sealBirthdayRecord(account.birthdayKey, b, anchor);
+    const res = await actors.directory.set_birthday(ct);
+    return !("err" in res);
+  } catch {
+    return false;
+  }
+}
+
+// One-call wallet sync: load the encrypted cache if present, scan only the tail
+// past the cursor, persist the updated cache. On a cache MISS with birthday recovery enabled, the
+// birthday is recovered from the directory (verified, fail-safe to 0) before scanning; after a
+// genesis-complete scan the derived floor B* is (re)published — this covers new accounts,
+// pre-feature backfill, and self-heal of absent/corrupt records in one rule. `creationBirthday`
+// is the caller-asserted creation floor (sampled at/before `register`, see App registration flow)
+// used only when the directory has no record yet. `fullRescan: true` is the recovery remedy: it
+// ignores cache and hint, rescans from genesis, and republishes the healed floor.
+export async function syncWallet(
+  actors,
+  wasm,
+  account,
+  {
+    store = null,
+    birthday = 0,
+    creationBirthday = null,
+    birthdayRecovery = BIRTHDAY_RECOVERY_ENABLED,
+    fullRescan = false,
+  } = {}
+) {
+  const cached = fullRescan ? null : store ? await loadCache(actors, account, store) : null;
+  const canBirthday = birthdayRecovery && birthdayCapable(account) && !!actors.directory;
+  const creation = creationBirthday != null && creationBirthday > 0 ? creationBirthday : null;
+
+  let recovery = null;
+  let bday = cached ? cached.birthday : birthday;
+  if (!cached && canBirthday && !fullRescan) {
+    recovery = await recoverBirthday(actors, account);
+    // All inputs are floors; the tightest (max) floor scans least. The recovered value wins over
+    // a stale creation assertion; `creation` only matters when the directory has no record yet.
+    bday = Math.max(bday, recovery.status === "recovered" ? recovery.birthday : 0, recovery.status === "absent" && creation != null ? creation : 0);
+  }
+  if (fullRescan) bday = 0;
+
   const cursor = cached ? cached.cursor : 0;
-  const bday = cached ? cached.birthday : birthday;
   const cachedNotes = cached ? cached.notes : [];
   const scan = await scanNotes(actors, wasm, account, { birthday: bday, cursor, cachedNotes });
+
+  if (canBirthday && !cached) {
+    const from = Math.max(bday, cursor);
+    const recovered = recovery && recovery.status === "recovered" ? recovery.birthday : null;
+    if (from === 0) {
+      // Genesis-complete ownership scan ⇒ B* is a proven, permanent floor: no owned note exists
+      // below min(owned position); if nothing is owned, every position below the scan tip was
+      // exhaustively checked and positions are append-only, so the tip itself is a floor.
+      const bStar = scan.notes.length ? Math.min(...scan.notes.map((n) => n.position)) : scan.cursor;
+      if (recovered == null || bStar !== recovered) await publishBirthday(actors, account, bStar);
+    } else if (creation != null && recovery && recovery.status === "absent" && from === creation) {
+      await publishBirthday(actors, account, creation);
+    }
+  }
+
   if (store) await saveCache(actors, account, { notes: scan.notes, cursor: scan.cursor, birthday: bday }, store);
-  return { notes: scan.notes, cursor: scan.cursor, fromCache: !!cached };
+  return { notes: scan.notes, cursor: scan.cursor, scanned: scan.scanned, opened: scan.opened, fromCache: !!cached, birthday: bday, recovery: recovery ? recovery.status : null };
 }
 
 // IndexedDB-backed store for the browser; tests inject their own {get,set,delete}. Kept tiny and

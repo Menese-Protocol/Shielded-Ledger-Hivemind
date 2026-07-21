@@ -132,6 +132,11 @@ export async function vetkeyShieldedAccountFor(wasm, actors, birthday = null) {
   // Symmetric key for the encrypted local cache (wallet.saveCache): principal-bound and session-
   // derived, so another principal's cache fails authentication and only this session can read it.
   const cacheKey = vetKey.deriveSymmetricKey("picp-shielded-account/cache/v1", 32);
+  // Symmetric key for the DIRECTORY-held sealed birthday record (wallet.recoverBirthday /
+  // publishBirthday) — its own info-string, so it is independent of the cache key (a directory
+  // record can never be opened with the cache key or vice versa) and reproducible with no local
+  // state on any device that authenticates as this principal. Session-lifetime like cacheKey.
+  const birthdayKey = vetKey.deriveSymmetricKey("picp-shielded-account/birthday/v1", 32);
   try {
     const nk = wasm.field_from_seed(nkSeed);
     const pair = nacl.box.keyPair.fromSecretKey(encSeed);
@@ -141,10 +146,12 @@ export async function vetkeyShieldedAccountFor(wasm, actors, birthday = null) {
       encPk: pair.publicKey,
       encSk: pair.secretKey,
       cacheKey: new Uint8Array(cacheKey),
+      birthdayKey: new Uint8Array(birthdayKey),
       custody: "ii-vetkey",
-      // null ⇒ birthday-less restore ⇒ full-history scan (the heavy restore case). A device that has
-      // synced before recovers the birthday from the encrypted cache; a stored birthday may be
-      // supplied on restore to skip pre-birthday history.
+      // null ⇒ no locally-known birthday. A device that has synced before recovers it from the
+      // encrypted cache; a FRESH device recovers it from the vetKey-sealed directory record
+      // (wallet.syncWallet cache-miss path, gated by BIRTHDAY_RECOVERY_ENABLED) — lazily, so a
+      // warm open never adds a directory round-trip. Fail-safe: full-history scan.
       birthday,
     };
   } finally {
