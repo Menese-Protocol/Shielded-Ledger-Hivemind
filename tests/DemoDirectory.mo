@@ -28,6 +28,13 @@ persistent actor DemoDirectory {
   };
 
   let entries = Map.empty<Principal, Entry>();
+  // Sealed wallet-birthday records, caller-keyed. Kept OUT of `entries` on purpose:
+  // (a) `lookup` is a public query and must never expose another principal's birthday
+  // ciphertext (presence/size metadata); (b) a new stable map is trivially upgrade-compatible,
+  // whereas widening the Entry record inside the existing stable map is not. The canister
+  // stores ONLY ciphertext (fixed 113 bytes) and can never build a principal→creation-height
+  // table from its state.
+  let birthdays = Map.empty<Principal, Blob>();
   let vetkd : VetKdSystemApi = actor ("aaaaa-aa");
   let key_id : VetKdKeyId = { curve = #bls12_381_g2; name = "test_key_1" };
   let key_context : Blob = Text.encodeUtf8("picp-shielded-account/v1");
@@ -66,6 +73,35 @@ persistent actor DemoDirectory {
     if (enc_pk.size() == 0 or enc_pk.size() > 128) return #err("bad-enc-pk");
     Map.add(entries, Principal.compare, caller, { shielded_pk; enc_pk });
     #ok
+  };
+
+  // The sealed birthday record is exactly nonce(24) ‖ secretbox(version(1) ‖ height(8 BE) ‖
+  // ledger-binding-hash(32) ‖ chain-anchor(32)) = 113 bytes for EVERY account at EVERY height —
+  // an exact-size guard, so ciphertext length can never leak the birthday's magnitude.
+  let BIRTHDAY_CT_SIZE : Nat = 113;
+
+  /// Store the caller's wallet birthday, sealed client-side under a vetKey-derived key the
+  /// canister never sees. Caller-keyed like `register`: you can only ever write your own record,
+  /// so no one can plant an inflated birthday on a victim. Registration is required first —
+  /// only real accounts consume state.
+  public shared ({ caller }) func set_birthday(ct : Blob) : async Result.Result<(), Text> {
+    if (Principal.isAnonymous(caller)) return #err("anonymous-caller");
+    switch (Map.get(entries, Principal.compare, caller)) {
+      case null { return #err("not-registered") };
+      case (?_) {};
+    };
+    if (ct.size() != BIRTHDAY_CT_SIZE) return #err("bad-birthday-ct-size");
+    Map.add(birthdays, Principal.compare, caller, ct);
+    #ok
+  };
+
+  /// Return the CALLER's own sealed birthday record only — deliberately not a query and not
+  /// part of `lookup`: an update call returns consensus-certified state (a single malicious
+  /// replica cannot serve a rolled-back ciphertext), and no other principal can even observe
+  /// whether a record exists.
+  public shared ({ caller }) func get_birthday() : async ?Blob {
+    if (Principal.isAnonymous(caller)) return null;
+    Map.get(birthdays, Principal.compare, caller)
   };
 
   public query func lookup(p : Principal) : async ?Entry {
