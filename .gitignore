@@ -16,3 +16,4 @@ node_modules/
 /coordinator/.mops/
 /demo-frontend/contributor-wasm/target/
 /soak/checkpoints/
+/src/MainTestHooks.generated.mo
