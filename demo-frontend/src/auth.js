@@ -51,8 +51,10 @@ export function throwawayIdentity(seed) {
 
 // Instant-demo accounts deliberately have no recovery promise: random keys live only for the
 // current tab and never consume a network vetKey derivation. II sessions use the deterministic
-// vetKey path below.
-export function ephemeralShieldedAccountFor(wasm) {
+// vetKey path below. `birthday` is the ledger log length at creation (a note before the wallet
+// existed cannot be its own — see wallet.recordBirthday); a fresh account records it so its first
+// sync scans [birthday, tip] instead of from genesis. Pass 0 to force a full-history scan.
+export function ephemeralShieldedAccountFor(wasm, birthday = 0) {
   const nk = wasm.random_field();
   const pair = nacl.box.keyPair();
   return {
@@ -61,6 +63,7 @@ export function ephemeralShieldedAccountFor(wasm) {
     encPk: pair.publicKey,
     encSk: pair.secretKey,
     custody: "throwaway-memory",
+    birthday,
   };
 }
 
@@ -110,7 +113,7 @@ const asBytes = (value) => new Uint8Array(value);
 
 // Recover the same account on any device authenticated as the same principal. The transport
 // secret and derived seeds are deliberately ephemeral; only public keys are returned on-chain.
-export async function vetkeyShieldedAccountFor(wasm, actors) {
+export async function vetkeyShieldedAccountFor(wasm, actors, birthday = null) {
   const input = asBytes(actors.principal.toUint8Array());
   const transport = TransportSecretKey.random();
   const [publicKeyWire, encryptedResult] = await Promise.all([
@@ -126,6 +129,9 @@ export async function vetkeyShieldedAccountFor(wasm, actors) {
   const vetKey = encryptedVetKey.decryptAndVerify(transport, derivedPublicKey, input);
   const nkSeed = vetKey.deriveSymmetricKey("picp-shielded-account/nk/v1", 64);
   const encSeed = vetKey.deriveSymmetricKey("picp-shielded-account/x25519/v1", 32);
+  // Symmetric key for the encrypted local cache (wallet.saveCache): principal-bound and session-
+  // derived, so another principal's cache fails authentication and only this session can read it.
+  const cacheKey = vetKey.deriveSymmetricKey("picp-shielded-account/cache/v1", 32);
   try {
     const nk = wasm.field_from_seed(nkSeed);
     const pair = nacl.box.keyPair.fromSecretKey(encSeed);
@@ -134,7 +140,12 @@ export async function vetkeyShieldedAccountFor(wasm, actors) {
       pk: wasm.shielded_address(nk),
       encPk: pair.publicKey,
       encSk: pair.secretKey,
+      cacheKey: new Uint8Array(cacheKey),
       custody: "ii-vetkey",
+      // null ⇒ birthday-less restore ⇒ full-history scan (the heavy restore case). A device that has
+      // synced before recovers the birthday from the encrypted cache; a stored birthday may be
+      // supplied on restore to skip pre-birthday history.
+      birthday,
     };
   } finally {
     nkSeed.fill(0);
