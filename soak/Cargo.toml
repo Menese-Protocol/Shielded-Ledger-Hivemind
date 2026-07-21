@@ -1,5 +1,6 @@
 [package]
 name = "soak"
+default-run = "soak"
 version = "0.1.0"
 edition = "2021"
 publish = false
