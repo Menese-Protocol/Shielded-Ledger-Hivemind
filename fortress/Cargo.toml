@@ -17,3 +17,4 @@ blst = "0.3"
 [[bin]]
 name = "arith_oracle"
 path = "src/bin/arith_oracle.rs"
+
