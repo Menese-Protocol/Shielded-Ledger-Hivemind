@@ -20,8 +20,10 @@ import Nat64 "mo:core/Nat64";
 import Nat8 "mo:core/Nat8";
 import Principal "mo:core/Principal";
 import Runtime "mo:core/Runtime";
+import Sha256 "mo:sha2/Sha256";
 import Text "mo:core/Text";
 import Time "mo:core/Time";
+import Timer "mo:core/Timer";
 import Prim "mo:⛔";
 import CertifiedTuple "CertifiedTuple";
 import Groth16Multi "groth16/Groth16Multi";
@@ -30,6 +32,7 @@ import ICRC1Block "ICRC1Block";
 import ICRC2 "ICRC2";
 import ICRC2Block "ICRC2Block";
 import ICRC3 "ICRC3";
+import NoteAudit "NoteAudit";
 import NoteCodec "NoteCodec";
 import StableBlobSet "StableBlobSet";
 import StableLog "StableLog";
@@ -285,6 +288,88 @@ persistent actor ZkLedger {
   var test_fail_after_token_once : Bool = false;
   let stable_layout_version : Nat = STABLE_LAYOUT_VERSION;
 
+  // ==== background stable-state audit (postupgrade-scale fix) ====
+  // The old postupgrade ran the full per-note walk in ONE message and hit the wasm64
+  // 6 GiB cap at 51,411 notes (measured 3.0M instr + 180KB alloc per note). postupgrade
+  // now performs O(1)/O(k) bounded checks and delegates the full walk to this
+  // timer-driven audit: chunked, cursor in stable state, EXACTLY the old checks in the
+  // old order with the old error strings (NoteAudit.referenceCheck is the contract; the
+  // fast path falls back to it on any anomaly). A FAIL (or a deterministic trap inside
+  // a chunk) flips the sticky fail-closed guard below.
+  public type AuditState = { #running; #pass; #fail : { code : Text; index : Nat } };
+  public type AuditPhase = {
+    #log_index; #set_roots; #set_nullifiers; #set_shields; #set_unshields; #notes; #tail;
+  };
+  public type AuditStatus = {
+    state : AuditState;
+    phase : AuditPhase;
+    cursor : Nat;
+    total : Nat;
+    audit_epoch : Nat;
+    last_completed_at : ?Nat64;
+    last_chunk_at : ?Nat64;
+    chunk_retries : Nat;
+    guard : ?Text;
+    guard_epoch : Nat;
+  };
+  // #pass at genesis: the empty install state is vacuously valid (and the certified
+  // audit leaf must hash identically on a never-upgraded instance and a post-upgrade
+  // instance whose audit passed — e2e G2/G4 compare those tuples byte-for-byte).
+  var audit_state : AuditState = #pass;
+  var audit_phase : AuditPhase = #tail;
+  var audit_cursor : Nat = 0;
+  var audit_expected_parent : ?Blob = null;
+  var audit_log_expected_offset : Nat64 = 16;
+  var audit_log_captured_entries : Nat64 = 0;
+  var audit_log_captured_offset : Nat64 = 0;
+  var audit_set_captured_table : Nat64 = 0;
+  var audit_set_captured_capacity : Nat64 = 0;
+  var audit_set_captured_count : Nat64 = 0;
+  var audit_set_captured_puts : Nat = 0;
+  var audit_set_observed : Nat64 = 0;
+  var audit_set_restarts : Nat = 0;
+  var audit_epoch : Nat = 0;
+  var audit_last_completed_at : ?Nat64 = null;
+  var audit_last_chunk_at : ?Nat64 = null;
+  var audit_chunk_retries : Nat = 0;
+  // Fail-closed guard: set by an audit FAIL, sticky across upgrades, cleared only by
+  // clear_audit_guard (admin) after a NEWER audit epoch has re-run green.
+  var guard_code : ?Text = null;
+  var guard_epoch : Nat = 0;
+  // put counters: exact-count contention detection for the chunked set walks
+  var roots_put_counter : Nat = 0;
+  var nullifiers_put_counter : Nat = 0;
+  var shields_put_counter : Nat = 0;
+  var unshields_put_counter : Nat = 0;
+  // Incremental CHANGE-DETECTION digests (replace the O(n) region walks the old
+  // StableLog.digest/StableBlobSet.digest performed inside storage_status /
+  // atomicity_status): the log digest is a sha256 chain folded at append; each set
+  // digest is the XOR of sha256(key) folded at first-insert. On a state migrated from a
+  // pre-fix wasm they cover post-migration mutations only (documented; nothing asserts
+  // on digests of migrated instances).
+  var note_log_chain_digest : Blob = Blob.fromArray(Array.repeat<Nat8>(0, 32));
+  var roots_fold_digest : Blob = Blob.fromArray(Array.repeat<Nat8>(0, 32));
+  var nullifiers_fold_digest : Blob = Blob.fromArray(Array.repeat<Nat8>(0, 32));
+  var shields_fold_digest : Blob = Blob.fromArray(Array.repeat<Nat8>(0, 32));
+  var unshields_fold_digest : Blob = Blob.fromArray(Array.repeat<Nat8>(0, 32));
+  // postupgrade telemetry (T1: cost must stay ~flat vs note count)
+  var postupgrade_instructions : Nat64 = 0;
+  var postupgrade_heap_before : Nat = 0;
+  var postupgrade_heap_after : Nat = 0;
+  transient let note_checker = NoteAudit.Checker();
+
+  // chunk sizes from the Phase-2d measurement (≥4× instruction headroom against the
+  // 40B DTS budget + a 256 MiB per-chunk allocation envelope): fast path 1.40M instr /
+  // 35.3KB alloc per note → K=4096 ≈ 5.7B instr + 145 MiB; slot walk 386 instr/slot →
+  // 4M slots ≈ 1.6B instr (the contended-restart path is reachable only above 4M slots
+  // ≈ 2.8M entries — far beyond tier; it restarts then fails LOUD, never band-passes);
+  // index walk 623 instr/entry → 1M entries ≈ 0.65B instr.
+  let AUDIT_NOTES_PER_CHUNK : Nat = 4096;
+  let AUDIT_SLOTS_PER_CHUNK : Nat64 = 4_194_304;
+  let AUDIT_INDEX_PER_CHUNK : Nat64 = 1_048_576;
+  let AUDIT_CHUNK_FAILURE_LIMIT : Nat = 3;
+  let AUDIT_SET_RESTART_LIMIT : Nat = 3;
+
   StableBlobSet.ensureInit(historical_roots);
   StableBlobSet.ensureInit(spent_nullifiers);
   StableBlobSet.ensureInit(completed_shield_intents);
@@ -417,22 +502,56 @@ persistent actor ZkLedger {
     }
   };
 
+  /// XOR-of-sha256 fold for the incremental set digests. Folded ONLY on a first insert
+  /// (#ok(true)): addRoot tolerates re-adding an existing root, and an unconditional
+  /// fold would XOR the key back OUT while set content is unchanged.
+  func xorFold(acc : Blob, key : Blob) : Blob {
+    let h = Blob.toArray(Sha256.fromBlob(#sha256, key));
+    let a = Blob.toArray(acc);
+    Blob.fromArray(Array.tabulate<Nat8>(32, func(i) { a[i] ^ h[i] }))
+  };
+
   func addRoot(root : Blob) {
     switch (StableBlobSet.put(historical_roots, root)) {
-      case (#ok(_)) {};
+      case (#ok(true)) {
+        roots_put_counter += 1;
+        roots_fold_digest := xorFold(roots_fold_digest, root);
+      };
+      case (#ok(false)) {};
       case (#err(message)) Runtime.trap(message);
     }
   };
 
   func addNullifier(nullifier : Blob) {
     switch (StableBlobSet.put(spent_nullifiers, nullifier)) {
-      case (#ok(true)) {};
+      case (#ok(true)) {
+        nullifiers_put_counter += 1;
+        nullifiers_fold_digest := xorFold(nullifiers_fold_digest, nullifier);
+      };
       case (#ok(false)) Runtime.trap("stable-state:duplicate-nullifier-commit");
       case (#err(message)) Runtime.trap(message);
     }
   };
 
   func archiveManifest() : Blob { ICRC3.hashValue(#Array([])) };
+
+  /// The certified audit leaf: a PURE function of the audit verdict — state tag plus
+  /// code/index iff failed. Cursor, epoch, totals, and timestamps are EXCLUDED so the
+  /// tuple hashes identically on a never-upgraded instance (#pass at genesis) and after
+  /// any green post-upgrade audit — e2e G2/G3/G4 compare those trees byte-for-byte.
+  func auditLeafDigest() : Blob {
+    let entries = List.empty<(Text, ICRC3.Value)>();
+    switch (audit_state) {
+      case (#running) List.add(entries, ("state", #Text("running")));
+      case (#pass) List.add(entries, ("state", #Text("pass")));
+      case (#fail(f)) {
+        List.add(entries, ("state", #Text("fail")));
+        List.add(entries, ("code", #Text(f.code)));
+        List.add(entries, ("index", #Nat(f.index)));
+      };
+    };
+    ICRC3.hashValue(#Map(List.toArray(entries)))
+  };
 
   func certifiedTuple() : CertifiedTuple.Tuple {
     let index : ?Nat = switch (noteCount()) {
@@ -446,6 +565,7 @@ persistent actor ZkLedger {
       note_root;
       encoding_version = ENCODING_VERSION;
       archive_manifest = archiveManifest();
+      audit_digest = auditLeafDigest();
     }
   };
 
@@ -455,72 +575,10 @@ persistent actor ZkLedger {
     CertifiedData.set(CertifiedTuple.digest(certifiedTree()));
   };
 
-  func validateStableState() : Result<()> {
-    if (stable_layout_version != STABLE_LAYOUT_VERSION) {
-      return #err("stable-state:layout-version");
-    };
-    switch (StableLog.validate(note_log)) {
-      case (#err(message)) return #err(message);
-      case (#ok(_)) {};
-    };
-    switch (StableBlobSet.validate(historical_roots)) {
-      case (#err(message)) return #err("roots:" # message);
-      case (#ok(_)) {};
-    };
-    switch (StableBlobSet.validate(spent_nullifiers)) {
-      case (#err(message)) return #err("nullifiers:" # message);
-      case (#ok(_)) {};
-    };
-    switch (StableBlobSet.validate(completed_shield_intents)) {
-      case (#err(message)) return #err("completed-shields:" # message);
-      case (#ok(_)) {};
-    };
-    switch (StableBlobSet.validate(completed_unshield_intents)) {
-      case (#err(message)) return #err("completed-unshields:" # message);
-      case (#ok(_)) {};
-    };
-    if (transfer_statement_version != 1 and transfer_statement_version != 2) {
-      return #err("stable-state:transfer-statement-version");
-    };
-
-    var expected_parent : ?Blob = null;
-    var index : Nat = 0;
-    while (index < noteCount()) {
-      let encoded = switch (StableLog.get(note_log, index)) {
-        case (?value) value;
-        case null return #err("stable-state:missing-note");
-      };
-      let block = switch (NoteCodec.decode(encoded)) {
-        case (#ok(value)) value;
-        case (#err(message)) return #err(message);
-      };
-      if (block.btype != "zknote1" or block.encoding_version != ENCODING_VERSION) {
-        return #err("stable-state:block-domain");
-      };
-      if (block.note_position != index) return #err("stable-state:note-position");
-      if (block.phash != expected_parent) return #err("stable-state:phash");
-      if (not fieldSized(block.commitment) or not fieldSized(block.anchor_before) or
-          not fieldSized(block.note_root_after)) {
-        return #err("stable-state:block-field-length");
-      };
-      if (not StableBlobSet.contains(historical_roots, block.note_root_after)) {
-        return #err("stable-state:missing-historical-root");
-      };
-      for (nullifier in block.nullifiers.vals()) {
-        if (not StableBlobSet.contains(spent_nullifiers, nullifier)) {
-          return #err("stable-state:missing-nullifier");
-        };
-      };
-      let canonical = switch (NoteCodec.encode(block)) {
-        case (#ok(value)) value;
-        case (#err(message)) return #err(message);
-      };
-      if (canonical != encoded) return #err("stable-state:noncanonical-note");
-      expected_parent := ?ICRC3.hashValue(blockValue(block));
-      index += 1;
-    };
-    if (expected_parent != last_block_hash) return #err("stable-state:last-block-hash");
-
+  /// The old walk's post-note phases, verbatim (configured/unconfigured branch, pool
+  /// subaccount, token admin, pending intents). Shared by the bounded postupgrade
+  /// validation AND the audit's final phase — single source of the exact strings.
+  func validateTailAndPendings() : Result<()> {
     if (configured()) {
       if (transfer_vk_hex.size() == 0 or deposit_vk_hex.size() == 0) {
         return #err("stable-state:empty-vk");
@@ -638,12 +696,374 @@ persistent actor ZkLedger {
     #ok(())
   };
 
-  system func postupgrade() {
-    configuring := false;
-    switch (validateStableState()) {
-      case (#ok(_)) refreshCertification();
-      case (#err(message)) Runtime.trap("postupgrade:" # message);
+  /// O(1)/O(k) postupgrade validation: layout version, structure HEADER
+  /// checks (the O(n) walks moved into the audit), statement version, a decode of ONLY
+  /// the last block (hash == last_block_hash, position == noteCount()-1), the old
+  /// walk's configured/unconfigured/pool/pending phases (all O(1)), and finally the
+  /// tail-root binding (a NEW check with a NEW code, ordered last so every state an old
+  /// check can fault reports the OLD string first).
+  func validateStableStateBounded() : Result<()> {
+    if (stable_layout_version != STABLE_LAYOUT_VERSION) {
+      return #err("stable-state:layout-version");
+    };
+    switch (StableLog.validateHeader(note_log)) {
+      case (#err(message)) return #err(message);
+      case (#ok(_)) {};
+    };
+    switch (StableBlobSet.validateHeader(historical_roots)) {
+      case (#err(message)) return #err("roots:" # message);
+      case (#ok(_)) {};
+    };
+    switch (StableBlobSet.validateHeader(spent_nullifiers)) {
+      case (#err(message)) return #err("nullifiers:" # message);
+      case (#ok(_)) {};
+    };
+    switch (StableBlobSet.validateHeader(completed_shield_intents)) {
+      case (#err(message)) return #err("completed-shields:" # message);
+      case (#ok(_)) {};
+    };
+    switch (StableBlobSet.validateHeader(completed_unshield_intents)) {
+      case (#err(message)) return #err("completed-unshields:" # message);
+      case (#ok(_)) {};
+    };
+    if (transfer_statement_version != 1 and transfer_statement_version != 2) {
+      return #err("stable-state:transfer-statement-version");
+    };
+    var tail_block : ?ShieldedNoteBlock = null;
+    if (noteCount() == 0) {
+      if (last_block_hash != null) return #err("stable-state:last-block-hash");
+    } else {
+      let encoded = switch (StableLog.get(note_log, noteCount() - 1)) {
+        case (?value) value;
+        case null return #err("stable-state:missing-note");
+      };
+      let block = switch (NoteCodec.decode(encoded)) {
+        case (#ok(value)) value;
+        case (#err(message)) return #err(message);
+      };
+      if (?ICRC3.hashValue(NoteAudit.blockValue(block)) != last_block_hash) {
+        return #err("stable-state:last-block-hash");
+      };
+      if (block.note_position != noteCount() - 1) return #err("stable-state:note-position");
+      tail_block := ?block;
+    };
+    switch (validateTailAndPendings()) {
+      case (#err(message)) return #err(message);
+      case (#ok(_)) {};
+    };
+    switch (tail_block) {
+      case (?block) {
+        // strictly additional detection: the last appended block's root must BE the
+        // current root (true by construction of every append path)
+        if (block.note_root_after != note_root) return #err("stable-state:tail-root");
+      };
+      case null {};
+    };
+    #ok(())
+  };
+
+  // ==== audit state machine ====
+
+  func nowNat64() : Nat64 { Nat64.fromNat(Int.abs(Time.now())) };
+
+  func auditFail(code : Text, index : Nat) : Bool {
+    audit_state := #fail({ code; index });
+    if (guard_code == null) {
+      guard_code := ?code;
+      guard_epoch := audit_epoch;
+    };
+    audit_last_completed_at := ?nowNat64();
+    refreshCertification();
+    true
+  };
+
+  func auditPass() : Bool {
+    audit_state := #pass;
+    audit_last_completed_at := ?nowNat64();
+    refreshCertification();
+    true
+  };
+
+  /// Restart the audit from phase 0 and arm the tick chain. Called from postupgrade
+  /// (every upgrade re-audits the whole state) and from restart_audit.
+  func resetAudit<system>() {
+    audit_epoch += 1;
+    audit_state := #running;
+    audit_phase := #log_index;
+    audit_cursor := 0;
+    audit_expected_parent := null;
+    audit_log_expected_offset := StableLog.dataStartOffset();
+    audit_log_captured_entries := 0;
+    audit_log_captured_offset := 0;
+    audit_set_restarts := 0;
+    audit_chunk_retries := 0;
+    ignore Timer.setTimer<system>(#seconds 0, auditTick);
+    refreshCertification();
+  };
+
+  type AuditSelf = actor { __audit_chunk : shared () -> async Bool };
+
+  /// The tick: ONE awaited self-call per tick (trap isolation — a trap inside the chunk
+  /// rolls the chunk back and rejects the call; the catch arm here commits). Nothing
+  /// executes before the try (pass-3 A4). A racing upgrade ATTEMPT aborts an in-flight
+  /// chunk with a transient reject (TX probe, Phase 2c), so a single failure only
+  /// retries; AUDIT_CHUNK_FAILURE_LIMIT consecutive failures fail CLOSED with a code
+  /// that distinguishes deterministic traps from exhausted transients.
+  func auditTick() : async () {
+    if (audit_state != #running) return;
+    var done = false;
+    try {
+      let self : AuditSelf = actor (Principal.toText(selfPrincipal()));
+      done := await self.__audit_chunk();
+      audit_chunk_retries := 0;
+    } catch (e) {
+      audit_chunk_retries += 1;
+      if (audit_chunk_retries >= AUDIT_CHUNK_FAILURE_LIMIT) {
+        let code = switch (Error.code(e)) {
+          case (#canister_error) "stable-state:audit-chunk-trap:" # Error.message(e);
+          case (_) "audit:chunk-transient-exhausted:" # Error.message(e);
+        };
+        done := auditFail(code, audit_cursor);
+      };
+    };
+    if (not done) {
+      ignore Timer.setTimer<system>(#seconds 0, auditTick);
+    };
+  };
+
+  func auditSetTarget(phase : AuditPhase) : ?(StableBlobSet.State, Text, Nat) {
+    switch (phase) {
+      case (#set_roots) ?(historical_roots, "roots:", roots_put_counter);
+      case (#set_nullifiers) ?(spent_nullifiers, "nullifiers:", nullifiers_put_counter);
+      case (#set_shields) ?(completed_shield_intents, "completed-shields:", shields_put_counter);
+      case (#set_unshields) ?(completed_unshield_intents, "completed-unshields:", unshields_put_counter);
+      case (_) null;
     }
+  };
+
+  func auditAdvancePhase() {
+    audit_cursor := 0;
+    audit_set_restarts := 0;
+    audit_phase := switch (audit_phase) {
+      case (#log_index) #set_roots;
+      case (#set_roots) #set_nullifiers;
+      case (#set_nullifiers) #set_shields;
+      case (#set_shields) #set_unshields;
+      case (#set_unshields) #notes;
+      case (#notes) #tail;
+      case (#tail) #tail;
+    };
+  };
+
+  /// One audit chunk (self-call from auditTick; bounded work per message). Returns true
+  /// when the audit reached a terminal state. Phases run in the OLD validateStableState
+  /// order — layout+log header+index walk, the four set walks (header + slot count),
+  /// statement version, the per-note walk, then the tail phases — producing the OLD
+  /// error strings.
+  public shared ({ caller }) func __audit_chunk() : async Bool {
+    if (not Principal.equal(caller, selfPrincipal())) Runtime.trap("audit-chunk:self-only");
+    if (audit_state != #running) return true;
+    audit_last_chunk_at := ?nowNat64();
+    switch (audit_phase) {
+      case (#log_index) {
+        if (audit_cursor == 0) {
+          if (stable_layout_version != STABLE_LAYOUT_VERSION) {
+            return auditFail("stable-state:layout-version", 0);
+          };
+          switch (StableLog.validateHeader(note_log)) {
+            case (#err(message)) return auditFail(message, 0);
+            case (#ok(_)) {};
+          };
+          audit_log_captured_entries := Nat64.fromNat(StableLog.size(note_log));
+          audit_log_captured_offset := note_log.data_offset;
+          audit_log_expected_offset := StableLog.dataStartOffset();
+        };
+        let from = Nat64.fromNat(audit_cursor);
+        switch (StableLog.validateIndexRange(note_log, from, AUDIT_INDEX_PER_CHUNK, audit_log_expected_offset)) {
+          case (#err(message)) return auditFail(message, audit_cursor);
+          case (#ok(next_offset)) {
+            audit_log_expected_offset := next_offset;
+            let stepped = Nat64.toNat(
+              (if (from + AUDIT_INDEX_PER_CHUNK > audit_log_captured_entries) audit_log_captured_entries else from + AUDIT_INDEX_PER_CHUNK) - from
+            );
+            audit_cursor += stepped;
+          };
+        };
+        if (Nat64.fromNat(audit_cursor) >= audit_log_captured_entries) {
+          if (audit_log_expected_offset != audit_log_captured_offset) {
+            return auditFail("stable-log:tail-offset", audit_cursor);
+          };
+          auditAdvancePhase();
+        };
+        false
+      };
+      case (#set_roots or #set_nullifiers or #set_shields or #set_unshields) {
+        let (set, prefix, puts_now) = switch (auditSetTarget(audit_phase)) {
+          case (?target) target;
+          case null Runtime.trap("audit:phase-target");
+        };
+        if (audit_cursor == 0) {
+          switch (StableBlobSet.validateHeader(set)) {
+            case (#err(message)) return auditFail(prefix # message, 0);
+            case (#ok(_)) {};
+          };
+          audit_set_captured_table := set.table_offset;
+          audit_set_captured_capacity := set.capacity;
+          audit_set_captured_count := set.entry_count;
+          audit_set_captured_puts := puts_now;
+          audit_set_observed := 0;
+        };
+        // a grow moved the table mid-walk: restart this set's walk (bounded, loud)
+        if (set.table_offset != audit_set_captured_table or set.capacity != audit_set_captured_capacity) {
+          audit_set_restarts += 1;
+          if (audit_set_restarts > AUDIT_SET_RESTART_LIMIT) {
+            return auditFail("audit:set-walk-contended", audit_cursor);
+          };
+          audit_cursor := 0;
+          return false;
+        };
+        let from = Nat64.fromNat(audit_cursor);
+        switch (StableBlobSet.countTagsRange(set, audit_set_captured_table, audit_set_captured_capacity, from, AUDIT_SLOTS_PER_CHUNK)) {
+          case (#err(message)) return auditFail(prefix # message, audit_cursor);
+          case (#ok(observed)) {
+            audit_set_observed += observed;
+            let end = if (from + AUDIT_SLOTS_PER_CHUNK > audit_set_captured_capacity) audit_set_captured_capacity else from + AUDIT_SLOTS_PER_CHUNK;
+            audit_cursor := Nat64.toNat(end);
+          };
+        };
+        if (Nat64.fromNat(audit_cursor) >= audit_set_captured_capacity) {
+          if (puts_now == audit_set_captured_puts) {
+            // quiescent walk: EXACT equality, the old check verbatim
+            if (audit_set_observed != audit_set_captured_count) {
+              return auditFail(prefix # "stable-set:observed-count", audit_cursor);
+            };
+            auditAdvancePhase();
+          } else {
+            // racing inserts landed during a multi-chunk walk: restart, never band-pass
+            audit_set_restarts += 1;
+            if (audit_set_restarts > AUDIT_SET_RESTART_LIMIT) {
+              return auditFail("audit:set-walk-contended", audit_cursor);
+            };
+            audit_cursor := 0;
+          };
+        };
+        false
+      };
+      case (#notes) {
+        if (audit_cursor == 0) {
+          if (transfer_statement_version != 1 and transfer_statement_version != 2) {
+            return auditFail("stable-state:transfer-statement-version", 0);
+          };
+          audit_expected_parent := null;
+        };
+        var stepped : Nat = 0;
+        while (stepped < AUDIT_NOTES_PER_CHUNK and audit_cursor < noteCount()) {
+          let encoded = switch (StableLog.get(note_log, audit_cursor)) {
+            case (?value) value;
+            case null return auditFail("stable-state:missing-note", audit_cursor);
+          };
+          switch (note_checker.checkNote(encoded, audit_cursor, audit_expected_parent, historical_roots, spent_nullifiers)) {
+            case (#err(message)) return auditFail(message, audit_cursor);
+            case (#ok(hash)) audit_expected_parent := ?hash;
+          };
+          audit_cursor += 1;
+          stepped += 1;
+        };
+        // the tail comparison must be atomic with walk completion: run it in the SAME
+        // message the cursor catches the live noteCount() in
+        if (audit_cursor >= noteCount()) {
+          if (audit_expected_parent != last_block_hash) {
+            return auditFail("stable-state:last-block-hash", audit_cursor);
+          };
+          switch (validateTailAndPendings()) {
+            case (#err(message)) return auditFail(message, audit_cursor);
+            case (#ok(_)) {};
+          };
+          audit_phase := #tail;
+          return auditPass();
+        };
+        false
+      };
+      case (#tail) {
+        // reachable only if a terminal transition was interrupted; re-run the tail
+        if (audit_expected_parent != last_block_hash and audit_cursor < noteCount()) {
+          audit_phase := #notes;
+          return false;
+        };
+        switch (validateTailAndPendings()) {
+          case (#err(message)) return auditFail(message, audit_cursor);
+          case (#ok(_)) {};
+        };
+        auditPass()
+      };
+    }
+  };
+
+  func auditStatusValue() : AuditStatus {
+    {
+      state = audit_state;
+      phase = audit_phase;
+      cursor = audit_cursor;
+      total = noteCount();
+      audit_epoch;
+      last_completed_at = audit_last_completed_at;
+      last_chunk_at = audit_last_chunk_at;
+      chunk_retries = audit_chunk_retries;
+      guard = guard_code;
+      guard_epoch;
+    }
+  };
+
+  public query func audit_status() : async AuditStatus { auditStatusValue() };
+
+  /// Restart the background audit (admin). Guard-EXEMPT by design: re-running the audit
+  /// is the only path to clearing a tripped guard, and it mutates only audit state.
+  public shared ({ caller }) func restart_audit() : async Result<AuditStatus> {
+    if (not isAdministrator(caller)) return #err("REJECT:not-administrator");
+    resetAudit<system>();
+    #ok(auditStatusValue())
+  };
+
+  /// Clear the fail-closed guard (admin), permitted ONLY after a NEWER audit epoch has
+  /// re-run green (#pass with audit_epoch > guard_epoch).
+  public shared ({ caller }) func clear_audit_guard() : async Result<AuditStatus> {
+    if (not isAdministrator(caller)) return #err("REJECT:not-administrator");
+    switch (guard_code) {
+      case null return #err("REJECT:guard-not-set");
+      case (?_) {};
+    };
+    if (audit_state != #pass or audit_epoch <= guard_epoch) {
+      return #err("REJECT:guard-requires-green-reaudit");
+    };
+    guard_code := null;
+    #ok(auditStatusValue())
+  };
+
+  /// Fail-closed rejection for every state-mutating endpoint while the guard is set.
+  func guardRejection() : ?Text {
+    switch (guard_code) {
+      case (?code) ?("GUARDED:stable-state-audit-failed:" # code);
+      case null null;
+    }
+  };
+
+  system func postupgrade() {
+    let heap_before = Prim.rts_heap_size();
+    configuring := false;
+    switch (validateStableStateBounded()) {
+      case (#ok(_)) {};
+      case (#err(message)) Runtime.trap("postupgrade:" # message);
+    };
+    refreshCertification();
+    resetAudit<system>();
+    postupgrade_heap_before := heap_before;
+    postupgrade_heap_after := Prim.rts_heap_size();
+    postupgrade_instructions := Prim.performanceCounter(0);
+  };
+
+  /// Postupgrade cost telemetry (T1 asserts ~flat vs note count).
+  public query func postupgrade_stats() : async { instructions : Nat64; heap_before : Nat; heap_after : Nat } {
+    { instructions = postupgrade_instructions; heap_before = postupgrade_heap_before; heap_after = postupgrade_heap_after }
   };
 
   func configured() : Bool {
@@ -832,29 +1252,12 @@ persistent actor ZkLedger {
       case (#ok(index)) { if (index != position) Runtime.trap("stable-state:note-position") };
       case (#err(message)) Runtime.trap(message);
     };
-    last_block_hash := ?ICRC3.hashValue(blockValue(block));
-  };
-
-  func blockValue(block : ShieldedNoteBlock) : ICRC3.Value {
-    let entries = List.empty<(Text, ICRC3.Value)>();
-    List.add(entries, ("btype", #Text(block.btype)));
-    switch (block.phash) { case (?hash) List.add(entries, ("phash", #Blob(hash))); case null {} };
-    List.add(entries, ("encoding_version", #Nat(block.encoding_version)));
-    List.add(entries, ("note_position", #Nat(block.note_position)));
-    List.add(entries, ("commitment", #Blob(block.commitment)));
-    List.add(entries, ("ephemeral_key", #Blob(block.ephemeral_key)));
-    List.add(entries, ("note_ciphertext", #Blob(block.note_ciphertext)));
-    List.add(entries, ("nullifiers", #Array(Array.map<Blob, ICRC3.Value>(block.nullifiers, func(value) {
-      #Blob(value)
-    }))));
-    List.add(entries, ("anchor_before", #Blob(block.anchor_before)));
-    List.add(entries, ("note_root_after", #Blob(block.note_root_after)));
-    List.add(entries, ("timestamp", #Nat(Nat64.toNat(block.timestamp))));
-    List.add(entries, ("origin", #Text(switch (block.origin) {
-      case (#shield) "shield";
-      case (#confidential_transfer) "confidential_transfer";
-    })));
-    #Map(List.toArray(entries))
+    // incremental change-detection digest: sha256 chain over the appended encodings
+    let chain = Sha256.Digest(#sha256);
+    chain.writeBlob(note_log_chain_digest);
+    chain.writeBlob(encoded);
+    note_log_chain_digest := chain.sum();
+    last_block_hash := ?ICRC3.hashValue(NoteAudit.blockValue(block));
   };
 
   func validateOutput(output : OutputRecord) : ?Text {
@@ -870,6 +1273,7 @@ persistent actor ZkLedger {
     transferVkHex : Text,
     depositVkHex : Text,
   ) : async Result<LedgerStatus> {
+    switch (guardRejection()) { case (?message) return #err(message); case null {} };
     if (configured() or configuring) return #err("REJECT:already-configured");
     if (transferVkHex.size() == 0 or depositVkHex.size() == 0) return #err("REJECT:empty-vk");
     // Parse + validate + prepare both verifying keys NOW (in-process, no await, no state
@@ -920,6 +1324,7 @@ persistent actor ZkLedger {
     newTransferVkHex : Text,
     newDepositVkHex : Text,
   ) : async Result<LedgerStatus> {
+    switch (guardRejection()) { case (?message) return #err(message); case null {} };
     if (not isAdministrator(caller)) return #err("REJECT:not-administrator");
     if (not configured()) return #err("REJECT:unconfigured");
     if (pending_shield != null or pending_unshield != null) return #err("REJECT:pending-token-mutation");
@@ -949,6 +1354,7 @@ persistent actor ZkLedger {
     historyAdapterId : Principal,
     poolSubaccount : ?Blob,
   ) : async Result<AtomicityStatus> {
+    switch (guardRejection()) { case (?message) return #err(message); case null {} };
     if (not isAdministrator(caller)) return #err("REJECT:not-administrator");
     if (token_configuring) return #err("REJECT:token-configuration-in-progress");
     if (tokenConfigured()) return #err("REJECT:token-already-configured");
@@ -1007,28 +1413,34 @@ persistent actor ZkLedger {
     recipientBindingValue(recipient)
   };
 
+  // Digest fields are the incrementally-maintained CHANGE-DETECTION digests (folded at
+  // append/first-insert) — the old one-shot region walks were O(n) with per-entry heap
+  // allocation inside a single query message. Values differ from the old scheme
+  // by construction; every consumer compares them across time, never against
+  // recomputation. On a state migrated from a pre-fix wasm they cover post-migration
+  // mutations only.
   func storageStatusValue() : StorageStatus {
     {
       layout_version = stable_layout_version;
       note_entries = noteCount();
       note_bytes = StableLog.dataSize(note_log);
-      note_digest = StableLog.digest(note_log);
+      note_digest = note_log_chain_digest;
       root_entries = rootCount();
       root_capacity = Nat64.toNat(historical_roots.capacity);
       root_region_bytes = StableBlobSet.bytesAllocated(historical_roots);
-      root_digest = StableBlobSet.digest(historical_roots);
+      root_digest = roots_fold_digest;
       nullifier_entries = nullifierCount();
       nullifier_capacity = Nat64.toNat(spent_nullifiers.capacity);
       nullifier_region_bytes = StableBlobSet.bytesAllocated(spent_nullifiers);
-      nullifier_digest = StableBlobSet.digest(spent_nullifiers);
+      nullifier_digest = nullifiers_fold_digest;
       completed_shield_entries = completedShieldCount();
       completed_shield_capacity = Nat64.toNat(completed_shield_intents.capacity);
       completed_shield_region_bytes = StableBlobSet.bytesAllocated(completed_shield_intents);
-      completed_shield_digest = StableBlobSet.digest(completed_shield_intents);
+      completed_shield_digest = shields_fold_digest;
       completed_unshield_entries = completedUnshieldCount();
       completed_unshield_capacity = Nat64.toNat(completed_unshield_intents.capacity);
       completed_unshield_region_bytes = StableBlobSet.bytesAllocated(completed_unshield_intents);
-      completed_unshield_digest = StableBlobSet.digest(completed_unshield_intents);
+      completed_unshield_digest = unshields_fold_digest;
     }
   };
 
@@ -1043,9 +1455,9 @@ persistent actor ZkLedger {
       pending = pending_shield;
       pending_unshield;
       completed_intents = completedShieldCount();
-      completed_intent_digest = StableBlobSet.digest(completed_shield_intents);
+      completed_intent_digest = shields_fold_digest;
       completed_unshield_intents = completedUnshieldCount();
-      completed_unshield_intent_digest = StableBlobSet.digest(completed_unshield_intents);
+      completed_unshield_intent_digest = unshields_fold_digest;
       test_fault_armed = test_fail_after_token_once;
     }
   };
@@ -1053,6 +1465,7 @@ persistent actor ZkLedger {
   public query func atomicity_status() : async AtomicityStatus { atomicityStatusValue() };
 
   public shared ({ caller }) func test_arm_fail_after_token_once() : async Result<()> {
+    switch (guardRejection()) { case (?message) return #err(message); case null {} };
     if (not isAdministrator(caller)) return #err("REJECT:not-administrator");
     if (pending_shield != null or pending_unshield != null) return #err("REJECT:pending-token-mutation");
     test_fail_after_token_once := true;
@@ -1074,11 +1487,44 @@ persistent actor ZkLedger {
     }
   };
 
+  /// Bounded stable-state validation: the O(1)/O(k) postupgrade checks, NOT the
+  /// full walk (which OOM'd at 51k notes). Returns #ok while the background audit is
+  /// still #running — poll audit_status for the full-walk verdict; deep external
+  /// verification pages through validate_stable_state_range.
   public query func validate_stable_state() : async Result<StorageStatus> {
-    switch (validateStableState()) {
+    switch (validateStableStateBounded()) {
       case (#ok(_)) #ok(storageStatusValue());
       case (#err(message)) #err(message);
     }
+  };
+
+  /// Paged deep verification: run EXACTLY the old per-note checks over notes
+  /// [from, from+count) (count capped), threading the parent hash between pages. Pass
+  /// expected_parent = null for from == 0; feed each page's returned hash into the
+  /// next. When the page reaches the log tip, the tip hash is compared to
+  /// last_block_hash exactly like the old walk.
+  public query func validate_stable_state_range(from : Nat, count : Nat, expected_parent : ?Blob) : async Result<?Blob> {
+    let capped = Nat.min(count, 512);
+    if (from > noteCount()) return #err("stable-state:range-out-of-bounds");
+    if (from == 0 and expected_parent != null) return #err("stable-state:range-parent");
+    var parent = expected_parent;
+    var index = from;
+    let end = Nat.min(from + capped, noteCount());
+    while (index < end) {
+      let encoded = switch (StableLog.get(note_log, index)) {
+        case (?value) value;
+        case null return #err("stable-state:missing-note");
+      };
+      switch (NoteAudit.referenceCheck(encoded, index, parent, historical_roots, spent_nullifiers)) {
+        case (#err(message)) return #err(message);
+        case (#ok(hash)) parent := ?hash;
+      };
+      index += 1;
+    };
+    if (index >= noteCount() and parent != last_block_hash) {
+      return #err("stable-state:last-block-hash");
+    };
+    #ok(parent)
   };
 
   public query func certified_snapshot() : async CertifiedSnapshot {
@@ -1120,14 +1566,23 @@ persistent actor ZkLedger {
 
   public query func icrc3_get_archives(_args : GetArchivesArgs) : async [ArchiveInfo] { [] };
 
+  // ICRC-3 permits returning fewer blocks than requested; clients paginate. The cap is
+  // TOTAL across all requested ranges (a multi-range arg must not multiply the bound)
+  // and bounds this query's decode work per message — the old uncapped loop
+  // could be driven through the whole log in one call.
+  let MAX_BLOCKS_PER_CALL : Nat = 512;
+
   public query func icrc3_get_blocks(args : [GetBlocksArgs]) : async GetBlocksResult {
     let result = List.empty<Block>();
-    for (range in args.vals()) {
+    var emitted : Nat = 0;
+    label ranges for (range in args.vals()) {
       if (range.start < noteCount()) {
         let end = Nat.min(range.start + range.length, noteCount());
         var i = range.start;
         while (i < end) {
-          List.add(result, { id = i; block = blockValue(blockAt(i)) });
+          if (emitted >= MAX_BLOCKS_PER_CALL) break ranges;
+          List.add(result, { id = i; block = NoteAudit.blockValue(blockAt(i)) });
+          emitted += 1;
           i += 1;
         };
       };
@@ -1188,7 +1643,10 @@ persistent actor ZkLedger {
     pool_value += Nat64.toNat(pending.value);
     epoch += 1;
     switch (StableBlobSet.put(completed_shield_intents, intentId)) {
-      case (#ok(true)) {};
+      case (#ok(true)) {
+        shields_put_counter += 1;
+        shields_fold_digest := xorFold(shields_fold_digest, intentId);
+      };
       case (#ok(false)) Runtime.trap("stable-state:completed-shield-duplicate");
       case (#err(message)) Runtime.trap(message);
     };
@@ -1293,6 +1751,10 @@ persistent actor ZkLedger {
   };
 
   public shared ({ caller }) func shield(args : DepositArgs) : async MutationResult {
+    // guard FIRST: even the already-finalized replay answer reads the completed set —
+    // exactly the state a failed audit distrusts (and contains() can trap on a corrupt
+    // slot); a guarded ledger answers with a clean reject, never a membership claim
+    switch (guardRejection()) { case (?message) return mutation(message, "NOT_CALLED"); case null {} };
     if (not configured()) return mutation("REJECT:unconfigured", "NOT_CALLED");
     if (not tokenConfigured()) return mutation("REJECT:token-unconfigured", "NOT_CALLED");
     if (pending_shield != null or pending_unshield != null) {
@@ -1381,6 +1843,10 @@ persistent actor ZkLedger {
   };
 
   public shared ({ caller }) func resume_shield() : async MutationResult {
+    // Blocking resume while guarded is fund-safe: the pending intent is stable and
+    // reconcile-by-memo is dedup-window-independent, so finalization only WAITS for
+    // guard-clear + green re-audit (Main.mo ledger_tip_before design).
+    switch (guardRejection()) { case (?message) return mutation(message, "NOT_CALLED"); case null {} };
     let pending = switch (pending_shield) {
       case (?value) value;
       case null return mutation("REJECT:no-pending-shield", "NOT_CALLED");
@@ -1449,7 +1915,10 @@ persistent actor ZkLedger {
     pool_value -= pending.pool_debit;
     epoch += 1;
     switch (StableBlobSet.put(completed_unshield_intents, intentId)) {
-      case (#ok(true)) {};
+      case (#ok(true)) {
+        unshields_put_counter += 1;
+        unshields_fold_digest := xorFold(unshields_fold_digest, intentId);
+      };
       case (#ok(false)) Runtime.trap("stable-state:completed-unshield-duplicate");
       case (#err(message)) Runtime.trap(message);
     };
@@ -1547,6 +2016,7 @@ persistent actor ZkLedger {
   };
 
   public shared ({ caller }) func resume_unshield() : async MutationResult {
+    switch (guardRejection()) { case (?message) return mutation(message, "NOT_CALLED"); case null {} };
     let pending = switch (pending_unshield) {
       case (?value) value;
       case null return mutation("REJECT:no-pending-unshield", "NOT_CALLED");
@@ -1559,6 +2029,7 @@ persistent actor ZkLedger {
   };
 
   public shared ({ caller }) func confidential_transfer(args : TransferArgs) : async MutationResult {
+    switch (guardRejection()) { case (?message) return mutation(message, "NOT_CALLED"); case null {} };
     if (not configured()) return mutation("REJECT:unconfigured", "NOT_CALLED");
     if (transfer_statement_version != 2) {
       return mutation("REJECT:transfer-statement-version", "NOT_CALLED");

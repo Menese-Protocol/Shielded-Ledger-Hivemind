@@ -16,6 +16,9 @@ module {
     note_root : Blob;
     encoding_version : Nat;
     archive_manifest : Blob;
+    // digest of the background stable-state audit verdict (state tag + code/index iff
+    // failed — a pure function of the audited ledger state, never of cursor/epoch/time)
+    audit_digest : Blob;
   };
 
   public type HashTree = {
@@ -31,15 +34,19 @@ module {
   };
 
   func zkTree(tuple : Tuple) : HashTree {
+    // labels stay alphabetical: archive_manifest < audit < encoding_version < note_count < note_root
     #labeled(
       Text.encodeUtf8("zk"),
       #fork(
         labeledLeaf("archive_manifest", tuple.archive_manifest),
         #fork(
-          labeledLeaf("encoding_version", Blob.fromArray(leb128Nat(tuple.encoding_version))),
+          labeledLeaf("audit", tuple.audit_digest),
           #fork(
-            labeledLeaf("note_count", Blob.fromArray(leb128Nat(tuple.note_count))),
-            labeledLeaf("note_root", tuple.note_root),
+            labeledLeaf("encoding_version", Blob.fromArray(leb128Nat(tuple.encoding_version))),
+            #fork(
+              labeledLeaf("note_count", Blob.fromArray(leb128Nat(tuple.note_count))),
+              labeledLeaf("note_root", tuple.note_root),
+            ),
           ),
         ),
       ),
