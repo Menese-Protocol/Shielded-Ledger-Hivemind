@@ -430,6 +430,24 @@ impl Runner {
         std::fs::create_dir_all(&tier.state_dir).expect("create state dir");
         std::fs::create_dir_all(tier.checkpoint_file.parent().unwrap()).ok();
         let env = pic_env::setup(wasms, &keys.transfer_vk_hex, &keys.deposit_vk_hex, &tier.state_dir);
+        // Optionally run the whole corpus with the in-canister Poseidon frontier
+        // enabled. With the oracle still attached (default) every append is cross-checked
+        // in-canister vs the oracle — a corpus-scale proof the two roots agree. With
+        // SOAK_TREE_FRONTIER_DETACH the oracle is dropped and the ledger stands alone.
+        if std::env::var("SOAK_TREE_FRONTIER").is_ok() {
+            let r: ct::MotokoResult<ct::LedgerStatus> = env
+                .update(env.ledger, env.admin, "set_tree_frontier", (true,))
+                .expect("set_tree_frontier call");
+            r.into_result().expect("enable tree frontier");
+            println!("[setup] in-canister Poseidon frontier ENABLED (oracle cross-checked)");
+            if std::env::var("SOAK_TREE_FRONTIER_DETACH").is_ok() {
+                let r: ct::MotokoResult<ct::LedgerStatus> = env
+                    .update(env.ledger, env.admin, "set_tree_oracle", (Option::<Principal>::None,))
+                    .expect("set_tree_oracle call");
+                r.into_result().expect("detach tree oracle");
+                println!("[setup] tree oracle DETACHED — ledger computes every root alone");
+            }
+        }
         let principals: Vec<Principal> = accounts.iter().map(|a| a.principal).collect();
         println!("[setup] funding {} accounts on the token fixture...", principals.len());
         let t0 = Instant::now();
@@ -1332,6 +1350,24 @@ impl Runner {
                 "audit did not PASS after upgrade #{}: {other:?}",
                 self.upgrades_done.len() + 1
             ),
+        }
+        // Upgrade safety: the frontier flag is stable, so it (and the authoritative
+        // root) must survive the boundary unchanged. Assert the flag persisted and the
+        // detach state is intact whenever the run enabled the frontier.
+        if std::env::var("SOAK_TREE_FRONTIER").is_ok() {
+            #[derive(candid::CandidType, serde::Deserialize)]
+            struct FrontierStatus { enabled: bool, tree_oracle: Option<Principal> }
+            let fs: FrontierStatus = self
+                .env
+                .query(self.env.ledger, "tree_frontier_status", ())
+                .expect("tree_frontier_status");
+            assert!(fs.enabled, "upgrade lost the tree-frontier flag");
+            let detached = std::env::var("SOAK_TREE_FRONTIER_DETACH").is_ok();
+            assert_eq!(
+                fs.tree_oracle.is_none(),
+                detached,
+                "upgrade changed the oracle attachment state"
+            );
         }
         self.cheap_invariants();
         self.progress(&format!(
