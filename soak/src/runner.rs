@@ -1210,6 +1210,17 @@ impl Runner {
             .expect("audit_status query")
     }
 
+    /// audit_status, tolerating a module that predates the audit (a checkpoint resumed
+    /// with the OLD wasm still installed — the state upgrade #1 starts from). Returns
+    /// None exactly when the method does not exist; any other failure still panics.
+    fn try_audit_status(&self) -> Option<ct::AuditStatus> {
+        match self.env.query::<ct::AuditStatus>(self.env.ledger, "audit_status", ()) {
+            Ok(s) => Some(s),
+            Err(e) if e.contains("no query method") || e.contains("does not exist") => None,
+            Err(e) => panic!("audit_status query: {e}"),
+        }
+    }
+
     /// Drive PocketIC rounds until the background audit reaches a terminal state, with a
     /// HARD BOUND committed up front (bounded-verification: a stalled tick chain must
     /// fail the run loudly, never hang the poll). Returns the terminal status.
@@ -1257,10 +1268,17 @@ impl Runner {
         // DRAIN: an open audit-chunk self-call makes the moc EOP runtime reject the
         // upgrade ("canister_pre_upgrade attempted with outstanding message callbacks",
         // TX probe). The audit must be terminal before install_code. A pre-existing
-        // FAIL is ledger-implicated: stop loudly.
-        let drained = self.await_audit_terminal("pre-upgrade drain");
-        if let ct::AuditState::fail { code, index } = &drained.state {
-            panic!("audit FAILED before upgrade #{}: {code} at index {index}", self.upgrades_done.len() + 1);
+        // FAIL is ledger-implicated: stop loudly. A module that PREDATES the audit
+        // (old-wasm checkpoint, upgrade #1 of a resumed run) has no audit and no open
+        // contexts — nothing to drain.
+        match self.try_audit_status() {
+            None => self.progress("pre-upgrade drain: installed module predates the audit (old wasm) — nothing to drain"),
+            Some(_) => {
+                let drained = self.await_audit_terminal("pre-upgrade drain");
+                if let ct::AuditState::fail { code, index } = &drained.state {
+                    panic!("audit FAILED before upgrade #{}: {code} at index {index}", self.upgrades_done.len() + 1);
+                }
+            }
         }
         let pre = self.env.ledger_status();
         // moc 1.4.1 compiles with enhanced orthogonal persistence: the upgrade must carry
