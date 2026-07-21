@@ -31,6 +31,7 @@ import Prim "mo:⛔";
 import Sha256 "mo:sha2/Sha256";
 import ICRC2 "../src/ICRC2";
 import ICRC3 "../src/ICRC3";
+import NoteAudit "../src/NoteAudit";
 import NoteCodec "../src/NoteCodec";
 import StableBlobSet "../src/StableBlobSet";
 import StableLog "../src/StableLog";
@@ -709,5 +710,56 @@ persistent actor ScaleFixture {
 
   public query func fixture_status() : async (Nat, Nat, Nat, Blob, ?Blob) {
     (noteCount(), rootCount(), nullifierCount(), note_root, last_block_hash)
+  };
+
+  // ==== NoteAudit parity gate (fast Checker vs verbatim referenceCheck) ====
+  transient let parity_checker = NoteAudit.Checker();
+
+  /// Walk notes [0, count) with BOTH per-note paths. Every note must produce the same
+  /// outcome: (#ok h, #ok h') with h == h', or (#err m, #err m') with m == m'. Also
+  /// measures both paths (instructions, allocation) for the §3.4 before/after record.
+  /// Returns #ok((checked, fast_instr, fast_alloc, ref_instr, ref_alloc)).
+  public func parity_check(count : Nat) : async Result<(Nat, Nat64, Nat, Nat64, Nat)> {
+    var parent_fast : ?Blob = null;
+    var parent_ref : ?Blob = null;
+    var index : Nat = 0;
+    var fast_instr : Nat64 = 0;
+    var fast_alloc : Nat = 0;
+    var ref_instr : Nat64 = 0;
+    var ref_alloc : Nat = 0;
+    let end = if (count > noteCount()) noteCount() else count;
+    while (index < end) {
+      let encoded = switch (StableLog.get(note_log, index)) {
+        case (?value) value;
+        case null return #err("parity: missing note");
+      };
+      let a0 = Prim.rts_total_allocation();
+      let c0 = Prim.performanceCounter(0);
+      let fast = parity_checker.checkNote(encoded, index, parent_fast, historical_roots, spent_nullifiers);
+      let c1 = Prim.performanceCounter(0);
+      let a1 = Prim.rts_total_allocation();
+      let refr = NoteAudit.referenceCheck(encoded, index, parent_ref, historical_roots, spent_nullifiers);
+      let c2 = Prim.performanceCounter(0);
+      let a2 = Prim.rts_total_allocation();
+      fast_instr += c1 - c0;
+      fast_alloc += a1 - a0;
+      ref_instr += c2 - c1;
+      ref_alloc += a2 - a1;
+      switch (fast, refr) {
+        case (#ok(hf), #ok(hr)) {
+          if (hf != hr) return #err("parity: hash mismatch at " # Nat.toText(index));
+          parent_fast := ?hf;
+          parent_ref := ?hr;
+        };
+        case (#err(mf), #err(mr)) {
+          if (mf != mr) return #err("parity: error mismatch at " # Nat.toText(index) # ": fast=" # mf # " ref=" # mr);
+          return #ok((index + 1, fast_instr, fast_alloc, ref_instr, ref_alloc));
+        };
+        case (#ok(_), #err(mr)) return #err("parity: fast ok / ref err(" # mr # ") at " # Nat.toText(index));
+        case (#err(mf), #ok(_)) return #err("parity: fast err(" # mf # ") / ref ok at " # Nat.toText(index));
+      };
+      index += 1;
+    };
+    #ok((end, fast_instr, fast_alloc, ref_instr, ref_alloc))
   };
 }

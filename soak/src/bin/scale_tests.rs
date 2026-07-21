@@ -220,6 +220,48 @@ fn fixture_selftest() -> bool {
     );
     ok &= expect_code("last-block-hash tamper", ctx.old_walk(), "stable-state:last-block-hash");
 
+    println!("== NoteAudit parity: fast Checker vs verbatim reference, valid 1k state ==");
+    let (ctx, _p1) = fresh(1_000);
+    let parity = |ctx: &Ctx, label: &str| -> bool {
+        let raw = ctx.call_raw("parity_check", candid::encode_args((candid::Nat::from(1_000u64),)).unwrap());
+        let (r,): (soak::candid_types::MotokoResult<(candid::Nat, u64, candid::Nat, u64, candid::Nat)>,) =
+            candid::decode_args(&raw).expect("parity decode");
+        match r.into_result() {
+            Ok((checked, fi, fa, ri, ra)) => {
+                let n = u64::try_from(checked.0.clone()).unwrap().max(1);
+                let fa: u128 = fa.0.try_into().unwrap();
+                let ra: u128 = ra.0.try_into().unwrap();
+                println!(
+                    "  PASS: {label} ({checked} notes; fast {}/note instr {}B/note alloc vs ref {}/note instr {}B/note alloc)",
+                    fi / n,
+                    fa / n as u128,
+                    ri / n,
+                    ra / n as u128
+                );
+                true
+            }
+            Err(e) => {
+                println!("  FAIL: {label}: {e}");
+                false
+            }
+        }
+    };
+    ok &= parity(&ctx, "valid-state parity + measurement");
+
+    println!("== NoteAudit parity on corrupted states (fallback verdict identity) ==");
+    let (ctx, _p2) = fresh(1_000);
+    let _ = ctx.call_raw(
+        "corrupt_note_byte",
+        candid::encode_args((candid::Nat::from(500u64), candid::Nat::from(60u64), false)).unwrap(),
+    );
+    ok &= parity(&ctx, "checksum-stale parity");
+    let (ctx, _p3) = fresh(1_000);
+    let _ = ctx.call_raw(
+        "corrupt_note_byte",
+        candid::encode_args((candid::Nat::from(500u64), candid::Nat::from(60u64), true)).unwrap(),
+    );
+    ok &= parity(&ctx, "phash-tamper parity");
+
     println!("== pending_unshield: valid populates -> #ok; corrupted binding -> binding code ==");
     let (ctx, _s10) = fresh(1_000);
     let _ = ctx.call_raw("populate_pending_unshield", candid::encode_args((false,)).unwrap());
