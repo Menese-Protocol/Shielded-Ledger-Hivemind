@@ -5,18 +5,23 @@
 ///   - width t = 3 (rate 2, capacity 1), 8 full + 57 partial rounds, alpha = 5;
 ///     constants in `PoseidonConstants.mo`, extracted by `frontier_oracle`
 ///     from `find_poseidon_ark_and_mds::<Fr>(255, 2, 8, 57, 0)`.
-///   - state layout [capacity | rate]: absorption writes state[1..2], the partial
-///     S-box acts on state[0], squeeze reads state[1] — exactly arkworks.
+///   - state layout [capacity | rate]: absorption writes lanes 1..2, the partial
+///     S-box acts on lane 0, squeeze reads lane 1 — exactly arkworks.
 ///   - `merkleCompress(l, r)` = permutation of [0, l, r], lane 1 out.
 ///   - `append` = the incremental-frontier algorithm of `IncrementalTree::append`
 ///     (one cached left sibling per level, 32 compressions per append).
 ///
-/// Field arithmetic is `groth16/Fr.mo` (plain Nat mod r — the correctness anchor the
-/// Groth16 port measured as affordable; an append is ~32 permutations, orders of
-/// magnitude below the in-process pairing check that already runs per operation).
+/// Field arithmetic is `groth16/FrFlat.mo` — in-place Montgomery on 8×32-bit limbs
+/// (the flat, allocation-disciplined style). The first port ran
+/// on plain-Nat `Fr.mo` and was proven byte-identical to arkworks (18,360-comparison
+/// differential, 2 passes, 4 seeds); the cost probe then measured it at 32.07M
+/// instructions + 1.38 MB garbage per permutation (44 MB per append) — churnfix-class
+/// allocation — so the internals moved to FrFlat and the ENTIRE differential gate is
+/// re-run on this backend. Round constants are converted to Montgomery form once at
+/// module init; the permutation itself allocates nothing.
 ///
-/// Differential gate: `tests/PoseidonDifferential.mo` proves every function here
-/// byte-identical to arkworks on the seeded fixtures before Main.mo may call it.
+/// Differential gate: `tests/PoseidonDifferential.mo` proves every public function
+/// here byte-identical to arkworks on the seeded fixtures before Main.mo may call it.
 ///
 /// Menese DeFi Team.
 
@@ -26,57 +31,123 @@ import Nat "mo:core/Nat";
 import Nat8 "mo:core/Nat8";
 import Nat64 "mo:core/Nat64";
 import Runtime "mo:core/Runtime";
+import VarArray "mo:core/VarArray";
 import Prim "mo:⛔";
 import C "PoseidonConstants";
 import Fr "groth16/Fr";
+import F "groth16/FrFlat";
 
 module {
   public let DEPTH : Nat = 32;
-  let FULL_ROUNDS : Nat = 8;
   let PARTIAL_ROUNDS : Nat = 57;
+  let ROUNDS : Nat = 65; // 8 full + 57 partial
+  let HALF_FULL : Nat = 4; // full_rounds / 2
 
-  /// One Poseidon permutation on state (s0, s1, s2); s0 is the capacity lane.
-  /// Round schedule (arkworks `permute`): 4 full, 57 partial, 4 full; each round is
-  /// ARK add, S-box (all lanes on full rounds, lane 0 on partial), MDS mat-vec.
-  public func permute(s0 : Nat, s1 : Nat, s2 : Nat) : (Nat, Nat, Nat) {
-    var a = s0;
-    var b = s1;
-    var c = s2;
-    let half = FULL_ROUNDS / 2;
-    let ark = C.ARK;
-    let mds = C.MDS;
-    let m00 = mds[0][0]; let m01 = mds[0][1]; let m02 = mds[0][2];
-    let m10 = mds[1][0]; let m11 = mds[1][1]; let m12 = mds[1][2];
-    let m20 = mds[2][0]; let m21 = mds[2][1]; let m22 = mds[2][2];
-    var round : Nat = 0;
-    let total = FULL_ROUNDS + PARTIAL_ROUNDS;
-    while (round < total) {
-      let keys = ark[round];
-      a := Fr.add(a, keys[0]);
-      b := Fr.add(b, keys[1]);
-      c := Fr.add(c, keys[2]);
-      let isFull = round < half or round >= half + PARTIAL_ROUNDS;
-      if (isFull) {
-        a := sbox(a);
-        b := sbox(b);
-        c := sbox(c);
-      } else {
-        a := sbox(a);
-      };
-      let na = Fr.add(Fr.add(Fr.mul(m00, a), Fr.mul(m01, b)), Fr.mul(m02, c));
-      let nb = Fr.add(Fr.add(Fr.mul(m10, a), Fr.mul(m11, b)), Fr.mul(m12, c));
-      let nc = Fr.add(Fr.add(Fr.mul(m20, a), Fr.mul(m21, b)), Fr.mul(m22, c));
-      a := na;
-      b := nb;
-      c := nc;
-      round += 1;
-    };
-    (a, b, c)
+  // ---- working arena layout (Nat32 limb offsets; one element = 8 limbs) ----
+  // 0..55   perm slots: s0 s1 s2 n0 n1 n2 tmp
+  // 56..63  spare element (RR / ONE / MDS-constant slot)
+  // 64..71  cur (chained value, Montgomery form)
+  // 72..79  sib (sibling / conversion scratch)
+  let S0 : Nat = 0;
+  let S1 : Nat = 8;
+  let S2 : Nat = 16;
+  let N0 : Nat = 24;
+  let TMP : Nat = 48;
+  let SPARE : Nat = 56;
+  let CUR : Nat = 64;
+  let SIB : Nat = 72;
+  let ARENA : Nat = 80;
+
+  func newArena() : [var Nat32] { VarArray.repeat<Nat32>(0, ARENA) };
+
+  /// Round constants in Montgomery form: static literal tables emitted by the oracle
+  /// (`C.ARK_MONT[(round*3 + lane)*8 ..]`, `C.MDS_MONT[(i*3 + j)*8 ..]` — arkworks'
+  /// internal a·2^256 mod r repr, the exact operand form of the FrFlat CIOS). The
+  /// canonical `C.ARK`/`C.MDS` stay alongside; the differential gate validates both
+  /// forms transitively (any wrong limb diverges the first vector).
+  let ARK_M : [Nat32] = C.ARK_MONT;
+  let MDS_M : [Nat32] = C.MDS_MONT;
+
+  /// x := x^5 for the element at offset `off` (2 squarings + 1 multiply, in place).
+  func sboxAt(w : [var Nat32], off : Nat) {
+    F.montSqrInto(w, TMP, w, off);
+    F.montSqrInto(w, TMP, w, TMP);
+    F.montMulInto(w, off, w, TMP, w, off);
   };
 
-  /// x^5 — 2 squarings and 1 multiplication.
-  func sbox(x : Nat) : Nat {
-    Fr.mul(Fr.sqr(Fr.sqr(x)), x)
+  /// One full 65-round permutation on slots S0..S2 (Montgomery form), in place.
+  /// Round = ARK add; S-box on all lanes (full rounds) or lane 0 (partial); MDS mat-vec.
+  func permuteCore(w : [var Nat32]) {
+    var round = 0;
+    while (round < ROUNDS) {
+      let arkBase = round * 24;
+      F.addConstInto(w, S0, w, S0, ARK_M, arkBase);
+      F.addConstInto(w, S1, w, S1, ARK_M, arkBase + 8);
+      F.addConstInto(w, S2, w, S2, ARK_M, arkBase + 16);
+      if (round < HALF_FULL or round >= HALF_FULL + PARTIAL_ROUNDS) {
+        sboxAt(w, S0);
+        sboxAt(w, S1);
+        sboxAt(w, S2);
+      } else {
+        sboxAt(w, S0);
+      };
+      var i = 0;
+      while (i < 3) {
+        let outOff = N0 + i * 8;
+        F.loadConst(w, SPARE, MDS_M, (i * 3) * 8);
+        F.montMulInto(w, outOff, w, SPARE, w, S0);
+        F.loadConst(w, SPARE, MDS_M, (i * 3 + 1) * 8);
+        F.montMulInto(w, TMP, w, SPARE, w, S1);
+        F.addInto(w, outOff, w, outOff, w, TMP);
+        F.loadConst(w, SPARE, MDS_M, (i * 3 + 2) * 8);
+        F.montMulInto(w, TMP, w, SPARE, w, S2);
+        F.addInto(w, outOff, w, outOff, w, TMP);
+        i += 1;
+      };
+      F.copy(w, S0, w, N0);
+      F.copy(w, S1, w, N0 + 8);
+      F.copy(w, S2, w, N0 + 16);
+      round += 1;
+    };
+  };
+
+  func loadMont(w : [var Nat32], off : Nat, value : Nat) {
+    F.fromNat(value, w, off);
+    F.toMontInto(w, off, w, off, w, SPARE);
+  };
+
+  func readCanonical(w : [var Nat32], off : Nat) : Nat {
+    F.fromMontInto(w, SIB, w, off, w, SPARE);
+    F.toNat(w, SIB)
+  };
+
+  /// One Poseidon permutation on canonical state (s0, s1, s2); s0 is the capacity lane.
+  public func permute(s0 : Nat, s1 : Nat, s2 : Nat) : (Nat, Nat, Nat) {
+    let w = newArena();
+    loadMont(w, S0, s0);
+    loadMont(w, S1, s1);
+    loadMont(w, S2, s2);
+    permuteCore(w);
+    let o2 = readCanonical(w, S2); // SIB is scratch for reads; order irrelevant
+    let o1 = readCanonical(w, S1);
+    let o0 = readCanonical(w, S0);
+    (o0, o1, o2)
+  };
+
+  /// `n` chained permutations on canonical state — permute applied n times (one
+  /// boundary conversion pair total). n = 1 is exactly `permute`. Exists so the cost
+  /// probe can separate the round-loop cost from the Nat⇄limb boundary cost.
+  public func permuteN(s0 : Nat, s1 : Nat, s2 : Nat, n : Nat) : (Nat, Nat, Nat) {
+    let w = newArena();
+    loadMont(w, S0, s0);
+    loadMont(w, S1, s1);
+    loadMont(w, S2, s2);
+    var i = 0;
+    while (i < n) { permuteCore(w); i += 1 };
+    let o2 = readCanonical(w, S2);
+    let o1 = readCanonical(w, S1);
+    let o0 = readCanonical(w, S0);
+    (o0, o1, o2)
   };
 
   /// arkworks `PoseidonSponge` absorb/squeeze for the reference `hash_n` call shape:
@@ -84,27 +155,29 @@ module {
   /// `squeeze_field_elements(1)`. Duplex schedule: permute when a third element
   /// arrives on a full rate section, and once more before the squeeze.
   public func hashN(inputs : [Nat]) : Nat {
-    var s0 : Nat = 0;
-    var s1 : Nat = 0;
-    var s2 : Nat = 0;
+    let w = newArena();
     var absorbed : Nat = 0; // next_absorb_index within the rate section (0..2)
     for (x in inputs.vals()) {
       if (absorbed == 2) {
-        let (t0, t1, t2) = permute(s0, s1, s2);
-        s0 := t0; s1 := t1; s2 := t2;
+        permuteCore(w);
         absorbed := 0;
       };
-      if (absorbed == 0) { s1 := Fr.add(s1, x) } else { s2 := Fr.add(s2, x) };
+      loadMont(w, CUR, x);
+      let lane = if (absorbed == 0) S1 else S2;
+      F.addInto(w, lane, w, lane, w, CUR);
       absorbed += 1;
     };
-    let (_, out, _) = permute(s0, s1, s2);
-    out
+    permuteCore(w);
+    readCanonical(w, S1)
   };
 
   /// 2-to-1 Merkle compression: `hash_n([l, r])` = one permutation of [0, l, r].
   public func merkleCompress(l : Nat, r : Nat) : Nat {
-    let (_, out, _) = permute(0, l, r);
-    out
+    let w = newArena();
+    loadMont(w, S1, l);
+    loadMont(w, S2, r);
+    permuteCore(w);
+    readCanonical(w, S1)
   };
 
   /// zeros[0] = 0 (the empty leaf); zeros[i+1] = compress(zeros[i], zeros[i]).
@@ -131,27 +204,37 @@ module {
   };
 
   /// Append one leaf: returns the updated frontier and the new root — the exact
-  /// `IncrementalTree::append` walk (32 compressions). Traps only on a full tree,
-  /// which `append` callers must pre-check exactly as the oracle does.
+  /// `IncrementalTree::append` walk (32 compressions, `cur` chained in Montgomery
+  /// form across levels). Traps only on a full tree, which callers must pre-check
+  /// exactly as the oracle does.
   public func append(frontier : Frontier, zeros : [Nat], leaf : Nat) : (Frontier, Nat) {
     if (frontier.nextIndex >= (1 : Nat64) << 32) { Runtime.trap("tree full") };
     let filled = Array.toVarArray<Nat>(frontier.filled);
+    let w = newArena();
+    loadMont(w, CUR, leaf);
     var idx = frontier.nextIndex;
-    var cur = leaf;
     var level : Nat = 0;
     while (level < DEPTH) {
       if (idx % 2 == 0) {
-        filled[level] := cur;
-        cur := merkleCompress(cur, zeros[level]);
+        filled[level] := readCanonical(w, CUR);
+        loadMont(w, SIB, zeros[level]);
+        F.setZero(w, S0);
+        F.copy(w, S1, w, CUR);
+        F.copy(w, S2, w, SIB);
       } else {
-        cur := merkleCompress(filled[level], cur);
+        loadMont(w, SIB, filled[level]);
+        F.setZero(w, S0);
+        F.copy(w, S1, w, SIB);
+        F.copy(w, S2, w, CUR);
       };
+      permuteCore(w);
+      F.copy(w, CUR, w, S1);
       idx /= 2;
       level += 1;
     };
     (
       { filled = Array.fromVarArray(filled); nextIndex = frontier.nextIndex + 1 },
-      cur,
+      readCanonical(w, CUR),
     )
   };
 
