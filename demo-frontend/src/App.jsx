@@ -9,7 +9,7 @@ import React, { useEffect, useMemo, useRef, useState, useCallback } from "react"
 import { Principal } from "@dfinity/principal";
 import { actorsFor, bytesToHex, hexToBytes } from "./ic.js";
 import { loadProver, loadProvingKeys } from "./prover.js";
-import { CANISTERS, BASE } from "./config.js";
+import { CANISTERS, BASE, BIRTHDAY_RECOVERY_ENABLED } from "./config.js";
 import { parseDemoAmount } from "./amounts.js";
 import * as W from "./wallet.js";
 import * as ledgerFeed from "./ledgerFeed.js";
@@ -174,8 +174,13 @@ export default function App() {
       throw new Error("This principal already has a different shielded address, but its legacy key is not available in this browser. Refusing to rotate it or strand funds.");
     } else {
       stageStep("Registering your shielded address on-chain…");
+      // Creation floor, sampled BEFORE register: a sender can only discover this pk via the
+      // directory AFTER registration, so no owned note can sit below this height. syncWallet
+      // publishes it (sealed) once the directory confirms no record exists — flag-gated.
+      const creationSample = BIRTHDAY_RECOVERY_ENABLED ? await W.recordBirthday(actors) : null;
       const res = await W.registerInDirectory(actors, secureAccount, encPkHex(secureAccount.encPk));
       if ("err" in res) throw new Error("registration failed: " + res.err);
+      if (creationSample != null) secureAccount.creationBirthday = creationSample;
       registered = true;
       addLog("you", deriveWithVetKey
         ? "II-bound shielded account registered: the private keys can be recovered after the same login"
@@ -264,7 +269,16 @@ export default function App() {
       note_root: bytesToHex(new Uint8Array(st.note_root)),
     });
     if (acc) {
-      const scan = await W.scanNotes(a, wasmRef.current, acc);
+      // ii-vetkey accounts go through the one-call sync (cursor + birthday + encrypted cache).
+      // With BIRTHDAY_RECOVERY_ENABLED unset this is byte-identical to the direct scanNotes
+      // genesis scan (no store, no directory birthday traffic); when set, a fresh device
+      // recovers its birthday from the vetKey-sealed directory record and scans [birthday, tip].
+      const scan = acc.custody === "ii-vetkey"
+        ? await W.syncWallet(a, wasmRef.current, acc, {
+            store: BIRTHDAY_RECOVERY_ENABLED ? W.indexedDbStore() : null,
+            creationBirthday: acc.creationBirthday ?? null,
+          })
+        : await W.scanNotes(a, wasmRef.current, acc);
       setShielded({ ...scan, scannedOnce: true });
     }
   }, [session]);
