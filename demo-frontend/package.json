@@ -11,6 +11,7 @@
     "test:amounts": "node scripts/test-amounts.mjs",
     "test:keyset-negative": "node scripts/test-keyset-negative.mjs",
     "test:static-boot": "node scripts/verify-static-boot.mjs",
+    "test:readpath": "node scripts/readpath/run-all.mjs",
     "verify:keyset": "node scripts/verify-keyset.mjs public/keys",
     "verify:keyset:production": "node scripts/verify-keyset.mjs public/keys --require-real-value"
   },
