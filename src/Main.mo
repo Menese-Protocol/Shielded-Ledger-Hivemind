@@ -35,6 +35,7 @@ import ICRC3 "ICRC3";
 import NoteAudit "NoteAudit";
 import NoteCodec "NoteCodec";
 import Pir2 "Pir2";
+import PoseidonTree "PoseidonTree";
 import StableBlobSet "StableBlobSet";
 import StableLog "StableLog";
 
@@ -272,6 +273,17 @@ persistent actor ZkLedger {
   transient var transfer_vk_flat : ?Groth16Multi.FlatVk = null;
   transient var deposit_vk_flat : ?Groth16Multi.FlatVk = null;
   var tree_state : ?TreeState = null;
+  // ==== in-canister Poseidon Merkle frontier (single switch, default OFF) ====
+  // OFF: byte-identical legacy — the tree oracle's returned root is trusted (the
+  // counterfeit-class exposure this flag closes). ON: the ledger computes every tree
+  // transition itself (`PoseidonTree.mo`, differentially gated against arkworks); an
+  // attached oracle is only a cross-check whose disagreement flips the sticky
+  // fail-closed guard, and with the oracle detached (`set_tree_oracle(null)`) the
+  // ledger stands alone. All-or-nothing: no per-path enable.
+  var tree_frontier_enabled : Bool = false;
+  // zeroHashes() is a pure function of the gate-validated constants (275M instr once);
+  // TRANSIENT: wiped by upgrades, rebuilt lazily — the FlatVk pattern.
+  transient var zero_hashes_cache : ?[Nat] = null;
   var note_root : Blob = "";
   let historical_roots = StableBlobSet.newState();
   let spent_nullifiers = StableBlobSet.newState();
@@ -1170,11 +1182,26 @@ persistent actor ZkLedger {
   };
 
   /// Fail-closed rejection for every state-mutating endpoint while the guard is set.
+  /// Audit failures keep their exact legacy string; a tree-frontier/oracle mismatch
+  /// (set only while the frontier flag is ON) carries its own prefix.
   func guardRejection() : ?Text {
     switch (guard_code) {
-      case (?code) ?("GUARDED:stable-state-audit-failed:" # code);
+      case (?code) {
+        if (Text.startsWith(code, #text "tree-frontier-mismatch")) return ?("GUARDED:" # code);
+        ?("GUARDED:stable-state-audit-failed:" # code)
+      };
       case null null;
     }
+  };
+
+  /// Flip the sticky fail-closed guard on an in-canister/oracle tree disagreement —
+  /// same mechanism, epoch bookkeeping, and clear path (`clear_audit_guard` after a
+  /// newer green audit) as an audit FAIL.
+  func flipFrontierGuard(detail : Text) {
+    if (guard_code == null) {
+      guard_code := ?("tree-frontier-mismatch:" # detail);
+      guard_epoch := audit_epoch;
+    };
   };
 
   system func postupgrade() {
@@ -1200,7 +1227,10 @@ persistent actor ZkLedger {
   };
 
   func configured() : Bool {
-    verifier_id != null and tree_oracle_id != null and tree_state != null
+    // with the in-canister frontier enabled the ledger no longer needs an oracle to
+    // compute transitions; flag OFF keeps the legacy requirement byte-identically.
+    verifier_id != null and tree_state != null and
+    (tree_oracle_id != null or tree_frontier_enabled)
   };
 
   func mutation(outcome : Text, verifierOutcome : Text) : MutationResult {
@@ -1310,6 +1340,106 @@ persistent actor ZkLedger {
 
   func currentTree() : TreeState {
     switch (tree_state) { case (?state) state; case null Runtime.trap("unconfigured") }
+  };
+
+  func frontierZeros() : [Nat] {
+    switch (zero_hashes_cache) {
+      case (?zeros) zeros;
+      case null {
+        let zeros = PoseidonTree.zeroHashes();
+        zero_hashes_cache := ?zeros;
+        zeros
+      };
+    }
+  };
+
+  /// The tree oracle's `append` computed in-canister: parse the wire frontier, run the
+  /// incremental-tree walk (`PoseidonTree.append`, arkworks-gated), emit the successor
+  /// state. Validation order and error strings mirror `tree_oracle/src/lib.rs` exactly
+  /// (frontier-length / leaf-count / tree-full / frontier-field / root-field /
+  /// leaf-field) so a cross-checked oracle can never disagree on the rejection surface.
+  func frontierAppend(state : TreeState, leaves : [Text]) : Result<TreeState> {
+    if (state.filled.size() != PoseidonTree.DEPTH) return #err("REJECT:frontier-length");
+    if (leaves.size() == 0 or leaves.size() > 2) return #err("REJECT:leaf-count");
+    if (state.next_index > ((1 : Nat64) << 32) -% Nat64.fromNat(leaves.size())) {
+      return #err("REJECT:tree-full");
+    };
+    let filled = Prim.Array_init<Nat>(PoseidonTree.DEPTH, 0);
+    var level : Nat = 0;
+    while (level < PoseidonTree.DEPTH) {
+      switch (PoseidonTree.hexToNat(state.filled[level])) {
+        case (?value) filled[level] := value;
+        case null return #err("REJECT:frontier-field");
+      };
+      level += 1;
+    };
+    if (PoseidonTree.hexToNat(state.root) == null) return #err("REJECT:root-field");
+    let parsedLeaves = Prim.Array_init<Nat>(leaves.size(), 0);
+    var i : Nat = 0;
+    while (i < leaves.size()) {
+      switch (PoseidonTree.hexToNat(leaves[i])) {
+        case (?value) parsedLeaves[i] := value;
+        case null return #err("REJECT:leaf-field");
+      };
+      i += 1;
+    };
+    let zeros = frontierZeros();
+    var frontier : PoseidonTree.Frontier = {
+      filled = Array.fromVarArray(filled);
+      nextIndex = state.next_index;
+    };
+    var root : Nat = 0;
+    i := 0;
+    while (i < leaves.size()) {
+      let (next, newRoot) = PoseidonTree.append(frontier, zeros, parsedLeaves[i]);
+      frontier := next;
+      root := newRoot;
+      i += 1;
+    };
+    #ok({
+      filled = Array.map<Nat, Text>(frontier.filled, PoseidonTree.natToHex);
+      root = PoseidonTree.natToHex(root);
+      next_index = frontier.nextIndex;
+    })
+  };
+
+  /// With the frontier flag ON, compute the in-canister transition BEFORE any await
+  /// (atomic against the pre-verdict state); returns null with the flag OFF.
+  func frontierLocalNext(state : TreeState, leaves : [Text]) : Result<?TreeState> {
+    if (not tree_frontier_enabled) return #ok(null);
+    switch (frontierAppend(state, leaves)) {
+      case (#ok(next)) #ok(?next);
+      case (#err(message)) #err(message);
+    }
+  };
+
+  func frontierMismatchDetail(local : TreeState, oracle : TreeState) : ?Text {
+    if (local.root != oracle.root) return ?("root:" # local.root # ":" # oracle.root);
+    if (local.next_index != oracle.next_index) return ?"next-index";
+    if (not Array.equal<Text>(local.filled, oracle.filled, Text.equal)) return ?"frontier-lanes";
+    null
+  };
+
+  /// Cross-check the oracle's transition against the in-canister one (flag ON with an
+  /// oracle attached). ANY disagreement flips the sticky fail-closed guard and rejects:
+  /// the in-canister computation is authoritative, so no oracle-injected root can reach
+  /// `historical_roots`. Returns the rejection message, or null when consistent.
+  func frontierCrossCheck(localNext : ?TreeState, oracleNext : TreeState, site : Text) : ?Text {
+    switch (localNext) {
+      case null null;
+      case (?local) {
+        switch (frontierMismatchDetail(local, oracleNext)) {
+          case null null;
+          case (?detail) {
+            flipFrontierGuard(site # ":" # detail);
+            switch (guardRejection()) {
+              case (?message) ?message;
+              case null ?"GUARDED:tree-frontier-mismatch";
+            }
+          };
+        }
+      };
+    }
   };
 
   // The verify boundary, in-process. Same verdict strings the Rust verifier canister returned
@@ -1487,6 +1617,56 @@ persistent actor ZkLedger {
     deposit_vk_flat := ?Groth16Multi.prepareFlatVk(depositPrepared);
     transfer_statement_version := 2;
     #ok(statusValue())
+  };
+
+  /// THE single switch for the in-canister Poseidon frontier. Admin-gated,
+  /// all-or-nothing, default OFF (= byte-identical legacy: oracle root trusted).
+  /// Enabling validates that the live wire frontier parses canonically (every filled
+  /// lane + root < r) and pre-warms the zero-hash cache so no user pays the one-time
+  /// init. Disabling requires an attached oracle (otherwise the ledger would have no
+  /// transition source at all).
+  public shared ({ caller }) func set_tree_frontier(enabled : Bool) : async Result<LedgerStatus> {
+    switch (guardRejection()) { case (?message) return #err(message); case null {} };
+    if (not isAdministrator(caller)) return #err("REJECT:not-administrator");
+    if (not configured()) return #err("REJECT:unconfigured");
+    if (pending_shield != null or pending_unshield != null) {
+      return #err("REJECT:pending-token-mutation");
+    };
+    if (enabled) {
+      let state = currentTree();
+      if (state.filled.size() != PoseidonTree.DEPTH) return #err("REJECT:frontier-length");
+      for (lane in state.filled.vals()) {
+        if (PoseidonTree.hexToNat(lane) == null) return #err("REJECT:frontier-field");
+      };
+      if (PoseidonTree.hexToNat(state.root) == null) return #err("REJECT:root-field");
+      ignore frontierZeros();
+    } else if (tree_oracle_id == null) {
+      return #err("REJECT:no-tree-oracle");
+    };
+    tree_frontier_enabled := enabled;
+    #ok(statusValue())
+  };
+
+  /// Attach or detach the tree oracle (admin). Detaching is permitted ONLY while the
+  /// in-canister frontier is enabled — with the oracle detached the ledger computes
+  /// every transition alone and the oracle is fully out of the root-trust base.
+  public shared ({ caller }) func set_tree_oracle(oracle : ?Principal) : async Result<LedgerStatus> {
+    switch (guardRejection()) { case (?message) return #err(message); case null {} };
+    if (not isAdministrator(caller)) return #err("REJECT:not-administrator");
+    if (not configured()) return #err("REJECT:unconfigured");
+    if (pending_shield != null or pending_unshield != null) {
+      return #err("REJECT:pending-token-mutation");
+    };
+    switch (oracle) {
+      case null { if (not tree_frontier_enabled) return #err("REJECT:frontier-disabled") };
+      case (?_) {};
+    };
+    tree_oracle_id := oracle;
+    #ok(statusValue())
+  };
+
+  public query func tree_frontier_status() : async { enabled : Bool; tree_oracle : ?Principal } {
+    { enabled = tree_frontier_enabled; tree_oracle = tree_oracle_id }
   };
 
   public shared ({ caller }) func configure_token_ledger(
@@ -1952,10 +2132,35 @@ persistent actor ZkLedger {
     let verdict = verifyShieldProof(args.proof_hex, inputs);
     if (verdict != "ACCEPT") return mutation(verdict, verdict);
 
-    let transition = try {
-      await treeActor().append(currentTree(), [blobToHex(args.commitment)])
-    } catch (error) {
-      return mutation("REJECT:tree-oracle-call:" # Error.message(error), verdict);
+    let treeBefore = currentTree();
+    let shieldLeaves = [blobToHex(args.commitment)];
+    // With the frontier flag ON the transition is computed in-canister BEFORE the
+    // await (no state window); flag OFF leaves this null and the legacy path unchanged.
+    let localNext = switch (frontierLocalNext(treeBefore, shieldLeaves)) {
+      case (#ok(value)) value;
+      case (#err(message)) return mutation(message, verdict);
+    };
+    let transition = switch (localNext) {
+      case (?local) {
+        if (tree_oracle_id == null) {
+          // frontier authoritative, oracle detached: the ledger stands alone.
+          { state = ?local; error = null } : TreeTransition
+        } else {
+          // oracle attached: still called, demoted to a cross-checked accelerator.
+          try {
+            await treeActor().append(treeBefore, shieldLeaves)
+          } catch (error) {
+            return mutation("REJECT:tree-oracle-call:" # Error.message(error), verdict);
+          }
+        }
+      };
+      case null {
+        try {
+          await treeActor().append(treeBefore, shieldLeaves)
+        } catch (error) {
+          return mutation("REJECT:tree-oracle-call:" # Error.message(error), verdict);
+        }
+      };
     };
     if (pending_shield != null or pending_unshield != null or epoch != startEpoch) {
       return mutation("REJECT:state-changed", verdict);
@@ -1963,6 +2168,10 @@ persistent actor ZkLedger {
     let next = switch (parseTransition(transition)) {
       case (#ok(state)) state;
       case (#err(message)) return mutation(message, verdict);
+    };
+    switch (frontierCrossCheck(localNext, next, "shield")) {
+      case (?message) return mutation(message, verdict);
+      case null {};
     };
     let rootAfter = switch (hexToBlob(next.root)) {
       case (?root) root;
@@ -2284,13 +2493,35 @@ persistent actor ZkLedger {
     let verdict = verifyTransferProof(args.proof_hex, inputs);
     if (verdict != "ACCEPT") return mutation(verdict, verdict);
 
-    let transition = try {
-      await treeActor().append(currentTree(), [
-        blobToHex(args.output_1.commitment),
-        blobToHex(args.output_2.commitment),
-      ])
-    } catch (error) {
-      return mutation("REJECT:tree-oracle-call:" # Error.message(error), verdict);
+    let treeBefore = currentTree();
+    let transferLeaves = [
+      blobToHex(args.output_1.commitment),
+      blobToHex(args.output_2.commitment),
+    ];
+    // In-canister transition first (flag ON), oracle demoted to cross-check.
+    let localNext = switch (frontierLocalNext(treeBefore, transferLeaves)) {
+      case (#ok(value)) value;
+      case (#err(message)) return mutation(message, verdict);
+    };
+    let transition = switch (localNext) {
+      case (?local) {
+        if (tree_oracle_id == null) {
+          { state = ?local; error = null } : TreeTransition
+        } else {
+          try {
+            await treeActor().append(treeBefore, transferLeaves)
+          } catch (error) {
+            return mutation("REJECT:tree-oracle-call:" # Error.message(error), verdict);
+          }
+        }
+      };
+      case null {
+        try {
+          await treeActor().append(treeBefore, transferLeaves)
+        } catch (error) {
+          return mutation("REJECT:tree-oracle-call:" # Error.message(error), verdict);
+        }
+      };
     };
     if (pending_shield != null or pending_unshield != null or epoch != startEpoch) {
       return mutation("REJECT:state-changed", verdict);
@@ -2304,6 +2535,10 @@ persistent actor ZkLedger {
     let next = switch (parseTransition(transition)) {
       case (#ok(state)) state;
       case (#err(message)) return mutation(message, verdict);
+    };
+    switch (frontierCrossCheck(localNext, next, "transfer")) {
+      case (?message) return mutation(message, verdict);
+      case null {};
     };
     let rootAfter = switch (hexToBlob(next.root)) {
       case (?root) root;
