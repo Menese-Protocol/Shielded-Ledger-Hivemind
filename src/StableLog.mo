@@ -117,7 +117,10 @@ module {
     hash.sum()
   };
 
-  public func validate(state : State) : Result<()> {
+  /// The O(1) header subset of validate(): magic, versions, header/state cross-checks,
+  /// bounds. Exactly validate()'s checks BEFORE its index walk, same error strings —
+  /// safe to run in postupgrade at any entry count.
+  public func validateHeader(state : State) : Result<()> {
     if (not state.initialized) return #err("stable-log:not-initialized");
     if (capacity(state.index_region) < HEADER_SIZE or capacity(state.data_region) < DATA_HEADER_SIZE) {
       return #err("stable-log:region-too-small");
@@ -144,10 +147,23 @@ module {
     if (state.data_offset < DATA_HEADER_SIZE or state.data_offset > capacity(state.data_region)) {
       return #err("stable-log:data-bounds");
     };
+    #ok(())
+  };
 
-    var expected_offset = DATA_HEADER_SIZE;
-    var index : Nat64 = 0;
-    while (index < state.entry_count) {
+  /// The contiguity walk over index entries [from, min(from+count, entry_count)),
+  /// chunk-safe: the caller carries the running expected_offset between chunks (start it
+  /// at dataStartOffset()). Same error strings as validate()'s walk; the caller performs
+  /// the final tail comparison against a data_offset captured at its phase start.
+  public func validateIndexRange(
+    state : State,
+    from : Nat64,
+    count : Nat64,
+    expected_offset_in : Nat64,
+  ) : Result<Nat64> {
+    var expected_offset = expected_offset_in;
+    var index = from;
+    let end = if (from + count > state.entry_count) state.entry_count else from + count;
+    while (index < end) {
       let index_offset = HEADER_SIZE + index * INDEX_ENTRY_SIZE;
       let data_offset = Region.loadNat64(state.index_region, index_offset);
       let data_length = Nat64.fromNat(
@@ -157,6 +173,21 @@ module {
       if (data_offset + data_length > state.data_offset) return #err("stable-log:entry-bounds");
       expected_offset += data_length;
       index += 1;
+    };
+    #ok(expected_offset)
+  };
+
+  /// First data offset (the walk's expected_offset seed) — the fixed data header size.
+  public func dataStartOffset() : Nat64 { DATA_HEADER_SIZE };
+
+  public func validate(state : State) : Result<()> {
+    switch (validateHeader(state)) {
+      case (#err(message)) return #err(message);
+      case (#ok(_)) {};
+    };
+    let expected_offset = switch (validateIndexRange(state, 0, state.entry_count, DATA_HEADER_SIZE)) {
+      case (#err(message)) return #err(message);
+      case (#ok(value)) value;
     };
     if (expected_offset != state.data_offset) return #err("stable-log:tail-offset");
     #ok(())

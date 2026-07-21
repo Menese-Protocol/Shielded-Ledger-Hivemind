@@ -189,7 +189,10 @@ module {
     current == 1
   };
 
-  public func validate(state : State) : Result<()> {
+  /// The O(1) header subset of validate(): magic, version, header/state cross-checks,
+  /// capacity/table bounds, load factor. Exactly validate()'s checks BEFORE its slot
+  /// walk, same error strings — safe to run in postupgrade at any capacity.
+  public func validateHeader(state : State) : Result<()> {
     if (not state.initialized) return #err("stable-set:not-initialized");
     if (regionCapacity(state) < HEADER_SIZE) return #err("stable-set:region-too-small");
     if (Region.loadBlob(state.region, 0, 8) != MAGIC) return #err("stable-set:magic");
@@ -209,13 +212,39 @@ module {
       return #err("stable-set:table-bounds");
     };
     if (state.entry_count * 10 > state.capacity * 7) return #err("stable-set:load-factor");
+    #ok(())
+  };
 
+  /// Slot-tag walk over slots [from, min(from+count, capacity_captured)) of a CAPTURED
+  /// table (offset + capacity captured at phase start, so a concurrent grow cannot move
+  /// the walk mid-phase; the caller detects the move and restarts). Returns the number
+  /// of occupied slots seen in the range; same error string as validate()'s walk.
+  public func countTagsRange(
+    state : State,
+    table_offset_captured : Nat64,
+    capacity_captured : Nat64,
+    from : Nat64,
+    count : Nat64,
+  ) : Result<Nat64> {
     var observed : Nat64 = 0;
-    var index : Nat64 = 0;
-    while (index < state.capacity) {
-      let tag = Region.loadNat8(state.region, slotOffset(state.table_offset, index));
+    var index = from;
+    let end = if (from + count > capacity_captured) capacity_captured else from + count;
+    while (index < end) {
+      let tag = Region.loadNat8(state.region, slotOffset(table_offset_captured, index));
       if (tag == 1) observed += 1 else if (tag != 0) return #err("stable-set:slot-tag");
       index += 1;
+    };
+    #ok(observed)
+  };
+
+  public func validate(state : State) : Result<()> {
+    switch (validateHeader(state)) {
+      case (#err(message)) return #err(message);
+      case (#ok(_)) {};
+    };
+    let observed = switch (countTagsRange(state, state.table_offset, state.capacity, 0, state.capacity)) {
+      case (#err(message)) return #err(message);
+      case (#ok(value)) value;
     };
     if (observed != state.entry_count) return #err("stable-set:observed-count");
     #ok(())
