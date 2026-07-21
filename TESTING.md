@@ -225,6 +225,38 @@ Run with `cd soak && cargo run --release --bin scale_tests`.
   encrypted selector per log record, so its payload grows with the log and it is not a
   soak-scale operation. The soak leaves PIR to the replica suite.
 
+## 3b. The PIR v2 harness: differential oracle + cost probes + privacy battery
+
+PIR v2 (`src/Pir2.mo`, default-off behind `pir2_enable`) is proven by an oracle-first harness
+that runs BEFORE the ledger integration is trusted: an independent Rust reference, on-replica
+cost probes, an inner-loop micro-bench, and a keyless-observer privacy battery.
+
+- **Differential oracle** — `POCKET_IC_BIN=… cargo run --release --manifest-path soak/Cargo.toml
+  --bin pir2_differential` (set `SEED` for the second seed). Feeds one seeded ≥144k-record,
+  multi-shard corpus with adversarial content (all-0xFF / oversized / empty / zero envelopes)
+  to both the production `Pir2.mo` server (under PocketIC) and the Rust reference
+  (`soak/src/pir2.rs`); byte-compares every stripe answer (several widths, full + partial
+  pins), the accumulated answer, sampled frozen-shard hints, record-stream slices, and the
+  certified chain + boundary digests; and round-trips every one of 1,000 queries to the exact
+  288-byte record with the commitment-prefix integrity check.
+- **Reference self-tests** — `cargo test --release --manifest-path soak/Cargo.toml --lib pir2`:
+  geometry vs spec constants, A-expansion pinned vectors, round-trip on adversarial envelopes,
+  stripe composition, pinning-under-growth, client-hint == server hint, chain tamper-detection,
+  wire, noise margin.
+- **Cost probe** — `cargo run --release --manifest-path soak/Cargo.toml --bin probe_pir_cost`:
+  append-path hint maintenance (flat across 10⁴/10⁶/10⁷), stripe instructions per multiply-add
+  and per stripe, query/response/record-stream wire bytes, hint-chunk serving, the metered
+  update-call dial, and the backfill-strategy comparison. Drives `tests/Pir2CostProbe.mo`.
+- **Inner-loop micro-bench** — `cargo run --release --manifest-path soak/Cargo.toml --bin
+  pir2_microbench`: seven candidate matvec loops on-replica, checksum-identical, so the
+  production loop is chosen by measured instructions/madd. Drives `tests/Pir2MicroBench.mo`.
+- **B12 privacy battery** — folded into `npm run test:readpath` (`b-p12-pir`): transcript
+  indistinguishability for different targets, selector-marginal chi-square (with a skew
+  self-test for teeth), a negative control that detects a leaking partial-schedule client,
+  match-independent shard set, and the uniform-scan schedule — two seeds, 11 checks.
+
+All numbers land in `docs/PIR-SPEC.md` §V2.7.
+
 ## 4. Motoko unit tests
 
 - `tests/ICRC3HashTest.mo`, `tests/ICRC2BlockTest.mo`: hashing and exact block matching

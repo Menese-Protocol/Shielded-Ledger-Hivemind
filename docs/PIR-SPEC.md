@@ -1,101 +1,213 @@
-# PIR specification: parameters, security estimate, and cost model
+# PIR specification: v1 linear baseline and v2 preprocessed query layer
 
-The ledger's `pir_query_lwe` endpoint lets a client read one record from the public commitment
-log without revealing which record it read. This document states the exact scheme, its
-parameters, what security is and is not claimed, and what it costs; the numbers here are the
-authoritative reference for the implementation in `demo-frontend/prover-wasm/src/lib.rs`
-(client) and `src/Main.mo` (ledger).
+The ledger lets a client read one record from the public commitment log without revealing
+which record it read. Two schemes coexist: **v1**, the linear LWE baseline (`pir_query_lwe`),
+kept as the simple, self-verifying reference; and **v2** (`pir2_*`, default-off behind
+`PIR_V2_ENABLED`), a SimplePIR-shaped query layer whose one-time hint is maintained
+*incrementally by the ledger itself* as the append-only log grows, so v2 scales to the 10⁸
+target while v1's query grows linearly and stops being transportable near ~400 records.
 
-## Scheme
+The authoritative implementations are `demo-frontend/prover-wasm/src/lib.rs` (v1 client),
+`src/Main.mo` (v1 endpoint), `src/Pir2.mo` (v2 module), and `soak/src/pir2.rs` (the v2
+differential reference). Every measured number below is produced by the probes named in §V2.7.
 
-Plain LWE (Regev-style) private information retrieval, one query bit per record.
+---
 
-The client encrypts a selector vector of `N` bits, one per record, where exactly the target
-record's bit is 1. For each of the record's 256 output bits, the ledger homomorphically sums
-the selector ciphertexts of every record whose public database bit is set. Branching in that
-scan depends only on the public database bit; the encrypted selector is never decrypted,
-inspected, or branched on. The response is 256 ciphertexts; the client decrypts each and
-rounds to recover the record.
+## Part I — v1: linear LWE baseline
 
-## Parameters
+Plain Regev LWE, one query bit per record.
+
+The client encrypts a selector vector of `N` bits, one per record, target bit 1. For each of
+the record's 256 output bits the ledger homomorphically sums the selector ciphertexts of
+every record whose public database bit is set. Branching depends only on the public database
+bit; the encrypted selector is never decrypted or branched on. The response is 256
+ciphertexts; the client decrypts and rounds.
+
+### Parameters
 
 | parameter | value | where |
 |---|---|---|
-| dimension `n` | 630 | `PIR_DIMENSION` / `LWE_DIMENSION` |
-| ciphertext modulus `q` | 2^64 (native wrapping `u64`/`Nat64`) | arithmetic type |
-| plaintext scale Δ | 2^63 (one bit per ciphertext) | `PIR_DELTA` |
-| decoding threshold | 2^62 | `PIR_ROUNDING` |
-| noise | rounded Gaussian, σ = 2^49 (Box–Muller over OS/browser entropy) | `PIR_NOISE_SIGMA` |
+| dimension `n` | 630 | `LWE_DIMENSION` |
+| modulus `q` | 2^64 (wrapping `Nat64`) | arithmetic type |
+| plaintext scale Δ | 2^63 | `PIR_DELTA` |
+| noise | rounded Gaussian, σ = 2^49 | `PIR_NOISE_SIGMA` |
 | secret | uniform binary, length 630, fresh per query | `pir_keygen` |
-| record width | 256 bits (the 32-byte note commitment) | `PIR_OUTPUT_BITS` / `RECORD_BITS` |
-| ciphertext | 630 × u64 (`a`) + 1 × u64 (`b`) = 5,048 bytes | wire structs |
+| record width | 256 bits (the 32-byte commitment) | `RECORD_BITS` |
+| ciphertext | 630×u64 + u64 = 5,048 B | wire structs |
 
-The ledger rejects, by trapping, any query whose selector count differs from the full note-log
-length or whose ciphertext dimension differs from 630. Coefficients travel as full-width 64-bit
-integers (strings in JSON on the frontend boundary, `nat64` in candid), so no coefficient is
-ever range-reduced by the transport.
+### Cost and boundary
 
-## Security estimate
+Query = N × 5,048 B (172 KB at N=34, 5.05 MB at N=1,000); response 256 × 5,048 B constant.
+The ~2 MiB ingress cap bounds a single-call query to ~400 records. v1 is the honest baseline
+— simple enough to verify, its privacy property checkable in the response — but linear query
+growth is why v2 exists. What v1 claims and does not claim (index privacy at the algorithmic
+level via full uniform scan + zero target-dependent branches; fresh-key queries; no claim
+against a malicious ledger beyond stale/fork detection via `snapshot_root`) is unchanged and
+still asserted by the security gate and `e2e.py`.
 
-The noise-to-modulus regime is `q/σ = 2^15` at dimension 630 with a binary secret. The closest
-well-studied reference point is FrodoKEM-640 (n = 640, `q/σ ≈ 2^13.5`), which targets NIST
-Level 1, roughly 128-bit classical security. This scheme sits in the same neighborhood with a
-slightly wider noise gap and a binary rather than small-Gaussian secret, both of which cost
-some margin; a first-order honest claim is therefore **on the order of 2^100–2^128 classical
-operations**, and a precise figure from the
-[lattice estimator](https://github.com/malb/lattice-estimator) is an open item that must be
-pinned before any real-value deployment.
+---
 
-What is claimed, precisely:
+## Part II — v2: preprocessed query layer (SimplePIR pattern, ledger-maintained hint)
 
-- **Index privacy at the algorithmic level.** The scan touches every record and performs no
-  target-dependent branch; each response reports `records_scanned` (always the full log) and
-  `target_dependent_branches` (always zero), and the security gate asserts both.
-- **Fresh-key queries.** The secret is generated per lookup and never reused, so query
-  repetition compounds no key exposure; each query is an independent LWE instance.
-- **Safe handling of malformed input.** Wrong selector counts and wrong dimensions trap before
-  any scan. All coefficient arithmetic is wrapping; a malformed coefficient value cannot leave
-  the `u64` domain, cannot trap mid-scan, and produces only garbage for the client to decrypt.
+### V2.0 Scheme
 
-What is **not** claimed:
+The note log is projected into fixed **R = 288-byte records**
+(`commitment(32) ‖ note_ciphertext[0..256)` zero-padded), arranged per shard as an
+`m_rows × m_cols` byte matrix D over Z_p in column-major record fill. The client downloads (or
+self-computes) a one-time **hint H = D·A**, then sends a single `m_cols`-length query vector
+`qu`; the server's whole work is the plain integer matrix-vector product `D·qu`, computed in
+public column-range stripes. The client recovers its record from `D·qu − (D·A)·s = Δ·D[:,c*]`.
 
-- Network- and transport-level metadata (that you queried at all, when, and from where) is out
-  of scope; PIR hides the index, not the act of querying.
-- No claim is made against a malicious ledger that returns wrong answers; the response carries
-  the certified `snapshot_root` so the client can detect a stale or forked view, but response
-  correctness against a fully malicious server is not part of the LWE PIR guarantee.
-- The parameter set has not yet been through the lattice estimator or independent review; see
-  the audit boundary in the README.
+The distinguishing property from textbook SimplePIR: **there is no offline preprocessing
+step.** The ledger is append-only, so each append folds exactly one column segment into H
+inside the same replicated, instruction-metered transaction that writes the note — the ledger
+IS the preprocessor, and consensus replicates it. Hint integrity therefore reduces to ledger
+certification (§V2.5), not to server honesty.
 
-## Cost model
+### V2.1 Parameters
 
-For a log of `N` records:
+| parameter | value |
+|---|---|
+| LWE dimension n | 1024 |
+| modulus q | 2³² (native wrapping `Nat32`/u32) |
+| plaintext p | 2⁸ (one cell = one byte) |
+| Δ | 2²⁴ |
+| noise σ | 6.4, rounded Gaussian, fresh per query (client-side) |
+| secret | uniform Z_q^n, fresh per query |
+| record R | 288 B = commitment(32) ‖ note_ciphertext[0..256) zero-padded |
+| shard size S | fixed at `pir2_enable`, certified in `pir2_params` (default 2²⁰) |
 
-| quantity | formula | at N = 34 (today) | at N = 1,000 |
-|---|---|---|---|
-| query size | N × 5,048 B | 172 KB | 5.05 MB |
-| response size | 256 × 5,048 B, **constant in N and in the target** | 1.26 MB | 1.26 MB |
-| ledger work | ≈ N × 256 × 631 / 2 wrapping adds (density ~½) | ~2.7M adds | ~80.7M adds |
+**Public matrix A** is expanded from a fixed nothing-up-my-sleeve constant — never chosen by
+any party, never shipped. Normative definition: for shard σ, column c, block
+k ∈ [0, n/8), `A[c, 8k..8k+8) = SHA-256("zk-ledger/pir2/v1/A" ‖ σ_le64 ‖ c_le64 ‖ k_le64)`
+read as 8 little-endian u32 words. Every client and the reference COMPILE IN the constant and
+MUST trap if `pir2_params` echoes a different one (certification proves what the canister
+says, not that a seed is honest; the compiled constant is the actual defense against a
+trapdoored A).
 
-Correctness has enormous margin: the summed error grows as σ·√N ≈ 2^49·√N against a decoding
-threshold of 2^62, so per-bit decoding failure stays negligible past 10^6 records; the message
-size limit binds long before the noise does.
+**Derived geometry** (pure integer function of S, R; `src/Pir2.mo:geometry`, byte-identical in
+the Rust reference and every client): `rpc = max(1, (isqrt(S·R)+R/2) div R)`,
+`m_rows = R·rpc`, `m_cols = ⌈S/rpc⌉`. Record i in a shard occupies column `i div rpc`, rows
+`[R·(i mod rpc), R·(i mod rpc)+R)`.
 
-## Known boundaries at scale
+At **S = 2²⁰**: rpc 60, m_rows 17,280, m_cols 17,477; query 69,908 B, response 69,120 B per
+stripe, hint 70.8 MB/shard. At 10⁸: 96 shards, D ≈ 28.8 GB, H ≈ 6.8 GB stable (inside the IC
+500 GiB stable bound).
 
-Two limits are stated openly rather than hidden:
+### V2.2 Correctness
 
-1. **Query size grows linearly.** The ingress message limit (~2 MB) bounds a single-call query
-   to roughly 400 records. Beyond that the query must be chunked across calls, or the scheme
-   upgraded to a batched or recursive PIR construction; that upgrade is the stated production
-   path, not an afterthought.
-2. **Query calls are unmetered on the Internet Computer.** A query costs the caller nothing
-   while the node performs the full linear scan, so at production scale a cheap caller can
-   force expensive work. The production design must bound this: moving heavy PIR behind
-   metered update calls, capping served log windows, or serving PIR from dedicated replicas.
-   For the valueless demo the exposure is accepted and documented.
+Client phase error = Σ_c D[r,c]·e_c over m_cols pinned columns. Worst case is
+adversary-chosen cells (envelope bytes are caller-controlled): all-255 gives
+std ≈ 6.4·255·√m_cols. At S = 2²⁰ (m_cols 17,477): std ≈ 2^17.7 vs Δ/2 = 2²³ → ≈39σ margin;
+uniform-byte data ≈67σ. Per-cell decode failure is negligible; the differential oracle
+verifies exact decode on every query and tolerates none.
 
-Linear-scan PIR is the honest baseline: it is simple enough to verify and its privacy property
-is checkable in the response itself. At meaningful ledger size the scan becomes the dominant
-cost even though it stays private; treating that as a scaling problem to engineer, rather than
-a reason to weaken the privacy property, is the design position of this repository.
+### V2.3 Security (open item to pin before real-value deployment)
+
+(n=1024, q=2³², σ=6.4, uniform secret) is SimplePIR's published parameter set (Henzinger et
+al., USENIX Sec 2023), which its authors audited with the lattice estimator at ≥128-bit
+classical. The exposure model this deployment must be estimated against: **m_cols LWE samples
+exposed per query under one fresh uniform secret; one fixed public A reused across all clients
+and queries per shard** (multi-secret LWE, standard hybrid argument); the hint is a public
+function of public (A, D) with no secret dependence. A lattice-estimator re-run at
+attacker-optimized sample count is REQUIRED before any real-value use; the identical-set
+citation and the correctness-side derivation are stated as provenance, not as the estimate.
+
+### V2.4 Query protocol and privacy invariants
+
+A client retrieving position `idx` in shard σ at pinned fill `f` (pinned to a column boundary
+by default, quantizing the sync-point fingerprint):
+
+1. `qu = A_σ·s + e + Δ·u_{c*}` over `m_cols(f)` columns, sent as a little-endian u32 Blob.
+2. Per stripe `pir2_query(σ, f, stripe, kCols, qu)` scans EXACTLY the stripe's pinned columns
+   — bounds are public functions of `(f, stripe)`, never of the target. Response = dense
+   `m_rows`-word partial vector + a trace (`cells_scanned`, `target_dependent_branches`,
+   `instructions`) + the current fill (client requires ≥ f, catching lagging replicas).
+3. Client sums the stripe partials and decodes its R rows; **integrity for free**: decrypted
+   cells [0..32) MUST equal the target's expected commitment from the detection stream, and
+   the envelope's Poly1305 authenticates the rest.
+
+**Client MUST-clauses (normative — a third-party client that violates them leaks):** always
+fetch the full hint; always run the full stripe schedule of the pinned fill; always both
+keyword candidates (§V2.6); pin fills to column boundaries. The privacy battery's oracle
+detects a partial-schedule client (B12 proof C).
+
+**Auditable invariants:** every stripe's trace carries `records_scanned = full stripe` and
+`target_dependent_branches = 0` as canister state, replayable by anyone. `answerStripe`
+carries no data-dependent branch on cell or query content.
+
+### V2.5 Certification — the on-chain novelty
+
+- **The ledger is the preprocessor.** Preprocessing is replicated, instruction-metered, and
+  transactional with the append. No offline step exists.
+- **Certified frozen hints.** Only frozen shards serve hint downloads. At freeze a chunked job
+  Merkle-digests 64 KB hint pages and publishes the root in the certified tree next to
+  `note_root`; `pir2_hint_chunk` responses verify against the IC certificate. SimplePIR's
+  silent-wrong-hint failure becomes detectable equivocation.
+- **Certified record stream.** `pir2_record_stream` serves densely packed
+  `(position 8B BE ‖ 288 cells)` (296 B/note, measured — the tail hint's verifiable inputs).
+  A per-append chained digest `chain_i = SHA-256(chain_{i−1} ‖ cells_i)` with boundaries every
+  4,096 records; the latest boundary lives in the certified tree, so a streaming client's
+  recomputed chain is anchored.
+- **Metering dial.** The striping design drops into metered update execution unchanged; the
+  demo ships the query path, and the paper prices the metered stripe.
+
+### V2.6 Epoch shards, uniform access, keyword mode
+
+Only the last shard is mutable; frozen shards (D, H, digests) are immutable forever. The
+client's hint acquisition AND query schedule are public functions of (birthday, tip, sync
+round) ONLY — never of matches: it queries every scheduled shard in [birthday, tip] each
+round with a dummy target where it has no match (LWE queries are indistinguishable, so the
+transcript is match-independent). The residual leak is the shard set itself — anonymity set
+per shard 2²⁰, not 10⁸ — and the transcript-indistinguishability is same-schedule scoped; both are
+stated, not hidden. A synced wallet computes the tail hint itself from `pir2_record_stream`
+(248 B/note marginal over today's 48 B detection entry) and downloads no hint; it queries only
+the tail shard.
+
+**Keyword mode** (fetch-by-commitment, for deep-restore repair) uses a STATIC per-shard cuckoo
+directory built at freeze (never on the append path — eviction contradicts write-once cells
+and would spike the money path), served through the same PIR machinery as a small second
+matrix; a client always reads both cuckoo candidates. Tail-shard keyword lookups use the
+camouflaged page path until freeze. Reference: keyword-PIR bucketing (Chor–Gilboa–Naor '98).
+
+### V2.7 Cost model (measured)
+
+Measured on PocketIC by `soak/src/bin/probe_pir_cost.rs` (driving `tests/Pir2CostProbe.mo`,
+the production `src/Pir2.mo` module) and the seven-variant inner-loop bench
+`tests/Pir2MicroBench.mo`. Geometry S = 2¹⁸ for the probe run (rpc 30, m_rows 8,640,
+m_cols 8,739); the stripe cost is a function of (kCols, m_rows) only, independent of N, so it
+IS the 10⁸-scale stripe measurement.
+
+| quantity | measured | note |
+|---|---|---|
+| append hint maintenance | 176.3M instr, 2.26 MB alloc / record | **flat across 10⁴/10⁶/10⁷**; small next to the ~9B-instr Groth16 verify already on the append path |
+| stripe matvec | 258–280 instr/madd; K=486 → 1.098e9 instr | `target_dependent_branches = 0`; **flat across tiers** |
+| inner loop | 283 instr/madd (pure-Nat32 widening) | measured winner of 7 variants (v6); vs 360 for the Nat64 shape |
+| query wire | 4·m_cols(pinned) | 34,956 B at a 2¹⁸ shard's full fill |
+| response wire | 4·m_rows = 34,560 B / stripe | ≪ 2 MiB per message |
+| record stream | 296 B/note (gate ≤ 296) | 248 B/note marginal over detection stream |
+| hint chunk serve | 1 MiB/call sustained | frozen-shard only |
+| backfill | heap-accumulated per shard, single flush | vs naive per-record RMW (~236 TB stable I/O at 10⁸ for 6.8 GB of output) |
+
+**Committed gates:** per-stripe ≤ 1.25×10⁹ instructions (4× headroom under the 5×10⁹ query
+budget); total response per full-shard query ≤ 2 MiB (⇒ ≤ 30 stripes ⇒ K derived from
+the probe). At S = 2²⁰: K ≈ 600 columns/stripe satisfies both.
+
+**Scaling law to 10⁸:** append and stripe costs are N-independent by construction and
+measured flat across three tiers; a full-size stripe at 10⁸-scale content is directly runnable
+(a stripe is bounded by (K, m_rows)). The 10⁸ table: 96 shards, query 69.9 KB/shard, response
+69.1 KB/stripe, hint 70.8 MB/frozen shard, append 176M instr — all measured constants.
+
+### V2.8 Flag, migration, boundaries
+
+`PIR_V2_ENABLED` (stable, default false) is armed by one-shot `pir2_enable(S)` (repeat traps;
+S immutable for the deployment's life; no disable surface). Flag off ⇒ the append path skips
+all maintenance and every v2 endpoint rejects; `pir_query_lwe` and all existing behavior are
+byte-identical. Enabling on a non-empty log starts a chunked heap-accumulated backfill; v2
+queries reject until it completes. New stable regions carry layout-version headers; postupgrade
+does O(1) header checks; `moc --stable-compatible` old→new (old = public `08ff678`) passes and
+the candid diff is additive-only.
+
+Stated boundaries: query calls remain unmetered on the IC (the metering dial answers this at
+production scale); the shard-set access pattern leaks epoch-granularity membership (2²⁰
+anonymity set); and the security parameter pin (§V2.3) is an open operator-gate item.
