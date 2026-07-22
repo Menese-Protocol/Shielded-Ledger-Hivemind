@@ -76,7 +76,7 @@ export function keygen(next) {
   return s;
 }
 
-function gaussian(next) {
+export function gaussian(next) {
   const scale = 2 ** 53;
   const a = ((next() * 2 ** 32 + next()) / 2 ** 11 + 1) / (scale + 1);
   const b = ((next() * 2 ** 32 + next()) / 2 ** 11 + 1) / (scale + 1);
