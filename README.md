@@ -131,9 +131,14 @@ The ledger exposes an LWE-based private information retrieval endpoint, `pir_que
 client encrypts its selector, so no index travels on the wire; the ledger performs the same
 uniform scan over every record regardless of the target; the client decrypts the answer
 locally. Every response reports `records_scanned` (always all of them) and
-`target_dependent_branches` (always zero), and the security gate asserts both. The exact LWE
-parameters, the claimed security level, the cost model, and the stated scaling boundaries are
-in [`docs/PIR-SPEC.md`](docs/PIR-SPEC.md).
+`target_dependent_branches` (always zero), and the security gate asserts both.
+
+The deployed parameter set (n = 1152, q = 2³², σ = 12.8, uniform secret, fresh per query) is
+pinned by a direct lattice-estimator run against the deployment's exact exposure model: the
+cheapest known lattice attack costs ≈ 2¹⁴⁷·⁷ classical operations, comfortably above the
+128-bit bar, while the worst-case decode margin stays at 19σ. The full parameter table, the
+estimate, the cost model, and the stated scaling boundaries are in
+[`docs/PIR-SPEC.md`](docs/PIR-SPEC.md).
 
 *The ledger answers without knowing the question.*
 

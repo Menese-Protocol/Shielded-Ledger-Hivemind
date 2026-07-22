@@ -213,4 +213,5 @@ the candid diff is additive-only.
 
 Stated boundaries: query calls remain unmetered on the IC (the metering dial answers this at
 production scale); the shard-set access pattern leaks epoch-granularity membership (2²⁰
-anonymity set); and the security parameter pin (§V2.3) is an open operator-gate item.
+anonymity set); and the security parameter set is pinned by the estimator run in §V2.3 —
+any future parameter change re-triggers that estimate before deployment.
