@@ -17,7 +17,28 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 if [[ "${1:-}" == "--fast" ]]; then
-  export FORTRESS_DIV=1000 FORTRESS_META_N=8 FORTRESS_INV_OPS=200000 FORTRESS_SC_N=12 FORTRESS_FUZZ_RUNS=20000
+  # smoke pass — minimal tiers to prove the wiring, seconds-to-minutes per section.
+  export FORTRESS_DIV=1000 FORTRESS_META_N=8 FORTRESS_INV_OPS=200000 FORTRESS_SC_N=12 \
+         FORTRESS_FUZZ_RUNS=20000 FORTRESS_PROP_SCALE=1000 FORTRESS_FUZZMO_SCALE=1000 \
+         FORTRESS_SEAM_INJECTIONS=5 FORTRESS_SC_PROBES=200
+else
+  # GATE TIER (default): substantial, deterministic, fits the <=3h budget when run
+  # SEQUENTIALLY. The FULL committed tiers (§2 millions, §3 100k/family, §6 200, §9 2M, §10
+  # 2000 probes, §7 250k/decoder) are each run separately for the evidence packet
+  # (for-team/EVIDENCE-fortress.md) — override any knob below to reproduce a full tier, e.g.
+  # FORTRESS_PROP_SCALE=1 scripts/fortress-properties.sh. Only knobs not already set win.
+  : "${FORTRESS_DIV:=1}"                 # §2 full millions (fast: bigint ops are cheap)
+  : "${FORTRESS_PROP_SCALE:=20}"         # §3 5k/family (100k full is ~30min alone)
+  : "${FORTRESS_META_N:=40}"             # §6 40 bases (200 full)
+  : "${FORTRESS_INV_OPS:=2000000}"       # §9 model tier full 2M (fast, native)
+  : "${FORTRESS_SEAM_INJECTIONS:=25}"    # §9 live seams full 25/seam
+  : "${FORTRESS_SC_N:=40}"               # §10 pairs
+  : "${FORTRESS_SC_PROBES:=500}"         # §10 sweep (2000 full)
+  : "${FORTRESS_FUZZ_RUNS:=200000}"      # §7 cargo-fuzz full 200k/target
+  : "${FORTRESS_FUZZMO_SCALE:=20}"       # §7 Motoko 12.5k/decoder (250k full)
+  export FORTRESS_DIV FORTRESS_PROP_SCALE FORTRESS_META_N FORTRESS_INV_OPS \
+         FORTRESS_SEAM_INJECTIONS FORTRESS_SC_N FORTRESS_SC_PROBES FORTRESS_FUZZ_RUNS \
+         FORTRESS_FUZZMO_SCALE
 fi
 
 MOC="$(dfx cache show)/moc"
@@ -35,11 +56,14 @@ run() { # run <label> <command...>
 banner "build fortress + soak drivers"
 cargo build --release -p fortress
 cargo build --release --manifest-path circuit/Cargo.toml -p gen --features bls12-381 --bin circuit_oracle
-cargo build --release --manifest-path soak/Cargo.toml --bin taxonomy_gate --bin metamorphic_gate --bin invariant_model_tier --bin sidechannel_gate
+cargo build --release --manifest-path soak/Cargo.toml --bin taxonomy_gate --bin metamorphic_gate --bin invariant_model_tier --bin sidechannel_gate --bin seam_battery
 
-# §2/§3 arithmetic differential + algebraic properties (+ teeth)
-run "§2/§3 arithmetic differential" ./scripts/fortress-arith.sh
-run "§2/§3 teeth" ./scripts/fortress-teeth.sh
+# §2 arithmetic differential (+ teeth)
+run "§2 arithmetic differential" ./scripts/fortress-arith.sh
+run "§2 teeth" ./scripts/fortress-teeth.sh
+
+# §3 algebraic-property battery (a DISTINCT detector class) (+ teeth)
+run "§3 algebraic properties" ./scripts/fortress-properties.sh
 
 # §4 independent reference model + violation matrix (+ teeth)
 run "§4 reference model" ./scripts/fortress-refmodel.sh
@@ -57,6 +81,9 @@ run "§6 metamorphic" ./scripts/fortress-metamorphic.sh
 # §9 stateful invariants, model tier (+ teeth)
 run "§9 invariant model tier" ./scripts/fortress-invariant-model.sh
 
+# §9 live in-canister seam battery (+ double-mint teeth) — PocketIC + hook wasm
+run "§9 live seams" ./scripts/fortress-seam.sh
+
 # §10 differential side-channel (+ teeth) — PocketIC
 run "§10 side-channel" ./scripts/fortress-sidechannel.sh
 
@@ -72,6 +99,9 @@ elif [[ $fz -eq 2 ]]; then
 else
   echo "[§7 fuzz] FAIL" >&2; fail=1
 fi
+
+# §7 Motoko-side decoder robustness battery (the decoders cargo-fuzz can't reach)
+run "§7 Motoko decoder battery" ./scripts/fortress-fuzz-motoko.sh
 
 # Ceremony cross-language PoK verifier (extend existing coverage into the gate)
 banner "ceremony PoK Motoko==Rust vector"

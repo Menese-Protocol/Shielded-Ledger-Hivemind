@@ -25,13 +25,14 @@ RED, the detector has regressed and the gate fails.
 | § | Detector | What it proves | Teeth (planted bug → RED) |
 |---|---|---|---|
 | §1 | Three-verifier taxonomy | The production Motoko verifier (on PocketIC, the shipped L3 path), arkworks, and blst agree on accept/reject across a 1017-case mutation taxonomy | one wrong Montgomery limb makes Motoko diverge from ark/blst |
-| §2/§3 | Per-op arithmetic differential + algebraic properties | 63 op classes of the production Motoko field/tower/curve/pairing/decode layers match an independent arkworks/blst oracle over millions of seeded cases | wrong RR/PINV limb, wrong modulus bit, broken Fp2 mul, wrong curve b |
+| §2 | Per-op arithmetic differential | 63 op classes of the production Motoko field/tower/curve/pairing/decode layers match an independent arkworks/blst oracle over millions of seeded cases | wrong RR/PINV limb, wrong modulus bit, broken Fp2 mul, wrong curve b |
+| §3 | Algebraic properties | Field/curve/pairing identities hold on the production L2/L3 layers (field 100k/family incl a·a⁻¹=1, sqr=mul, Frobenius order; curve [a+b]P=[a]P+[b]P, [r]P=O, [2]P=P+P; pairing bilinearity, additivity, degeneracy) | a broken-distributivity Fp2 mutant |
 | §4 | Independent reference model + violation matrix | An independent (stdlib-Python) Poseidon + circuit model reproduces every production value; 13 single-rule circuit violations are all unsatisfiable | non-stdlib import, wrong round constant, a satisfied violation |
 | §5 | Under-constrained detection | Every one of the transfer circuit's 20,213 witness variables is constrained and noticed; no unconstrained witnesses | a planted dead witness + a boolean missing its booleanity |
 | §6 | Metamorphic | Validity-preserving proof transforms stay accepted; validity-destroying transforms are rejected — all 3-way | a destroying transform mislabeled preserving |
-| §7 | Coverage-guided fuzzing | Every wire/crypto decoder is a total function on arbitrary bytes (no panic, no unbounded allocation) | a decoder with a deliberate out-of-bounds panic |
-| §9 | Stateful financial invariants (model tier) | Across 2,000,000 seeded ops the custody/pool/conservation/nullifier invariants hold after every op, with atomic rollback at every seam | a double-mint credited without matching custody |
-| §10 | Differential side-channel | A secret bit is not recoverable from the production verify's instruction-count class; response size/error class constant | a branch keyed on that secret bit |
+| §7 | Coverage-guided fuzzing | Ten cargo-fuzz decoder targets + a Motoko-side battery (≥250k inputs/decoder): every wire/crypto/ceremony/ICRC-3/checkpoint decoder is total on arbitrary bytes (no panic, no unbounded alloc, no non-canonical accept) | a decoder with a deliberate out-of-bounds panic |
+| §9 | Stateful financial invariants | Model tier: 2,000,000 seeded ops, custody/pool/conservation/nullifier invariants hold after every op with atomic seam rollback. Live tier: the two remaining in-canister seams (during-token-call, during-cert-update) injected via hook wasm, ≥25 each, every message rolled back | a double-mint credited without matching custody |
+| §10 | Differential side-channel | Across transfer/shield/unshield verify classes (≥200 pairs) + a 2000-probe resource-difference sweep over 64 candidate bits, no secret bit is recoverable from the instruction-count class; response size/error class constant | a branch keyed on a secret bit |
 | ceremony | PoK cross-language | The Motoko on-chain PoK verifier accepts a genuine Rust-produced ceremony contribution and rejects tampered/wrong/identity ones | (existing negative controls in the vector) |
 
 ## Proven vs. testimonial — the honest boundaries
@@ -62,17 +63,17 @@ RED, the detector has regressed and the gate fails.
   time (the IC does not offer it). It proves no *observable secret-dependent class*, not
   bit-exact timing invariance. Benign data-dependent variation from scalar-multiplication bit
   patterns is present and expected (~0.05% of the verify).
-- **§9 live in-canister seams** — the model tier proves the invariant algebra at 2M-op scale;
-  the live stateful tier is the `soak/` suite, which drives the real canister and already
-  exercises seams *before-ledger-call* (insufficient-allowance rejection), *after-success-
-  before-commit* (the shipped `trapAfterToken` fault-arm), *during-upgrade* (upgrades under
-  load), and *during-recovery* (`resume_shield`/`resume_unshield`). Seam *during-commit* is
-  N/A by construction — the finalize is a single no-await region the IC rolls back atomically,
-  so a trap there cannot leave partial state (asserted by the model tier's atomic-rollback
-  invariant). The two remaining in-canister injection points (*during the token call* and
-  *during certified-state update*) are covered abstractly by the model tier; wiring their
-  live fixture/hook injection is the one scheduled extension, its design in
-  `for-team/THRESHOLDS-fortress.md` §9 — **pending operator approval, proposal there**.
+- **§9 live in-canister seams** — the model tier proves the invariant algebra at 2M-op scale.
+  The live stateful tier is the `soak/` suite (seams before-ledger-call, after-success-
+  before-commit via the shipped `trapAfterToken`, during-upgrade, during-recovery) PLUS the
+  fortress seam battery (`scripts/fortress-seam.sh`), which wires the two remaining seams —
+  *during the token call* (the token fixture traps `transfer_from` mid-shield → the backend
+  rolls back the pending intent) and *during certified-state update* (the hook calls the real
+  `refreshCertification()` then traps → the IC rolls the cert update back atomically), 25
+  injections each, all verified rolled back. Every seam hook lives in the hook wasm
+  (`build-test-wasm.sh`, additive-only; the shipped `zk_ledger.wasm` is byte-identical). Seam
+  *during-commit* remains N/A by construction — the finalize is a single no-await region the
+  IC rolls back atomically (asserted by the model tier's atomic-rollback invariant).
 
 ## Determinism
 
