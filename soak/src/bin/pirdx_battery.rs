@@ -136,13 +136,13 @@ impl<'a> Ledger<'a> {
         }
     }
     fn reindex(&self, from_shard: u64) -> Result2<Pir2StatusV> {
-        let r: ct::MotokoResult<Pir2StatusV> = self
+        let r: std::result::Result<ct::MotokoResult<Pir2StatusV>, String> = self
             .env
-            .update(self.env.ledger, self.env.admin, "pir2_reindex", (Nat::from(from_shard),))
-            .expect("pir2_reindex call");
+            .update(self.env.ledger, self.env.admin, "pir2_reindex", (Nat::from(from_shard),));
         match r {
-            ct::MotokoResult::ok(s) => Ok(s),
-            ct::MotokoResult::err(e) => Err(e),
+            Ok(ct::MotokoResult::ok(s)) => Ok(s),
+            Ok(ct::MotokoResult::err(e)) => Err(e),
+            Err(transport) => Err(transport),
         }
     }
     fn query_stripe(
@@ -451,11 +451,10 @@ fn phase_d1(ctx: &mut Ctx, shard_size: u64) {
                 "RED AC-D1 UNEXPECTED: transfers survived on the synchronous build — coupling not present?"
             ),
         }
-        let l = ctx.ledger();
-        l.arm_fold_trap(0);
-        drop(l);
-        ctx.runner.step_ops(2); // prove the ledger recovers once disarmed
-        println!("RED AC-D1: ledger recovers after disarm (2 ops committed)");
+        // NOTE: after the mid-op trap the runner's model and the canister diverge (the
+        // trap wedged a two-phase shield with a stuck pending intent — the blast radius
+        // of the coupling includes blocked token mutations). No further ops on this env.
+        println!("RED AC-D1: blast radius includes a wedged two-phase shield (pending intent stuck)");
     }
 }
 
@@ -716,6 +715,13 @@ fn main() {
             const S: u64 = 64; // small shard: freezes inside the corpus; NOT a DPAGE multiple
             {
                 let mut ctx = mk(1, "d1");
+                if !expect_decoupled {
+                    // RED AC-D4: no repair surface exists on the synchronous build
+                    match ctx.ledger().reindex(0) {
+                        Err(e) => println!("RED AC-D4 CONFIRMED: no repair surface ({e})"),
+                        Ok(_) => panic!("RED AC-D4: reindex exists on the synchronous build?"),
+                    }
+                }
                 phase_d1(&mut ctx, S);
                 if expect_decoupled {
                     phase_d3(&mut ctx, S);
@@ -727,8 +733,6 @@ fn main() {
                     // state exactly as the independent model demands.
                     let (battery, state_hash, blocks) = ctx.runner.verify_full();
                     println!("[small] verify_full: {} battery lines, {blocks} blocks, STATE-HASH {state_hash}", battery.len());
-                } else {
-                    phase_d4(&mut ctx, S); // RED: no repair surface
                 }
             }
             {

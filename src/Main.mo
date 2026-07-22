@@ -120,6 +120,10 @@ persistent actor ZkLedger {
     nullifier_count : Nat;
     pool_value : Nat;
     epoch : Nat;
+    // instructions executed in the current message slice when the response was built
+    // (PostupgradeStats precedent) — the money-path cost telemetry the derived-index
+    // decoupling battery asserts on (AC-D6: flag-on delta vs flag-off ≈ 0)
+    instructions : Nat64;
   };
 
   public type LedgerStatus = {
@@ -293,17 +297,40 @@ persistent actor ZkLedger {
   let note_log = StableLog.newState();
 
   // ==== PIR v2 query layer (default OFF; src/Pir2.mo) ====
-  // Additive and gated: while `pir2_state.enabled` is false the append path skips all v2
-  // maintenance and every v2 endpoint rejects, so an unset deployment is byte-identical to
-  // the pre-v2 ledger. `pir2_enable` arms it and, on a non-empty log, drives a chunked
-  // timer backfill that folds the existing note log into the matrix and hint before v2
-  // queries are answered. Cursor + flag are stable (survive upgrades; backfill resumes).
+  // Additive and gated: while `pir2_state.enabled` is false the append path carries no v2
+  // code, no timer is armed, and every v2 endpoint rejects, so an unset deployment is
+  // byte-identical to the pre-v2 ledger.
+  //
+  // DERIVED-INDEX DECOUPLING (for-team proposal, Phase-0 amended): the financial append is
+  // authoritative and complete WITHOUT the PIR index; a background fold driver trails it
+  // with the freshness cursor `pir2_state.record_count` (== the `indexed_upto` watermark —
+  // ONE variable, never two). All fold work — initial backfill after `pir2_enable`,
+  // steady-state catch-up, and repair refolds — runs through one awaited self-call chunk
+  // (`__pir2_fold_chunk`, audit-tick pattern) driven by a 2s recurring watchdog plus a
+  // chained fast path while behind. A trapping chunk is caught in the driver, recorded
+  // (#degraded + last error), and retried with exponential backoff; the money path is
+  // unaffected by construction. While the sticky audit guard is set the fold pauses
+  // (fail-closed extends to derived state).
   let pir2_state = Pir2.newState();
   var pir2_backfilling : Bool = false;
   var pir2_backfill_cursor : Nat = 0;
-  // Records per backfill tick — the per-record fold is ~176M instr (measured), so a chunk of
-  // 20 stays well under the 5B/message budget with headroom for the tick's own overhead.
+  // Records per fold chunk — the per-record fold is ~198M instr (measured, n=1152), so a
+  // chunk of 20 (~4.0e9 + decode overhead) stays under the 5e9 committed budget.
   let PIR2_BACKFILL_PER_TICK : Nat = 20;
+  let PIR2_FOLD_FAILURE_LIMIT : Nat = 3;
+  let PIR2_CHAIN_REPLAY_PER_CHUNK : Nat = 256;
+  let PIR2_ZERO_BYTES_PER_CHUNK : Nat64 = 8_388_608;
+  var pir2_fold_retries : Nat = 0;
+  var pir2_last_fold_error : ?Text = null;
+  var pir2_fold_backoff_until : Nat64 = 0;
+  var pir2_last_chunk_instructions : Nat64 = 0;
+  // Repair state machine (stable — an upgrade mid-repair MUST resume, or a half-zeroed hint
+  // region would be refolded over dirty bytes): chain replay from the DPAGE checkpoint up to
+  // the reset point, then chunked zeroing of every affected shard's hint span, then the
+  // normal catch-up refolds from the rewound cursor.
+  var pir2_repair : ?Pir2Repair = null;
+  transient var pir2_fold_inflight : Bool = false;
+  transient var pir2_driver_armed : Bool = false;
   var last_block_hash : ?Blob = null;
   var pool_value : Nat = 0;
   var epoch : Nat = 0;
@@ -598,6 +625,24 @@ persistent actor ZkLedger {
       encoding_version = ENCODING_VERSION;
       archive_manifest = archiveManifest();
       audit_digest = auditLeafDigest();
+      pir2_boundary = pir2BoundaryLeaf();
+    }
+  };
+
+  /// Certified anchor for the pir2 record stream: digest(32) ‖ covered-count(8B BE), present
+  /// only when pir2 is enabled and a DPAGE boundary exists — the flag-off certified tree is
+  /// byte-identical to the pre-pir2 one (spec §V2.5; Phase-0 delta D7).
+  func pir2BoundaryLeaf() : ?Blob {
+    if (not pir2_state.enabled) return null;
+    switch (Pir2.latestBoundary(pir2_state)) {
+      case (?(digest, covered)) {
+        let bytes = List.empty<Nat8>();
+        for (byte in digest.values()) List.add(bytes, byte);
+        var k : Nat = 8;
+        while (k > 0) { k -= 1; List.add(bytes, Nat8.fromNat((covered / (256 ** k)) % 256)) };
+        ?Blob.fromArray(List.toArray(bytes))
+      };
+      case null null;
     }
   };
 
@@ -1073,6 +1118,17 @@ persistent actor ZkLedger {
 
   // ==== PIR v2 admin + backfill + query surface (all additive) ====
 
+  public type Pir2IndexStatus = { #ok; #catching_up; #degraded; #repairing };
+  public type Pir2RepairPhase = {
+    #chain_replay : { next : Nat; upto : Nat };
+    #zeroing : { shard : Nat; offset : Nat64 };
+  };
+  public type Pir2Repair = {
+    from_shard : Nat;
+    last_shard : Nat;
+    phase : Pir2RepairPhase;
+  };
+  public type Pir2RepairStatus = { from_shard : Nat; phase : Text };
   public type Pir2Status = {
     enabled : Bool;
     backfilling : Bool;
@@ -1080,6 +1136,17 @@ persistent actor ZkLedger {
     shard_size : Nat;
     record_count : Nat;
     note_count : Nat;
+    // derived-index surface (all additive): the freshness watermark and the health of the
+    // background fold driver — the ops dashboard for reviewer point #5's containment story
+    indexed_upto : Nat;
+    lag : Nat;
+    index_status : Pir2IndexStatus;
+    last_fold_error : ?Text;
+    fold_retries : Nat;
+    fold_inflight : Bool;
+    fold_trap_armed : Nat;
+    last_chunk_instructions : Nat64;
+    repair : ?Pir2RepairStatus;
   };
   public type Pir2Params = {
     lwe_dimension : Nat;
@@ -1092,19 +1159,44 @@ persistent actor ZkLedger {
   };
 
   func pir2StatusValue() : Pir2Status {
+    let notes = noteCount();
+    let indexed = pir2_state.record_count;
+    let lag = if (notes > indexed) notes - indexed else 0;
     {
       enabled = pir2_state.enabled;
       backfilling = pir2_backfilling;
       backfill_cursor = pir2_backfill_cursor;
       shard_size = pir2_state.shard_size;
-      record_count = pir2_state.record_count;
-      note_count = noteCount();
+      record_count = indexed;
+      note_count = notes;
+      indexed_upto = indexed;
+      lag;
+      index_status = if (pir2_repair != null) #repairing
+        else if (pir2_fold_retries >= PIR2_FOLD_FAILURE_LIMIT) #degraded
+        else if (lag > 0) #catching_up
+        else #ok;
+      last_fold_error = pir2_last_fold_error;
+      fold_retries = pir2_fold_retries;
+      fold_inflight = pir2_fold_inflight;
+      fold_trap_armed = test_pir2_fold_trap_remaining;
+      last_chunk_instructions = pir2_last_chunk_instructions;
+      repair = switch (pir2_repair) {
+        case (?r) ?{
+          from_shard = r.from_shard;
+          phase = switch (r.phase) {
+            case (#chain_replay(_)) "chain_replay";
+            case (#zeroing(_)) "zeroing";
+          };
+        };
+        case null null;
+      };
     }
   };
 
   /// One-shot arm of the PIR v2 layer (admin). Sets the shard size (immutable thereafter),
-  /// initializes the v2 regions, and — if the note log is non-empty — starts a chunked
-  /// backfill; v2 queries reject until it completes.
+  /// initializes the v2 regions, and arms the background fold driver — on a non-empty log
+  /// the driver's catch-up IS the backfill (cursor 0 → tail). Queries serve any pin at or
+  /// below the watermark from the first folded record on.
   public shared ({ caller }) func pir2_enable(shardSize : Nat) : async Result<Pir2Status> {
     if (not isAdministrator(caller)) return #err("REJECT:not-administrator");
     switch (guardRejection()) { case (?message) return #err(message); case null {} };
@@ -1114,30 +1206,163 @@ persistent actor ZkLedger {
     if (noteCount() > 0) {
       pir2_backfilling := true;
       pir2_backfill_cursor := 0;
-      ignore Timer.setTimer<system>(#seconds 0, pir2BackfillTick);
     };
+    pir2ArmDriver<system>();
+    ignore Timer.setTimer<system>(#seconds 0, pir2DriverTick);
     #ok(pir2StatusValue())
   };
 
-  /// One backfill chunk: fold up to PIR2_BACKFILL_PER_TICK log records into the matrix + hint,
-  /// then re-arm until the cursor catches the (possibly growing) tail. Uses the exact live
-  /// fold (Pir2.append reads commitment + ciphertext from the decoded block), so a
-  /// backfilled state is bit-identical to one built incrementally.
-  func pir2BackfillTick() : async () {
-    if (not pir2_backfilling) return;
-    maybeTrapPir2Fold();
+  func pir2Behind() : Bool {
+    pir2_repair != null or pir2_state.record_count < noteCount()
+  };
+
+  /// Arm the recurring fold watchdog (idempotent per process lifetime; transient flag —
+  /// postupgrade re-arms). ONLY armed when pir2 is enabled: a flag-off deployment runs no
+  /// timers and is message-for-message identical to the pre-v2 ledger.
+  func pir2ArmDriver<system>() {
+    if (pir2_driver_armed) return;
+    pir2_driver_armed := true;
+    ignore Timer.recurringTimer<system>(#seconds 2, pir2DriverTick);
+  };
+
+  type Pir2FoldSelf = actor { __pir2_fold_chunk : shared (Bool) -> async Bool };
+
+  /// The fold driver tick (audit-tick pattern, Phase-0 delta D4): one awaited self-call per
+  /// tick so a trapping chunk rolls back ONLY the chunk — the catch arm here always commits
+  /// the failure record and the backoff. The idle path is O(1) and self-call-free. While the
+  /// sticky audit guard is set the driver pauses: fail-closed extends to derived state (D17).
+  func pir2DriverTick() : async () {
+    if (not pir2_state.enabled) return;
+    if (pir2_fold_inflight) return;
+    if (guard_code != null) return;
+    if (not pir2Behind()) return;
+    if (nowNat64() < pir2_fold_backoff_until) return;
+    pir2_fold_inflight := true;
+    var progressed = false;
+    // Test-fault consumption commits at the await below, so an armed burst is finite even
+    // though each faulted chunk itself rolls back (AC-D1 injection semantics).
+    let trapNow = test_pir2_fold_trap_remaining > 0;
+    if (trapNow) test_pir2_fold_trap_remaining -= 1;
+    try {
+      let self : Pir2FoldSelf = actor (Principal.toText(selfPrincipal()));
+      progressed := await self.__pir2_fold_chunk(trapNow);
+      pir2_fold_retries := 0;
+      pir2_last_fold_error := null;
+      pir2_fold_backoff_until := 0;
+    } catch (e) {
+      pir2_fold_retries += 1;
+      let prefix = switch (Error.code(e)) {
+        case (#canister_error) "pir2-fold-trap:";
+        case (_) "pir2-fold-transient:";
+      };
+      pir2_last_fold_error := ?(prefix # Error.message(e));
+      // exponential backoff, capped at 64s; the recurring watchdog retries after it expires
+      let shift = Nat.min(pir2_fold_retries, 6);
+      pir2_fold_backoff_until := nowNat64() + Nat64.fromNat(2 ** shift) *% 1_000_000_000;
+    };
+    pir2_fold_inflight := false;
+    if (progressed and pir2Behind()) {
+      ignore Timer.setTimer<system>(#seconds 0, pir2DriverTick);
+    };
+  };
+
+  /// One fold chunk, message-atomic, self-only: services the repair machine if one is
+  /// active, else folds up to PIR2_BACKFILL_PER_TICK records from the stable cursor
+  /// (`pir2_state.record_count` — THE watermark) toward the log tail, using the exact live
+  /// fold, so the derived index is bit-identical to a synchronously-built one. Returns
+  /// whether progress was made.
+  public shared ({ caller }) func __pir2_fold_chunk(trapNow : Bool) : async Bool {
+    if (not Principal.equal(caller, selfPrincipal())) Runtime.trap("pir2-fold-chunk:self-only");
+    if (trapNow) Runtime.trap("pir2-fold:test-trap");
+    let c0 = Prim.performanceCounter(0);
+    if (not pir2_state.enabled) return false;
+    if (guard_code != null) return false;
+    switch (pir2_repair) {
+      case (?repair) {
+        pir2RepairStep(repair);
+        pir2_last_chunk_instructions := Prim.performanceCounter(0) - c0;
+        return true;
+      };
+      case null {};
+    };
     var processed = 0;
-    label chunk while (processed < PIR2_BACKFILL_PER_TICK and pir2_state.record_count < noteCount()) {
+    let boundaryBefore = pir2_state.boundary_count;
+    while (processed < PIR2_BACKFILL_PER_TICK and pir2_state.record_count < noteCount()) {
       let block = blockAt(pir2_state.record_count);
       Pir2.append(pir2_state, block.commitment, block.note_ciphertext);
       pir2_backfill_cursor := pir2_state.record_count;
       processed += 1;
     };
-    if (pir2_state.record_count >= noteCount()) {
+    if (pir2_backfilling and pir2_state.record_count >= noteCount()) {
       pir2_backfilling := false;
-    } else {
-      ignore Timer.setTimer<system>(#seconds 0, pir2BackfillTick);
     };
+    // certified stream anchor follows the fold (never the money path): republish when a
+    // DPAGE boundary landed in this chunk
+    if (pir2_state.boundary_count != boundaryBefore) refreshCertification();
+    pir2_last_chunk_instructions := Prim.performanceCounter(0) - c0;
+    processed > 0
+  };
+
+  /// One bounded repair step. Order is the whole design (Phase-0 delta D3): the cursor was
+  /// already rewound (atomically, in pir2_reindex) so nothing serves the affected shards;
+  /// chain replay re-derives the digest from AUTHORITATIVE log records; zeroing clears every
+  /// affected hint span (the fold is +=); then the normal catch-up refolds.
+  func pir2RepairStep(repair : Pir2Repair) {
+    switch (repair.phase) {
+      case (#chain_replay({ next; upto })) {
+        var i = next;
+        let stop = Nat.min(i + PIR2_CHAIN_REPLAY_PER_CHUNK, upto);
+        while (i < stop) {
+          let block = blockAt(i);
+          Pir2.chainAbsorb(pir2_state, Pir2.packRecord(block.commitment, block.note_ciphertext));
+          i += 1;
+        };
+        pir2_repair := ?(
+          if (i >= upto) { { repair with phase = #zeroing({ shard = repair.from_shard; offset = 0 : Nat64 }) } }
+          else { { repair with phase = #chain_replay({ next = i; upto }) } }
+        );
+      };
+      case (#zeroing({ shard; offset })) {
+        let g = Pir2.geometry(pir2_state.shard_size);
+        let total = Pir2.hintBytesPerShard(g);
+        let take = Nat64.min(PIR2_ZERO_BYTES_PER_CHUNK, total - offset);
+        Pir2.zeroHintSpan(pir2_state, shard, offset, take);
+        let nextOffset = offset + take;
+        pir2_repair := if (nextOffset >= total) {
+          if (shard >= repair.last_shard) null
+          else ?{ repair with phase = #zeroing({ shard = shard + 1; offset = 0 : Nat64 }) };
+        } else {
+          ?{ repair with phase = #zeroing({ shard; offset = nextOffset }) };
+        };
+      };
+    };
+  };
+
+  /// Admin repair: rebuild the derived index for every shard >= `fromShard` from the
+  /// authoritative note log (AC-D4). Rewinds the watermark FIRST (message-atomically —
+  /// affected shards stop serving on every surface), restores the stream chain from the
+  /// nearest DPAGE checkpoint, then hands the chunked replay/zero/refold to the fold driver.
+  /// Transfers are unaffected throughout by construction.
+  public shared ({ caller }) func pir2_reindex(fromShard : Nat) : async Result<Pir2Status> {
+    if (not isAdministrator(caller)) return #err("REJECT:not-administrator");
+    switch (guardRejection()) { case (?message) return #err(message); case null {} };
+    if (not pir2_state.enabled) return #err("REJECT:pir2-not-enabled");
+    if (pir2_repair != null) return #err("REJECT:pir2-repair-in-progress");
+    let currentShards = Pir2.shardCount(pir2_state);
+    if (fromShard >= currentShards and currentShards > 0) return #err("REJECT:pir2-shard-beyond-fill");
+    if (currentShards == 0) return #err("REJECT:pir2-nothing-indexed");
+    let lastShard = currentShards - 1;
+    let replayFrom = Pir2.repairRewind(pir2_state, fromShard);
+    pir2_backfill_cursor := pir2_state.record_count;
+    pir2_repair := ?{
+      from_shard = fromShard;
+      last_shard = lastShard;
+      phase = #chain_replay({ next = replayFrom; upto = pir2_state.record_count });
+    };
+    // the certified anchor follows the rewound boundary state immediately
+    refreshCertification();
+    ignore Timer.setTimer<system>(#seconds 0, pir2DriverTick);
+    #ok(pir2StatusValue())
   };
 
   public query func pir2_status() : async Pir2Status { pir2StatusValue() };
@@ -1156,11 +1381,12 @@ persistent actor ZkLedger {
     })
   };
 
-  /// One stripe of the matvec. Rejects while backfilling (state incomplete) or disabled.
+  /// One stripe of the matvec. Serves any pin at or below the freshness watermark
+  /// (`indexed_upto` == the module cursor); deeper pins trap in the module's bound check,
+  /// so no query can ever decode against a partially-folded column segment.
   public query func pir2_query(shard : Nat, fill : Nat, stripe : Nat, kCols : Nat, qu : Blob)
     : async Result<(Blob, Pir2.StripeTrace)> {
     if (not pir2_state.enabled) return #err("REJECT:pir2-not-enabled");
-    if (pir2_backfilling) return #err("REJECT:pir2-backfilling");
     #ok(Pir2.answerStripe(pir2_state, shard, fill, stripe, kCols, qu))
   };
 
@@ -1168,14 +1394,12 @@ persistent actor ZkLedger {
   /// self-computation; capped at MAX_BLOCKS_PER_CALL records per call.
   public query func pir2_record_stream(start : Nat, count : Nat) : async Result<Blob> {
     if (not pir2_state.enabled) return #err("REJECT:pir2-not-enabled");
-    if (pir2_backfilling) return #err("REJECT:pir2-backfilling");
     #ok(Pir2.recordStream(pir2_state, start, Nat.min(count, MAX_BLOCKS_PER_CALL)))
   };
 
   /// Hint bytes for a FROZEN shard (traps for the mutable tail — clients self-compute it).
   public query func pir2_hint_chunk(shard : Nat, offset : Nat, len : Nat) : async Result<Blob> {
     if (not pir2_state.enabled) return #err("REJECT:pir2-not-enabled");
-    if (pir2_backfilling) return #err("REJECT:pir2-backfilling");
     #ok(Pir2.hintChunk(pir2_state, shard, offset, len))
   };
 
@@ -1186,11 +1410,6 @@ persistent actor ZkLedger {
       case (?(digest, covered)) #ok({ digest; covered });
       case null #err("REJECT:pir2-no-boundary");
     }
-  };
-
-  /// Fault-injection point for the PIR fold path (consumed wherever the fold executes).
-  func maybeTrapPir2Fold() {
-    if (test_pir2_fold_trap_remaining > 0) Runtime.trap("pir2-fold:test-trap");
   };
 
   /// Arm `count` forced fold traps (admin; AC-D1 containment battery). Arming with 0 disarms.
@@ -1249,8 +1468,12 @@ persistent actor ZkLedger {
       case (#err(message)) Runtime.trap("postupgrade:" # message);
     };
     if (not Pir2.headersValid(pir2_state)) Runtime.trap("postupgrade:pir2-headers");
-    // A backfill interrupted by the upgrade resumes from its stable cursor.
-    if (pir2_backfilling) ignore Timer.setTimer<system>(#seconds 0, pir2BackfillTick);
+    // The fold driver is transient: re-arm whenever pir2 is enabled. Catch-up and repair
+    // both resume from their STABLE cursors (mid-flight state cannot be lost).
+    if (pir2_state.enabled) {
+      pir2ArmDriver<system>();
+      ignore Timer.setTimer<system>(#seconds 0, pir2DriverTick);
+    };
     refreshCertification();
     resetAudit<system>();
     postupgrade_heap_before := heap_before;
@@ -1279,6 +1502,7 @@ persistent actor ZkLedger {
       nullifier_count = nullifierCount();
       pool_value;
       epoch;
+      instructions = Prim.performanceCounter(0);
     }
   };
 
@@ -1558,14 +1782,9 @@ persistent actor ZkLedger {
     chain.writeBlob(encoded);
     note_log_chain_digest := chain.sum();
     last_block_hash := ?ICRC3.hashValue(NoteAudit.blockValue(block));
-    // PIR v2 live maintenance: fold this record into the matrix + hint. Skipped while a
-    // backfill is catching up (the backfill walks the whole log including this record, so
-    // its cursor chases the growing tail); once caught up the hook maintains every new note.
-    if (pir2_state.enabled and not pir2_backfilling) {
-      if (pir2_state.record_count != position) Runtime.trap("stable-state:pir2-position");
-      maybeTrapPir2Fold();
-      Pir2.append(pir2_state, output.commitment, output.note_ciphertext);
-    };
+    // NO PIR code here — the append is authoritative and complete without the derived
+    // index; the background fold driver trails it (derived-index decoupling, reviewer
+    // point #5). A PIR fault can degrade queries, never this message.
   };
 
   func validateOutput(output : OutputRecord) : ?Text {

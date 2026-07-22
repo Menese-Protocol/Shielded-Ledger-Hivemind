@@ -1633,6 +1633,7 @@ impl Runner {
         )]))
         .to_vec();
         let tuple = cert::ExpectedTuple {
+            pir2_boundary: None, // flag-off soak: the certified tree must be pre-pir2-identical
             tip_index: blocks.len() as u64 - 1,
             tip_hash: replayer_tip_hash,
             note_count: blocks.len() as u64,

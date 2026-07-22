@@ -25,6 +25,7 @@ import Blob "mo:core/Blob";
 import List "mo:core/List";
 import Nat "mo:core/Nat";
 import Nat8 "mo:core/Nat8";
+import Nat32 "mo:core/Nat32";
 import Nat64 "mo:core/Nat64";
 import Region "mo:core/Region";
 import Runtime "mo:core/Runtime";
@@ -75,6 +76,9 @@ module {
     target_index_parameters : Nat;
     target_dependent_branches : Nat;
     instructions : Nat64;
+    // freshness watermark at answer time (== record_count): the client checks its pin
+    // against this and a lagging replica is caught exactly as §V2.4 requires
+    indexed_upto : Nat;
   };
 
   public func newState() : State {
@@ -221,7 +225,9 @@ module {
     Sha256.fromBlob(#sha256, Blob.fromArray(List.toArray(seed)))
   };
 
-  /// Expand A[c, :] into a caller-owned arena (LWE_N Nat32 slots at `offset`).
+  /// Expand A[c, :] into a caller-owned arena (LWE_N Nat32 slots at `offset`). Word
+  /// assembly stays in Nat32 lanes (see the wire-conversion note): constant instructions
+  /// regardless of the hash bytes.
   public func aRowInto(shard : Nat, c : Nat, out : [var Nat32], offset : Nat) {
     var k = 0;
     var w = 0;
@@ -229,11 +235,11 @@ module {
       let block = Blob.toArray(aBlock(shard, c, k));
       var i = 0;
       while (i < 8) {
-        let b0 = Nat8.toNat(block[4 * i]);
-        let b1 = Nat8.toNat(block[4 * i + 1]);
-        let b2 = Nat8.toNat(block[4 * i + 2]);
-        let b3 = Nat8.toNat(block[4 * i + 3]);
-        out[offset + w] := Prim.natToNat32(b0 + 256 * (b1 + 256 * (b2 + 256 * b3)));
+        let b0 = Prim.nat16ToNat32(Prim.nat8ToNat16(block[4 * i]));
+        let b1 = Prim.nat16ToNat32(Prim.nat8ToNat16(block[4 * i + 1]));
+        let b2 = Prim.nat16ToNat32(Prim.nat8ToNat16(block[4 * i + 2]));
+        let b3 = Prim.nat16ToNat32(Prim.nat8ToNat16(block[4 * i + 3]));
+        out[offset + w] := b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
         w += 1;
         i += 1;
       };
@@ -316,15 +322,20 @@ module {
 
   // ==== query path ====
 
+  // Wire conversions run in PURE word-width ops (Nat32 lanes, byte-sized compact Nats
+  // only): unbounded-Nat intermediates box value-dependently above the compact bound, which
+  // made the executed instruction count a function of wire CONTENT — caught by the S-1
+  // instruction-equality gate (the count depended only on public bytes, so nothing secret
+  // leaked, but the constant-instruction serving invariant must hold literally).
   func wireToU32(blob : Blob) : [Nat32] {
     let bytes = Blob.toArray(blob);
     if (bytes.size() % 4 != 0) Runtime.trap("pir2: wire length must be a multiple of 4");
     Array.tabulate<Nat32>(bytes.size() / 4, func(i) {
-      let b0 = Nat8.toNat(bytes[4 * i]);
-      let b1 = Nat8.toNat(bytes[4 * i + 1]);
-      let b2 = Nat8.toNat(bytes[4 * i + 2]);
-      let b3 = Nat8.toNat(bytes[4 * i + 3]);
-      Prim.natToNat32(b0 + 256 * (b1 + 256 * (b2 + 256 * b3)))
+      let b0 = Prim.nat16ToNat32(Prim.nat8ToNat16(bytes[4 * i]));
+      let b1 = Prim.nat16ToNat32(Prim.nat8ToNat16(bytes[4 * i + 1]));
+      let b2 = Prim.nat16ToNat32(Prim.nat8ToNat16(bytes[4 * i + 2]));
+      let b3 = Prim.nat16ToNat32(Prim.nat8ToNat16(bytes[4 * i + 3]));
+      b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
     })
   };
 
@@ -332,11 +343,11 @@ module {
     let out = Prim.Array_init<Nat8>(words.size() * 4, 0);
     var i = 0;
     while (i < words.size()) {
-      let w = Prim.nat32ToNat64(words[i]);
-      out[4 * i] := Nat8.fromNat(Nat64.toNat(w & 0xFF));
-      out[4 * i + 1] := Nat8.fromNat(Nat64.toNat((w >> 8) & 0xFF));
-      out[4 * i + 2] := Nat8.fromNat(Nat64.toNat((w >> 16) & 0xFF));
-      out[4 * i + 3] := Nat8.fromNat(Nat64.toNat((w >> 24) & 0xFF));
+      let w = words[i];
+      out[4 * i] := Nat8.fromNat(Nat32.toNat(w & 0xFF));
+      out[4 * i + 1] := Nat8.fromNat(Nat32.toNat((w >> 8) & 0xFF));
+      out[4 * i + 2] := Nat8.fromNat(Nat32.toNat((w >> 16) & 0xFF));
+      out[4 * i + 3] := Nat8.fromNat(Nat32.toNat((w >> 24) & 0xFF));
       i += 1;
     };
     Blob.fromArray(Array.fromVarArray(out))
@@ -396,8 +407,54 @@ module {
         target_index_parameters = 0;
         target_dependent_branches = 0;
         instructions = c1 - c0;
+        indexed_upto = state.record_count;
       },
     )
+  };
+
+  // ==== repair (derived-index recoverability; see the decoupling proposal) ====
+  //
+  // The fold is a pure function of the note log, so any shard suffix is rebuildable — but
+  // three subtleties make repair its own machinery (Phase-0 delta D3):
+  //   1. the stream chain folds from record 0, so a refold must RESTORE chain state from the
+  //      nearest DPAGE checkpoint at or below the reset point and chain-replay the remainder
+  //      from authoritative log records (never from possibly-corrupt PIR regions);
+  //   2. the hint fold is `+=`, so every shard being refolded must be explicitly zeroed
+  //      first (fresh Region pages arrive zeroed; a corrupt region does not);
+  //   3. the cursor must rewind FIRST so no serving surface can read affected shards while
+  //      the rebuild runs (every surface bounds by record_count).
+
+  /// Step 1 of repair, atomic in the caller's message: rewind the cursor to `fromShard`'s
+  /// boundary and restore (chain, boundary_count) from the nearest DPAGE checkpoint.
+  /// Returns the record index chain replay must resume from (== checkpoint coverage).
+  /// The replay range never crosses a DPAGE boundary (checkpoints = floor(target/DPAGE)).
+  public func repairRewind(state : State, fromShard : Nat) : Nat {
+    let target = fromShard * state.shard_size;
+    let checkpoints = target / DPAGE;
+    state.boundary_count := checkpoints;
+    state.chain := if (checkpoints == 0) Blob.fromArray(Array.repeat<Nat8>(0, 32))
+      else Region.loadBlob(state.c_region, HDR + Nat64.fromNat((checkpoints - 1) * 32), 32);
+    state.record_count := target;
+    checkpoints * DPAGE
+  };
+
+  /// Chain-only absorb for the repair replay: advances the digest WITHOUT touching cells,
+  /// hint, count, or boundaries (the replay range cannot cross a DPAGE boundary).
+  public func chainAbsorb(state : State, record : [Nat8]) {
+    let chainInput = List.empty<Nat8>();
+    for (byte in state.chain.values()) List.add(chainInput, byte);
+    for (byte in record.values()) List.add(chainInput, byte);
+    state.chain := Sha256.fromBlob(#sha256, Blob.fromArray(List.toArray(chainInput)));
+  };
+
+  /// Zero `len` hint bytes of `shard` at byte `offset` (repair pre-refold zeroing; the fold
+  /// is += and only FRESH region pages arrive zeroed).
+  public func zeroHintSpan(state : State, shard : Nat, offset : Nat64, len : Nat64) {
+    let g = geometry(state.shard_size);
+    let base = hRowOffset(g, shard, 0) + offset;
+    ensureCapacity(state.h_region, base + len);
+    let zeros = Blob.fromArray(Array.repeat<Nat8>(0, Nat64.toNat(len)));
+    Region.storeBlob(state.h_region, base, zeros);
   };
 
   /// Densely packed record stream: (position 8B BE ‖ 288 cells) per record — 296 B/note,

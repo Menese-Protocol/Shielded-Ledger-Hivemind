@@ -127,6 +127,7 @@ persistent actor Pir2CostProbe {
         target_index_parameters = 0;
         target_dependent_branches = 1; // honest self-report: this variant branches on content
         instructions = c1 - c0;
+        indexed_upto = state.record_count;
       },
     )
   };
