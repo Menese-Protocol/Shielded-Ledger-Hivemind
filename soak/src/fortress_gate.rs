@@ -263,6 +263,33 @@ pub fn valid_transfer(seed: [u8; 32]) -> ValidTransfer {
     ValidTransfer { pk, vk, circuit, proof, public }
 }
 
+/// A valid DEPOSIT (shield) proof + its vk/inputs — the shield verify op class. Different
+/// deposit secrets (pk/rho/rcm/value) give the same public shape (cm, v_pub) with different
+/// values, so §10 can measure the shield-verify instruction class the same way as transfers.
+pub fn valid_deposit(seed: [u8; 32]) -> ValidTransfer2 {
+    let cfg = poseidon_config();
+    let mut setup_rng = StdRng::from_seed([0xd0; 32]);
+    let (pk, vk) = Groth16::<Bls12_381>::circuit_specific_setup(common::DepositCircuit::blank(&cfg), &mut setup_rng).unwrap();
+    let mut rng = StdRng::from_seed(seed);
+    let value = 1 + rng.next_u64() % 1_000_000;
+    let owner_pk = derive_pk(&cfg, Fr::rand(&mut rng));
+    let rho = Fr::rand(&mut rng);
+    let rcm = Fr::rand(&mut rng);
+    let cm = note_commitment(&cfg, value, owner_pk, rho, rcm);
+    let circuit = common::DepositCircuit { cfg: cfg.clone(), cm: Some(cm), v_pub: Some(value), pk: Some(owner_pk), rho: Some(rho), rcm: Some(rcm) };
+    let public = circuit.public_inputs();
+    let proof = Groth16::<Bls12_381>::prove(&pk, circuit, &mut rng).unwrap();
+    assert!(Groth16::<Bls12_381>::verify(&vk, &public, &proof).unwrap(), "valid deposit must verify");
+    ValidTransfer2 { vk, proof, public }
+}
+
+/// Minimal (vk, proof, public) triple — deposit has no proving key reuse need in §10.
+pub struct ValidTransfer2 {
+    pub vk: VerifyingKey<Bls12_381>,
+    pub proof: Proof<Bls12_381>,
+    pub public: Vec<Fr>,
+}
+
 /// A second, unrelated valid vk (independent setup) — the "wrong vk" case.
 pub fn wrong_vk() -> VerifyingKey<Bls12_381> {
     let cfg = poseidon_config();

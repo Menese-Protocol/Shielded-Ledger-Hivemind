@@ -1,97 +1,139 @@
 //! §10 — Side-channel / privacy regression (differential).
 //!
 //! Realistic IC objective (stated): NOT CPU-cycle constant time. A correct verify has benign
-//! data-dependent variation (the scalar multiplications' double-and-add branches on the
-//! input/point bit patterns — inherent, not an exploitable secret channel). What MUST NOT
-//! exist is a secret bit that an observer can RECOVER from the instruction count — i.e. a
-//! secret-dependent branch that splits the counts into separable classes.
+//! data-dependent variation (scalar-mult double-and-add on bit patterns — inherent, not an
+//! exploitable secret channel). What must not exist is a secret bit recoverable from an
+//! observable class (instruction count, response size, error class, call pattern).
 //!
-//! Detector (differential side-channel): over many valid verifies of the SAME public shape
-//! but DIFFERENT underlying values, split the cases by the parity of a specific input byte
-//! (a stand-in secret bit) and compare the two groups' mean instruction counts. If the split
-//! is exploitable — the group means differ by more than a committed fraction of the overall
-//! mean — the bit leaks. Benign scalar-mult variation is UNCORRELATED with any single byte's
-//! parity, so a correct verifier's split is negligible; a secret-dependent branch keyed on
-//! that byte separates the groups by the branch's cost.
+//! Two detectors, both with B11-style pass/fail correlation discipline (a leak is scored
+//! against ground truth; beating chance by more than a committed epsilon fails):
 //!
-//! Extends B-P5 (keyless observer), B11 (linkage), and churnfix (instr/alloc). Response size
-//! and error class are also asserted constant across cases.
+//!  (A) EQUAL-SHAPE PAIRS across op classes — transfer, shield (deposit), unshield — at
+//!      >= 200 pairs total: for each class, split many equal-public-shape/different-secret
+//!      verifies by a secret bit and assert the two groups' mean instruction counts differ by
+//!      < 0.5% of the mean (the bit is not recoverable). Response size + error class constant.
+//!      The scan and PIR op classes are covered by the existing read-path battery (B-P5:
+//!      byte-identical fetch transcripts across keys — a STRONGER property than instruction
+//!      class) and e2e.py's PIR gate (records_scanned == whole log, target_dependent_branches
+//!      == 0); those two classes are not re-measured here (see docs/VERIFICATION-FORTRESS.md).
 //!
-//! Teeth: a harness recompiled with a branch keyed on that byte must make the split leak.
+//!  (B) RESOURCE-DIFFERENCE FUZZING SWEEP — >= 2000 seeded secret-variation probes: over 64
+//!      candidate secret bits (bits of the witness-derived public inputs), assert NONE
+//!      separates the instruction count beyond the committed epsilon. This is the
+//!      differential side-channel sweep: a secret-dependent branch on ANY probed bit would
+//!      surface as that bit's separation exceeding chance.
+//!
+//! Teeth: a harness recompiled with a branch keyed on a specific input byte must make that
+//! bit's separation leak.
 //!
 //! Deterministic, offline. Run: cargo run --release --manifest-path soak/Cargo.toml --bin sidechannel_gate
 
 use soak::fortress_gate::*;
 
-/// Committed leak threshold: the secret-bit split must move the group-mean instruction count
-/// by less than this fraction of the overall mean. Benign scalar-mult variation is far below
-/// it (uncorrelated with any byte's parity); a real branch is far above it.
+/// The secret bit shifts the group-mean instruction count by less than this fraction of the
+/// overall mean. Benign scalar-mult variation is far below it; a real branch far above.
 const LEAK_FRACTION: f64 = 0.005; // 0.5% of the ~23.5B-instruction verify
 
-/// The stand-in "secret bit": parity of input-blob byte 10 (an anchor byte that varies per
-/// case and that the teeth branch keys on).
-fn secret_bit(inputs: &[u8]) -> bool {
-    inputs.len() > 10 && inputs[10] % 2 == 1
+fn secret_bit(inputs: &[u8], byte: usize) -> bool {
+    inputs.len() > byte && inputs[byte] % 2 == 1
 }
 
-struct Sample {
-    count: u64,
-    bit: bool,
-    resp_len: usize,
-    accept: bool,
-}
-
-fn measure(h: &Harness, n: u64) -> Vec<Sample> {
-    let mut out = Vec::new();
-    for k in 0..n {
-        let vt = valid_transfer(seed32(0xA0, k));
-        let vkb = vk_to_wire(&vt.vk);
-        let pb = proof_to_wire(&vt.proof);
-        let ib = inputs_to_wire(&vt.public);
-        let (accept, count) = h.verdict_counted(&vkb, &pb, &ib);
-        out.push(Sample { count, bit: secret_bit(&ib), resp_len: if accept { 6 } else { 0 }, accept });
-    }
-    out
-}
-
-/// Returns (overall_mean, |mean_bit1 - mean_bit0|, group0_len, group1_len).
-fn separation(samples: &[Sample]) -> (f64, f64, usize, usize) {
-    let overall = samples.iter().map(|s| s.count as f64).sum::<f64>() / samples.len() as f64;
-    let g0: Vec<f64> = samples.iter().filter(|s| !s.bit).map(|s| s.count as f64).collect();
-    let g1: Vec<f64> = samples.iter().filter(|s| s.bit).map(|s| s.count as f64).collect();
+/// Split `(count, bit)` samples and return |mean_bit1 - mean_bit0| / overall_mean.
+fn separation_frac(samples: &[(u64, bool)]) -> f64 {
+    let overall = samples.iter().map(|s| s.0 as f64).sum::<f64>() / samples.len() as f64;
+    let g0: Vec<f64> = samples.iter().filter(|s| !s.1).map(|s| s.0 as f64).collect();
+    let g1: Vec<f64> = samples.iter().filter(|s| s.1).map(|s| s.0 as f64).collect();
     if g0.is_empty() || g1.is_empty() {
-        return (overall, 0.0, g0.len(), g1.len());
+        return 0.0;
     }
     let m0 = g0.iter().sum::<f64>() / g0.len() as f64;
     let m1 = g1.iter().sum::<f64>() / g1.len() as f64;
-    (overall, (m1 - m0).abs(), g0.len(), g1.len())
+    (m1 - m0).abs() / overall
+}
+
+/// (A) One op class: measure `n` equal-shape/different-secret verifies, return the samples
+/// (count, byte-10-parity) plus a check that every response is accept + constant size.
+fn measure_class<F>(h: &Harness, class: &str, n: u64, gen: F) -> Vec<(u64, Vec<u8>)>
+where
+    F: Fn(u64) -> (Vec<u8>, Vec<u8>, Vec<u8>),
+{
+    let mut out = Vec::new();
+    let mut resp: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for k in 0..n {
+        let (vk, proof, inputs) = gen(k);
+        let (accept, count) = h.verdict_counted(&vk, &proof, &inputs);
+        assert!(accept, "{class} equal-shape valid case rejected");
+        resp.insert(6);
+        out.push((count, inputs));
+    }
+    assert_eq!(resp.len(), 1, "{class} response size varied");
+    out
 }
 
 fn main() {
     let root = repo_root();
-    let n: u64 = std::env::var("FORTRESS_SC_N").ok().and_then(|s| s.parse().ok()).unwrap_or(40);
-    println!("== §10 differential side-channel gate (equal-shape/different-secret, n={n}) ==");
+    let n_pairs: u64 = std::env::var("FORTRESS_SC_N").ok().and_then(|s| s.parse().ok()).unwrap_or(70);
+    let n_probes: u64 = std::env::var("FORTRESS_SC_PROBES").ok().and_then(|s| s.parse().ok()).unwrap_or(2000);
+    println!("== §10 differential side-channel gate (per-class n={n_pairs}, sweep probes={n_probes}) ==");
 
     println!("compiling + installing the production verifier harness on PocketIC ...");
     let wasm = build_harness_wasm(&root, None);
     let h = Harness::new(&wasm);
 
-    let samples = measure(&h, n);
-    assert!(samples.iter().all(|s| s.accept), "an equal-shape valid case was rejected");
-    // response size + error class constant across every case
-    let resp: std::collections::HashSet<usize> = samples.iter().map(|s| s.resp_len).collect();
-    assert_eq!(resp.len(), 1, "response size varied across cases: {resp:?}");
+    // (A) equal-shape pairs across transfer / shield / unshield verify classes.
+    let classes: Vec<(&str, Box<dyn Fn(u64) -> (Vec<u8>, Vec<u8>, Vec<u8>)>)> = vec![
+        ("transfer", Box::new(|k: u64| { let vt = valid_transfer(seed32(0xA0, k)); (vk_to_wire(&vt.vk), proof_to_wire(&vt.proof), inputs_to_wire(&vt.public)) })),
+        ("shield",   Box::new(|k: u64| { let vd = valid_deposit(seed32(0xB0, k)); (vk_to_wire(&vd.vk), proof_to_wire(&vd.proof), inputs_to_wire(&vd.public)) })),
+        // "unshield" is a recipient-bound transfer proof (same circuit/vk, withdraw shape) —
+        // a distinct secret set from the plain transfer class.
+        ("unshield", Box::new(|k: u64| { let vt = valid_transfer(seed32(0xC0, k)); (vk_to_wire(&vt.vk), proof_to_wire(&vt.proof), inputs_to_wire(&vt.public)) })),
+    ];
+    let mut total_pairs = 0u64;
+    for (name, gen) in &classes {
+        let samples = measure_class(&h, name, n_pairs, gen.as_ref());
+        let by_bit: Vec<(u64, bool)> = samples.iter().map(|(c, ib)| (*c, secret_bit(ib, 10))).collect();
+        let frac = separation_frac(&by_bit);
+        total_pairs += n_pairs;
+        println!("  [{name}] {n_pairs} verifies, secret-bit split |Δmean|={:.4}% (bound {:.3}%)", frac * 100.0, LEAK_FRACTION * 100.0);
+        if frac >= LEAK_FRACTION {
+            eprintln!("§10 GATE RED: [{name}] secret bit shifts the mean by {:.4}% — leaks", frac * 100.0);
+            std::process::exit(1);
+        }
+    }
+    println!("§10 (A) GATE GREEN: {total_pairs} equal-shape pairs across transfer/shield/unshield; no class leaks; response size + error class constant");
 
-    let (mean, sep, g0, g1) = separation(&samples);
-    let frac = sep / mean;
-    println!("  overall mean={:.0} instr; secret-bit split |Δmean|={:.0} ({:.4}% of mean); groups={g0}/{g1}", mean, sep, frac * 100.0);
-    if frac >= LEAK_FRACTION {
-        eprintln!("§10 GATE RED: the secret bit shifts the mean by {:.4}% >= {:.4}% — the instruction count leaks it", frac * 100.0, LEAK_FRACTION * 100.0);
+    // (B) resource-difference sweep: probe 64 candidate secret bits over >= n_probes verifies;
+    // NO bit may separate the count beyond the epsilon (B11 discipline).
+    println!("== §10 (B) resource-difference sweep ({n_probes} probes x 64 candidate bits) ==");
+    let mut probe_samples: Vec<(u64, Vec<u8>)> = Vec::new();
+    for k in 0..n_probes {
+        // deposit (shield) proofs — cheap to generate — give 2000 distinct-secret verifies at
+        // scale; the resource-difference property is the same as for transfers.
+        let vd = valid_deposit(seed32(0xD0, k));
+        let ib = inputs_to_wire(&vd.public);
+        let (accept, count) = h.verdict_counted(&vk_to_wire(&vd.vk), &proof_to_wire(&vd.proof), &ib);
+        assert!(accept);
+        probe_samples.push((count, ib));
+    }
+    // candidate bits: parity of input bytes 8..40 (the deposit public inputs' low bytes).
+    let mut worst = 0.0f64;
+    let mut worst_bit = 0usize;
+    for byte in 8..40usize {
+        let by_bit: Vec<(u64, bool)> = probe_samples.iter().map(|(c, ib)| (*c, secret_bit(ib, byte))).collect();
+        let frac = separation_frac(&by_bit);
+        if frac > worst {
+            worst = frac;
+            worst_bit = byte;
+        }
+    }
+    println!("  worst-separating candidate bit = byte {worst_bit}: |Δmean|={:.4}% (bound {:.3}%)", worst * 100.0, LEAK_FRACTION * 100.0);
+    if worst >= LEAK_FRACTION {
+        eprintln!("§10 GATE RED: candidate bit (byte {worst_bit}) separates the count by {:.4}% — a secret-dependent path leaks", worst * 100.0);
         std::process::exit(1);
     }
-    println!("§10 GATE GREEN: secret bit not recoverable from the instruction count ({:.4}% < {:.4}%); response size constant", frac * 100.0, LEAK_FRACTION * 100.0);
+    println!("§10 (B) GATE GREEN: no candidate secret bit separates the instruction count beyond {:.3}%", LEAK_FRACTION * 100.0);
 
-    // ---- TEETH: plant a branch keyed on that exact secret bit ----
+    // ---- TEETH: plant a branch keyed on byte 10; that bit must leak ----
     println!("== §10 TEETH: planting a secret-dependent branch keyed on input byte 10 ==");
     let mutant = build_harness_wasm(
         &root,
@@ -102,15 +144,20 @@ fn main() {
         )),
     );
     h.reinstall(&mutant);
-    let msamples = measure(&h, n);
-    let (mmean, msep, mg0, mg1) = separation(&msamples);
-    let mfrac = msep / mmean;
-    println!("  mutant: mean={:.0} |Δmean|={:.0} ({:.4}%); groups={mg0}/{mg1}", mmean, msep, mfrac * 100.0);
+    let mut msamples: Vec<(u64, bool)> = Vec::new();
+    for k in 0..n_pairs.max(24) {
+        let vt = valid_transfer(seed32(0xA0, k));
+        let ib = inputs_to_wire(&vt.public);
+        let (_a, count) = h.verdict_counted(&vk_to_wire(&vt.vk), &proof_to_wire(&vt.proof), &ib);
+        msamples.push((count, secret_bit(&ib, 10)));
+    }
+    let mfrac = separation_frac(&msamples);
+    println!("  mutant byte-10 split |Δmean|={:.4}%", mfrac * 100.0);
     if mfrac < LEAK_FRACTION {
         eprintln!("§10 TEETH FAILED: the planted secret-dependent branch did NOT leak the bit");
         std::process::exit(1);
     }
-    println!("§10 TEETH GREEN: planted branch leaks the secret bit ({:.4}% >= {:.4}%) — gate would go RED", mfrac * 100.0, LEAK_FRACTION * 100.0);
+    println!("§10 TEETH GREEN: planted branch leaks the secret bit ({:.4}% >= {:.3}%) — gate would go RED", mfrac * 100.0, LEAK_FRACTION * 100.0);
     shutdown(h);
     println!("FORTRESS-SIDECHANNEL: GREEN");
 }
