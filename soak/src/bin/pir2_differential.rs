@@ -260,6 +260,49 @@ fn main() {
             }
         }
         println!("[diff] PHASE 2 PASS: {P2_CORPUS} records, {QUERIES} queries byte-identical (widths {widths:?})");
+
+        // ===== PHASE 3 (S-1): cross-target INSTRUCTION-COUNT equality gate =====
+        // §V2.4's auditable invariant says no branch on cell or query content; the trace's
+        // `target_dependent_branches = 0` is a DECLARATION. This gate measures the claim:
+        // for a fixed (shard, fill, stripe, kCols), the MEASURED `instructions` field must be
+        // EXACTLY equal across queries with different targets and different ciphertext
+        // content (committed threshold: max == min). Teeth: the probe's `answer_stripe_leaky`
+        // (a deliberate branch-on-query-content variant) must produce UNEQUAL counts on the
+        // same inputs — proving the gate detects the forbidden shape.
+        let s1_shard = 3u64;
+        let s1_fill = ref_shards[3].fill;
+        let s1_k = 128u64;
+        let s1_targets = [0usize, 1, 777, 2048, 4095];
+        let mut gate = |method: &str| -> (u64, u64) {
+            let mut min = u64::MAX;
+            let mut max = 0u64;
+            for (ti, &target) in s1_targets.iter().enumerate() {
+                let (c_star, _) = geometry.place(target);
+                let secret = pir2::keygen(|| rng.next_u32());
+                let qu = pir2::build_query(s1_shard, &geometry, s1_fill, c_star, &secret, || rng.next_u32());
+                let (_, trace): (Vec<u8>, StripeTrace) = candid::decode_args(&query(
+                    method,
+                    candid::encode_args((nat(s1_shard), nat(s1_fill as u64), nat(0), nat(s1_k), &pir2::to_wire(&qu))).unwrap(),
+                )).unwrap();
+                let instr = trace.instructions;
+                println!("[diff] S1 {method} target#{ti} instructions={instr}");
+                min = min.min(instr);
+                max = max.max(instr);
+            }
+            (min, max)
+        };
+        let (pmin, pmax) = gate("answer_stripe");
+        assert_eq!(
+            pmin, pmax,
+            "S1 GATE FAIL: production stripe instruction counts differ across targets ({pmin}..{pmax})"
+        );
+        println!("[diff] S1 PASS: production instruction count EXACTLY equal across {} targets ({pmin})", s1_targets.len());
+        let (lmin, lmax) = gate("answer_stripe_leaky");
+        assert_ne!(
+            lmin, lmax,
+            "S1 TEETH FAIL: the leaky variant produced equal instruction counts — the gate cannot detect the forbidden shape"
+        );
+        println!("[diff] S1 TEETH: leaky variant detected (instructions {lmin}..{lmax} differ across targets)");
     }
-    println!("[diff] PASS SEED={seed}: fold identity + 144k-scale query byte-identity both green");
+    println!("[diff] PASS SEED={seed}: fold identity + 144k-scale query byte-identity + S1 instruction-equality all green");
 }

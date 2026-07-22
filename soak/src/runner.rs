@@ -1273,7 +1273,24 @@ impl Runner {
         }
     }
 
-    fn upgrade(&mut self, at_op: u64) {
+    /// Drive exactly `n` ops through the normal plan→prove→submit pipeline with no
+    /// upgrades/recycles/checkpoints — the pirdx battery's building block for interleaving
+    /// transfers with PIR fold fault injection. Returns ops executed.
+    pub fn step_ops(&mut self, n: usize) -> u64 {
+        let mut executed = 0u64;
+        while (executed as usize) < n {
+            let want = self.tier.batch.min(n - executed as usize);
+            let plan = self.plan_batch(want);
+            let ops = self.prove_batch(plan);
+            for op in ops {
+                self.submit(op);
+                executed += 1;
+            }
+        }
+        executed
+    }
+
+    pub fn upgrade(&mut self, at_op: u64) {
         let rts = self.env.ledger_rts();
         self.progress(&format!(
             "upgrade #{} at op {} STARTING (mode upgrade, same wasm) | pre-upgrade rts: mem {:.2}GiB heap {:.2}GiB max-live {:.2}GiB",

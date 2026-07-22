@@ -24,6 +24,7 @@ const INSECURE_TEST_SEED: u64 = 20260712;
 const NOTE_DRAWS_BEFORE_TRANSFER_SETUP: usize = 8;
 const DRAWS_BETWEEN_SETUPS: usize = 13;
 
+#[derive(Clone)]
 pub struct Keyset {
     pub transfer_pk: ProvingKey<Bls12_381>,
     pub transfer_vk: VerifyingKey<Bls12_381>,
