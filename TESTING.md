@@ -254,6 +254,22 @@ cost probes, an inner-loop micro-bench, and a keyless-observer privacy battery.
   indistinguishability for different targets, selector-marginal chi-square (with a skew
   self-test for teeth), a negative control that detects a leaking partial-schedule client,
   match-independent shard set, and the uniform-scan schedule — two seeds, 11 checks.
+- **S-1 instruction-equality gate** — differential PHASE 3: the measured `instructions`
+  trace field must be EXACTLY equal across different-target queries at identical
+  (shard, fill, stripe, kCols); teeth via the probe's deliberately leaky
+  `answer_stripe_leaky` variant (harness-only), which must produce unequal counts.
+- **Derived-index battery** — `PIRDX_EXPECT=decoupled PIRDX_TIER=small cargo run --release
+  --manifest-path soak/Cargo.toml --bin pirdx_battery` (and `PIRDX_TIER=big` for the ≥10⁴
+  scale tier): money-path containment under injected fold traps (AC-D1), catch-up/gating/
+  repair/upgrade-resume byte-identity against the Rust reference fed from the ledger's own
+  block log (AC-D2..D5), money-message instruction delta + fold-chunk budget (AC-D6), and
+  the certified `pir2_boundary` leaf (D7). `PIRDX_EXPECT=coupled` runs the same assertions
+  as the recorded RED against a synchronous-fold build.
+- **S-3 sampler battery** — `cd demo-frontend && node scripts/readpath/s3-sampler-battery.mjs`
+  (build `prover-wasm/pkg-node` first with `wasm-pack build --target nodejs --out-dir
+  pkg-node`): committed moment/tail/zero-fraction bounds with mutation teeth for the JS twin,
+  the shipped wasm sampler (via `pir_selectors` noise extraction), and `pir_random_u64`;
+  mirrored in `cargo test --lib pir2` (`sampler_moments_*`).
 
 All numbers land in `docs/PIR-SPEC.md` §V2.7.
 
