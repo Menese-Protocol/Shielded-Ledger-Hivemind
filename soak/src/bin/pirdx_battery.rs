@@ -823,19 +823,27 @@ fn main() {
             tier.recycle_ops = 0;
             tier.state_dir = std::env::temp_dir().join(format!("pirdx-big-{}", std::process::id()));
             tier.checkpoint_file = tier.state_dir.join("ckpt.bin");
-            let ops_target: usize =
-                std::env::var("PIRDX_BIG_OPS").ok().and_then(|v| v.parse().ok()).unwrap_or(7_500);
-            tier.ops = ops_target + 100;
+            // The AC-D2 commitment is in NOTES (>=10^4), not ops — the note/op ratio is
+            // mix-dependent (~1.25), so the corpus loop is note-count-driven with a hard
+            // op cap as a runaway backstop.
+            let notes_target: u64 =
+                std::env::var("PIRDX_BIG_NOTES").ok().and_then(|v| v.parse().ok()).unwrap_or(10_050);
+            let ops_cap: usize =
+                std::env::var("PIRDX_BIG_OPS_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(14_000);
+            tier.ops = ops_cap + 100;
             let mut ctx = Ctx { runner: runner::Runner::new(tier, keyset, &wasms), expect_decoupled };
             const S_BIG: u64 = 4096; // == DPAGE: boundary + freeze exercised at 10^4 scale
-            println!("=== AC-D2 (catch-up at >=10^4 lag) — building corpus ({ops_target} ops) ===");
+            println!("=== AC-D2 (catch-up at >=10^4 lag) — building corpus ({notes_target} notes) ===");
             let mut done = 0usize;
-            while done < ops_target {
-                let step = 500.min(ops_target - done);
-                ctx.runner.step_ops(step);
-                done += step;
+            loop {
                 let notes = nat_u64(&ctx.runner.env.ledger_status().note_count);
-                println!("[big] {done}/{ops_target} ops, {notes} notes");
+                println!("[big] {done} ops, {notes}/{notes_target} notes");
+                if notes >= notes_target {
+                    break;
+                }
+                assert!(done < ops_cap, "corpus build exceeded the {ops_cap}-op backstop");
+                ctx.runner.step_ops(250);
+                done += 250;
             }
             let notes = nat_u64(&ctx.runner.env.ledger_status().note_count);
             assert!(notes >= 10_000, "AC-D2 commitment: need >=10^4 notes, got {notes}");
