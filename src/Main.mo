@@ -301,7 +301,7 @@ persistent actor ZkLedger {
   // code, no timer is armed, and every v2 endpoint rejects, so an unset deployment is
   // byte-identical to the pre-v2 ledger.
   //
-  // DERIVED-INDEX DECOUPLING (for-team proposal, Phase-0 amended): the financial append is
+  // DERIVED-INDEX DECOUPLING: the financial append is
   // authoritative and complete WITHOUT the PIR index; a background fold driver trails it
   // with the freshness cursor `pir2_state.record_count` (== the `indexed_upto` watermark —
   // ONE variable, never two). All fold work — initial backfill after `pir2_enable`,
@@ -631,7 +631,7 @@ persistent actor ZkLedger {
 
   /// Certified anchor for the pir2 record stream: digest(32) ‖ covered-count(8B BE), present
   /// only when pir2 is enabled and a DPAGE boundary exists — the flag-off certified tree is
-  /// byte-identical to the pre-pir2 one (spec §V2.5; Phase-0 delta D7).
+  /// byte-identical to the pre-pir2 one (spec §V2.5).
   func pir2BoundaryLeaf() : ?Blob {
     if (not pir2_state.enabled) return null;
     switch (Pir2.latestBoundary(pir2_state)) {
@@ -1227,7 +1227,7 @@ persistent actor ZkLedger {
 
   type Pir2FoldSelf = actor { __pir2_fold_chunk : shared (Bool) -> async Bool };
 
-  /// The fold driver tick (audit-tick pattern, Phase-0 delta D4): one awaited self-call per
+  /// The fold driver tick (audit-tick pattern): one awaited self-call per
   /// tick so a trapping chunk rolls back ONLY the chunk — the catch arm here always commits
   /// the failure record and the backoff. The idle path is O(1) and self-call-free. While the
   /// sticky audit guard is set the driver pauses: fail-closed extends to derived state (D17).
@@ -1303,7 +1303,7 @@ persistent actor ZkLedger {
     processed > 0
   };
 
-  /// One bounded repair step. Order is the whole design (Phase-0 delta D3): the cursor was
+  /// One bounded repair step. Order is the whole design: the cursor was
   /// already rewound (atomically, in pir2_reindex) so nothing serves the affected shards;
   /// chain replay re-derives the digest from AUTHORITATIVE log records; zeroing clears every
   /// affected hint span (the fold is +=); then the normal catch-up refolds.

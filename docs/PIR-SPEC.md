@@ -171,12 +171,12 @@ a deliberately leaky harness variant.
   client verifies a downloaded hint by recomputing the fold from the CERTIFIED record stream
   (the fold is deterministic and byte-reproducible — the differential oracle proves it), so
   a wrong hint is detectable by any client willing to stream the shard once; synced wallets
-  never download hints at all. A compact per-page proof (freeze-time Merkle digest of 64 KB
-  hint pages with the root in the certified tree, making `pir2_hint_chunk` responses verify
-  directly against the IC certificate) is DESIGNED but not yet in the artifact — pending
-  operator approval of `for-team/proposal-pir2-hint-root-certification.md`. Until it lands,
-  hint distribution to non-streaming clients trusts replica honesty up to the
-  stream-recompute check.
+  never download hints at all. A compact per-page proof (a freeze-time chunked job that
+  Merkle-digests 64 KB hint pages and publishes the root in the certified tree, making
+  `pir2_hint_chunk` responses verify directly against the IC certificate) is DESIGNED but
+  not yet in the artifact and gates on an operator decision. Until it lands, hint
+  distribution to non-streaming clients trusts replica honesty up to the stream-recompute
+  check.
 - **Certified record stream.** `pir2_record_stream` serves densely packed
   `(position 8B BE ‖ 288 cells)` (296 B/note, measured — the tail hint's verifiable inputs).
   A per-fold chained digest `chain_i = SHA-256(chain_{i−1} ‖ cells_i)` with boundaries every

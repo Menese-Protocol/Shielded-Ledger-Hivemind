@@ -1,5 +1,5 @@
-//! pirdx battery — AC-D1..AC-D6 harness for the PIR derived-index decoupling
-//! (for-team/proposal-pir-derived-index-decoupling.md, amended by Phase 0).
+//! pirdx battery — acceptance harness for the PIR derived-index decoupling (the
+//! background-fold design that removes all PIR work from the financial append path).
 //!
 //! One binary, explicit expectations, so the SAME assertions demonstrate RED on the
 //! synchronous build and GREEN on the decoupled one:
@@ -612,7 +612,7 @@ fn phase_d4(ctx: &mut Ctx, shard_size: u64) {
         }
         return;
     }
-    // transfers keep committing while the repair runs (mission: transfers unaffected)
+    // transfers keep committing while the repair runs (the containment requirement)
     l.reindex(0).expect("pir2_reindex");
     let s = l.status();
     assert_eq!(s.index_status, Some(IndexStatusV::repairing), "AC-D4: status must be #repairing");

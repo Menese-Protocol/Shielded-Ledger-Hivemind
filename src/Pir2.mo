@@ -415,7 +415,7 @@ module {
   // ==== repair (derived-index recoverability; see the decoupling proposal) ====
   //
   // The fold is a pure function of the note log, so any shard suffix is rebuildable — but
-  // three subtleties make repair its own machinery (Phase-0 delta D3):
+  // three subtleties make repair its own machinery:
   //   1. the stream chain folds from record 0, so a refold must RESTORE chain state from the
   //      nearest DPAGE checkpoint at or below the reset point and chain-replay the remainder
   //      from authoritative log records (never from possibly-corrupt PIR regions);
