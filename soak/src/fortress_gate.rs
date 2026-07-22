@@ -286,11 +286,12 @@ pub fn build_harness_wasm(repo_root: &Path, mutate: Option<(&str, &str, &str)>) 
         }
     }
     std::fs::copy(repo_root.join("fortress/harness/Verifier.mo"), stage.join("Verifier.mo")).unwrap();
-    if let Some((module, from, to)) = mutate {
-        let mp = stage.join("groth16").join(module);
+    if let Some((rel_path, from, to)) = mutate {
+        // rel_path is stage-relative, e.g. "groth16/FpMont.mo" or "Verifier.mo".
+        let mp = stage.join(rel_path);
         let src = std::fs::read_to_string(&mp).unwrap();
         let mutated = src.replacen(from, to, 1);
-        assert_ne!(src, mutated, "planted mutation did not change {module}");
+        assert_ne!(src, mutated, "planted mutation did not change {rel_path}");
         std::fs::write(&mp, mutated).unwrap();
     }
     let moc = std::env::var("SOAK_MOC").unwrap_or_else(|_| "/opt/moc-1.4.1/moc".into());
@@ -331,6 +332,14 @@ impl Harness {
         let raw = self.pic.update_call(self.canister, candid::Principal::anonymous(), "verify_oneshot", args).expect("verify_oneshot call");
         let verdict: String = candid::decode_one(&raw).expect("decode verdict");
         verdict == "ACCEPT"
+    }
+
+    /// §10: production verify plus the instructions it consumed. (verdict==ACCEPT, count).
+    pub fn verdict_counted(&self, vk: &[u8], proof: &[u8], inputs: &[u8]) -> (bool, u64) {
+        let args = candid::encode_args((hex(vk), hex(proof), hex(inputs))).unwrap();
+        let raw = self.pic.update_call(self.canister, candid::Principal::anonymous(), "verify_counted", args).expect("verify_counted call");
+        let (verdict, count): (String, u64) = candid::decode_args(&raw).expect("decode counted verdict");
+        (verdict == "ACCEPT", count)
     }
 }
 

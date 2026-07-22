@@ -160,7 +160,7 @@ fn main() {
 
     println!("== §1 TEETH: planting a single wrong Montgomery limb in the harness ==");
     let mutant = build_harness_wasm(&root, Some((
-        "FpMont.mo",
+        "groth16/FpMont.mo",
         "0x11988fe592cae3aa9a793e85b519952d67eb88a9939d83c08de5476c4c95b6d50a76e6a609d104f1f4df1f341c341746",
         "0x11988fe592cae3aa9a793e85b519952d67eb88a9939d83c08de5476c4c95b6d50a76e6a609d104f1f4df1f341c341747",
     )));
