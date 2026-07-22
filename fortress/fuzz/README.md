@@ -14,8 +14,20 @@ targets add domain assertions (idempotent decode, canonical re-check).
 | `decode_g2` | compressed G2 (blst) | total; idempotent decode |
 | `decode_fr` | 32-byte LE Fr canonicality (blst) | total; accepted scalar survives a round-trip re-check |
 | `decode_proof` | arkworks Groth16 proof (compressed + uncompressed) | total; malformed → Err, never panic |
-| `decode_vk` | arkworks Groth16 verifying key | total; malformed → Err, never panic |
+| `decode_vk` | the BOUNDED wire-format VK parser (same IC-length bound as `cross_oracle::parse_vk`) | total, no unbounded alloc (finding F-1: the RAW arkworks deserializer is unbounded — `decode_vk_raw` reproduces it, off the gate) |
+| `public_input_parser` | Groth16 public-input vector (u64 count + 32-byte-LE canonical Fr) | total; bounded count; never accepts a non-canonical (≥ r) scalar |
+| `ceremony_contribution` | ceremony contribution wire decoder (`ceremony::transcript::delta_from_wire`) | total; malformed → Err, no unbounded alloc |
+| `ceremony_transcript` | ceremony transcript framing (length-prefixed delta records) | total on arbitrary framing; bounded loop |
+| `icrc3_block` | ICRC-3 block candid decoder (`soak::candid_types::{Value,BlockEntry,GetBlocksResult}`) | total; malformed → Err, no unbounded alloc |
+| `stable_record` | soak checkpoint / stable-record decoder (`bincode::deserialize::<Checkpoint>`) | total; corrupt record → Err, no unbounded alloc |
 | `teeth_planted_panic` | a decoder with a DELIBERATE out-of-bounds panic on the `BUG!` prefix | **must crash** — proves the harness detects a real decode bug; NOT part of the gate pass criteria; its crash input is stored as a regression |
+
+Ten real decoder targets plus the teeth target. The `ceremony_contribution` corpus includes a
+genuine 296-byte delta produced by the real ceremony encoder. The Motoko-side decoders
+(`Groth16Wire.parseProof`/`parseInputs`, `Decode.decodeG1`, `DecodeG2.decodeG2`,
+`NoteCodec.decode`) that cargo-fuzz cannot reach get the equivalent seeded structure-aware
+battery in `fortress/motoko/FuzzDecoders.mo` (`scripts/fortress-fuzz-motoko.sh`, ≥ 250k inputs
+per decoder, same no-trap / no-non-canonical-accept assertions).
 
 The Motoko-side decoders that cargo-fuzz cannot reach (`Groth16Wire`, `Decode`/`DecodeG2`,
 `NoteCodec`, ICRC-3 block codec) are covered by the equivalent seeded random-bytes battery

@@ -11,7 +11,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FUZZDIR="$ROOT/fortress"
 RUNS="${FORTRESS_FUZZ_RUNS:-200000}"
-REAL=(decode_g1 decode_g2 decode_fr decode_proof decode_vk)
+REAL=(decode_g1 decode_g2 decode_fr decode_proof decode_vk \
+      public_input_parser ceremony_contribution ceremony_transcript icrc3_block stable_record)
 
 if ! command -v cargo-fuzz >/dev/null 2>&1 || ! rustup toolchain list 2>/dev/null | grep -q nightly; then
   echo "FORTRESS-FUZZ SKIP: cargo-fuzz or a nightly toolchain is not installed" >&2

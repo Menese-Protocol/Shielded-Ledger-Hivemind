@@ -10,6 +10,10 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 blst = "0.3"
+ceremony = { path = "../../ceremony" }
+soak = { path = "../../soak" }
+bincode = "1"
+candid = "0.10"
 ark-bls12-381 = "0.5"
 ark-groth16 = "0.5"
 ark-serialize = "0.5"
@@ -56,5 +60,35 @@ doc = false
 [[bin]]
 name = "decode_vk_raw"
 path = "fuzz_targets/decode_vk_raw.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "public_input_parser"
+path = "fuzz_targets/public_input_parser.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "ceremony_contribution"
+path = "fuzz_targets/ceremony_contribution.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "ceremony_transcript"
+path = "fuzz_targets/ceremony_transcript.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "icrc3_block"
+path = "fuzz_targets/icrc3_block.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "stable_record"
+path = "fuzz_targets/stable_record.rs"
 test = false
 doc = false
