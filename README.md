@@ -136,8 +136,12 @@ locally. Every response reports `records_scanned` (always all of them) and
 The deployed parameter set (n = 1152, q = 2³², σ = 12.8, uniform secret, fresh per query) is
 pinned by a direct lattice-estimator run against the deployment's exact exposure model: the
 cheapest known lattice attack costs ≈ 2¹⁴⁷·⁷ classical operations, comfortably above the
-128-bit bar, while the worst-case decode margin stays at 19σ. The full parameter table, the
-estimate, the cost model, and the stated scaling boundaries are in
+128-bit bar, while the worst-case decode margin stays at 19σ. Frozen-shard hints are public, immutable, and
+Merkle-certified against the ledger's certified tree, so wallets fetch them from any
+untrusted mirror or CDN and verify locally — the chain certifies; it does not have to
+serve. In production the expensive stripe computation runs as caller-paid metered calls
+behind boundary rate limiting; the open unmetered query mode is for demos. The full
+parameter table, the estimate, the cost model, and the stated scaling boundaries are in
 [`docs/PIR-SPEC.md`](docs/PIR-SPEC.md).
 
 *The ledger answers without knowing the question.*

@@ -152,8 +152,14 @@ carries no data-dependent branch on cell or query content.
   A per-append chained digest `chain_i = SHA-256(chain_{i−1} ‖ cells_i)` with boundaries every
   4,096 records; the latest boundary lives in the certified tree, so a streaming client's
   recomputed chain is anchored.
-- **Metering dial.** The striping design drops into metered update execution unchanged; the
-  demo ships the query path, and the paper prices the metered stripe.
+- **Metering dial and production policy.** The striping design drops into metered update
+  execution unchanged — a stripe measured as an update call costs the same 1.098×10⁹
+  instructions as the query call (probe, both modes). The demo ships the unmetered query
+  path. **Production policy: real-value deployments serve stripes as caller-paid update
+  calls (the metered mode), fronted by boundary-side rate limiting**; the unmetered query
+  mode is a demo/read-replica configuration, not a production posture. This bounds the
+  per-caller cost of the ~1.1×10⁹-instruction stripe the same way any update is bounded,
+  and answers the operational-DoS surface of an expensive open query endpoint.
 
 ### V2.6 Epoch shards, uniform access, keyword mode
 
@@ -166,6 +172,16 @@ per shard 2²⁰, not 10⁸ — and the transcript-indistinguishability is same-
 stated, not hidden. A synced wallet computes the tail hint itself from `pir2_record_stream`
 (248 B/note marginal over today's 48 B detection entry) and downloads no hint; it queries only
 the tail shard.
+
+**Hint distribution does not need the canister.** A frozen shard's hint is public,
+immutable, target-independent data whose 64 KB pages are Merkle-digested with the root in
+the certified tree — so hints can be served by any untrusted mirror, CDN, or peer and
+verified page-by-page against the certified root at zero trust or privacy cost (the
+download reveals only the shard set, which the query schedule reveals anyway). The
+canister's `pir2_hint_chunk` (1 MiB/call) is the fallback path, not the distribution
+plan: a wallet whose [birthday, tip] window spans k frozen shards acquires its k × 79.6 MB
+of hints from mirrors at ordinary CDN speeds, once, and caches them forever (frozen shards
+never change).
 
 **Keyword mode** (fetch-by-commitment, for deep-restore repair) uses a STATIC per-shard cuckoo
 directory built at freeze (never on the append path — eviction contradicts write-once cells
@@ -211,7 +227,8 @@ queries reject until it completes. New stable regions carry layout-version heade
 does O(1) header checks; `moc --stable-compatible` old→new (old = public `08ff678`) passes and
 the candid diff is additive-only.
 
-Stated boundaries: query calls remain unmetered on the IC (the metering dial answers this at
-production scale); the shard-set access pattern leaks epoch-granularity membership (2²⁰
+Stated boundaries: the demo configuration serves queries unmetered — production serves
+stripes as caller-paid metered updates behind boundary rate limiting (§V2.5, measured at
+identical instruction cost); the shard-set access pattern leaks epoch-granularity membership (2²⁰
 anonymity set); and the security parameter set is pinned by the estimator run in §V2.3 —
 any future parameter change re-triggers that estimate before deployment.
