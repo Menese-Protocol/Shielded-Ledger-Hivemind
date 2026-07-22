@@ -105,3 +105,24 @@
       case (#err(message)) Runtime.trap(message);
     }
   };
+
+  // ===== §9 live-seam injections (hook-wasm ONLY; never in the shipped zk_ledger.wasm) =====
+
+  // Seam "during certified-state update": perform the REAL certified-data update, then trap.
+  // The IC rolls the message back atomically, so the certified data and all state must be
+  // byte-identical afterward — the battery asserts exactly that (>=25 injections).
+  public shared ({ caller }) func test_trap_during_cert_update() : async () {
+    if (not isAdministrator(caller)) Runtime.trap("test-hook:not-administrator");
+    refreshCertification();
+    Runtime.trap("TEST_ONLY:fail-during-cert-update");
+  };
+
+  // Planted double-mint: inflate pool_value without any custody backing. The solvency
+  // invariant (custody == pool_value) must break on the next sweep — the §9 teeth.
+  public shared ({ caller }) func test_force_double_credit(amount : Nat) : async () {
+    if (not isAdministrator(caller)) Runtime.trap("test-hook:not-administrator");
+    pool_value += amount;
+  };
+
+  // Read-back of pool_value for the seam battery's solvency sweep.
+  public query func test_pool_value() : async Nat { pool_value };
