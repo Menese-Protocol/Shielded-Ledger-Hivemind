@@ -94,7 +94,9 @@ for (const seed of [1, 2]) {
 
   // boundary-PROOF tamper (not bytes): a mirror lying about a Merkle boundary leaf must fail the
   // proof against the trusted root (exercises the worker's end-merkle reject path).
-  const proofMirror = makeMirror(entryAt, TOTAL, { anchor, proofTamper: (p, j) => (j === TARGET_SEG ? { leaf: (() => { const b = p.leaf.slice(); b[0] ^= 0x01; return b; })(), path: p.path } : p) });
+  // corrupt the Merkle PATH (leaf value left intact) so the chain==leaf check passes but the path
+  // no longer resolves to the trusted root — exercises the worker's end-merkle reject path.
+  const proofMirror = makeMirror(entryAt, TOTAL, { anchor, proofTamper: (p, j) => (j === TARGET_SEG && p.path.length ? { leaf: p.leaf, path: p.path.map((s, i) => (i === 0 ? { hash: (() => { const b = s.hash.slice(); b[0] ^= 0x01; return b; })(), right: s.right } : s)) } : p) });
   const proofRun = await parallelScan({ ...common, mirror: proofMirror });
   record(`tamper/seed${seed} boundaryProof(merkle-reject)`, proofRun.rejected.some((r) => r.seg === TARGET_SEG && r.reason === "end-merkle"),
     `rejected=${JSON.stringify(proofRun.rejected)}`);

@@ -1,80 +1,75 @@
-// Parallel restore scan worker (Menese DeFi Team). One persistent worker per core; processes
-// DPAGE-aligned segment tasks: VERIFY-BEFORE-SCAN (Merkle boundary proofs + chain recompute
-// against the trusted certified root) then the per-note ECDH+view-tag recognition. A segment that
-// fails verification is REJECTED and never scanned — a tampered/truncated page cannot inject a
-// false match nor silently drop a planted note into the owned set.
+// Parallel restore scan worker (Menese DeFi Team). Processes a CHUNK of consecutive DPAGE-aligned
+// segments in one tight loop (amortizes message overhead → near-linear scaling) while preserving
+// per-segment VERIFY-BEFORE-SCAN and bounded memory (one segment's bytes held at a time). Per
+// segment: recompute the chain, verify its end boundary against the trusted certified root (chain
+// value == mirror-served boundary AND that boundary's Merkle path resolves to root), and only then
+// scan its entries (ECDH + view-tag). A segment that fails verification aborts the chunk (the
+// chain is broken past it) and is reported rejected — its entries never influence the owned set.
 import { parentPort, workerData } from "node:worker_threads";
 import { makeMatcher, ENTRY_LEN } from "./kernel.mjs";
 import { DPAGE, foldEntry, verifyMerkle, zero32 } from "./detect-chain.mjs";
 import { makeSynthetic } from "./mirror.mjs";
 
-const { mode, encSk } = workerData;
+const { mode, encSk, root: rootArr } = workerData;
 const matcher = makeMatcher(mode, Uint8Array.from(encSk));
+const ROOT = Uint8Array.from(rootArr);
 const PAGE = 512;
 const pageOf = (p) => Math.floor(p / PAGE) * PAGE;
+const u8 = (a) => (a == null ? null : Uint8Array.from(a));
+const eqBytes = (a, b) => { if (a.length !== b.length) return false; for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false; return true; };
 
-function processTask(t) {
+function processChunk(t) {
   const t0 = process.hrtime.bigint();
-  // 1) materialize segment bytes (provided by the untrusted mirror, or generated for scale)
-  let bytes;
-  if (t.segBytes) bytes = new Uint8Array(t.segBytes);
+  const gen = t.seedText != null ? makeSynthetic(t.seedText, new Map((t.planted ?? []).map(([p, e]) => [p, { ephPk: u8(e.ephPk), tag: u8(e.tag) }]))) : null;
+  // chunk start anchor: L_{startSeg-1}, Merkle-verified, or 0^32 for segment 0
+  let chain;
+  if (t.startFrom === 0) chain = zero32();
   else {
-    const planted = new Map((t.planted ?? []).map(([p, e]) => [p, { ephPk: Uint8Array.from(e.ephPk), tag: Uint8Array.from(e.tag) }]));
-    const gen = makeSynthetic(t.seedText, planted);
-    bytes = new Uint8Array((t.to - t.from) * ENTRY_LEN);
-    for (let i = t.from; i < t.to; i++) bytes.set(gen(i), (i - t.from) * ENTRY_LEN);
+    const sv = u8(t.startAnchor.value), sp = t.startAnchor.path.map((s) => ({ hash: u8(s.hash), right: s.right }));
+    if (!t.skipVerify && !verifyMerkle(sv, t.startFrom / DPAGE - 1, sp, ROOT)) return reply(t.id, { rejected: [{ seg: t.startFrom / DPAGE, reason: "start-merkle" }] }, t0);
+    chain = sv;
   }
-  const root = Uint8Array.from(t.root);
-  // skipVerify is a TEST-ONLY affordance (default off): the tamper battery uses it to prove that
-  // WITHOUT verify-before-scan a truncated page silently drops a planted note (an FN) — i.e. that
-  // the verification below is load-bearing. Production never sets it.
-  if (t.skipVerify) return scanOnly(t, bytes, t0);
-  // 2) VERIFY before scan
-  // start anchor
-  let startChain;
-  if (t.from === 0) startChain = zero32();
-  else {
-    const sa = Uint8Array.from(t.startAnchor), sp = t.startProof.map((s) => ({ hash: Uint8Array.from(s.hash), right: s.right }));
-    if (!verifyMerkle(sa, t.from / DPAGE - 1, sp, root)) return reject(t.id, "start-merkle", t0);
-    startChain = sa;
-  }
-  // recompute chain across the segment
-  let chain = startChain;
-  const count = bytes.length / ENTRY_LEN;
-  for (let i = 0; i < count; i++) chain = foldEntry(chain, bytes.subarray(i * ENTRY_LEN, i * ENTRY_LEN + ENTRY_LEN));
-  // expected end
-  let expected;
-  if (t.isTip) expected = Uint8Array.from(t.cTip); // certified directly
-  else {
-    const ea = Uint8Array.from(t.endAnchor), ep = t.endProof.map((s) => ({ hash: Uint8Array.from(s.hash), right: s.right }));
-    if (!verifyMerkle(ea, t.leafIndex, ep, root)) return reject(t.id, "end-merkle", t0);
-    expected = ea;
-  }
-  let eq = chain.length === expected.length;
-  for (let i = 0; eq && i < chain.length; i++) if (chain[i] !== expected[i]) eq = false;
-  if (!eq) return reject(t.id, "chain-mismatch", t0);
-  // 3) SCAN (only reached on a verified segment)
-  return scanOnly(t, bytes, t0);
-}
-
-function scanOnly(t, bytes, t0) {
-  const count = bytes.length / ENTRY_LEN;
   const matchedPages = new Set();
-  for (let i = 0; i < count; i++) {
-    const entry = bytes.subarray(i * ENTRY_LEN, i * ENTRY_LEN + ENTRY_LEN);
-    let pos = 0; for (let k = 0; k < 8; k++) pos = pos * 256 + entry[k];
-    if (pos < t.from0) continue;
-    if (pos < t.eff) { matchedPages.add(pageOf(pos)); continue; }
-    if (matcher(entry).match) matchedPages.add(pageOf(pos));
+  let scanned = 0;
+  for (let si = 0; si < t.segs.length; si++) {
+    const s = t.segs[si];
+    // materialize one segment's bytes (provided by the untrusted mirror, or generated for scale)
+    let bytes;
+    if (t.segBytes) bytes = new Uint8Array(t.segBytes[si]);
+    else { const n = s.to - s.from; bytes = new Uint8Array(n * ENTRY_LEN); for (let i = s.from; i < s.to; i++) bytes.set(gen(i), (i - s.from) * ENTRY_LEN); }
+    // count is derived from the ACTUAL served bytes — a truncated/malformed mirror page yields a
+    // chain over fewer entries (⇒ verify mismatch), and never reads past the buffer while scanning.
+    if (bytes.length % ENTRY_LEN !== 0) return reply(t.id, { rejected: [{ seg: s.from / DPAGE, reason: "malformed-length" }], matchedPages: [...matchedPages], scanned }, t0);
+    const count = bytes.length / ENTRY_LEN;
+    // fold this segment into the running chain
+    let segChain = chain;
+    for (let i = 0; i < count; i++) segChain = foldEntry(segChain, bytes.subarray(i * ENTRY_LEN, i * ENTRY_LEN + ENTRY_LEN));
+    // VERIFY before scan
+    if (!t.skipVerify) {
+      if (s.isTip) { if (!eqBytes(segChain, u8(t.cTip))) return reply(t.id, { rejected: [{ seg: s.from / DPAGE, reason: "tip-mismatch" }], matchedPages: [...matchedPages], scanned }, t0); }
+      else {
+        const ea = u8(s.endAnchor);
+        if (!eqBytes(segChain, ea)) return reply(t.id, { rejected: [{ seg: s.from / DPAGE, reason: "chain-mismatch" }], matchedPages: [...matchedPages], scanned }, t0);
+        const ep = s.endProof.map((x) => ({ hash: u8(x.hash), right: x.right }));
+        if (!verifyMerkle(ea, s.leafIndex, ep, ROOT)) return reply(t.id, { rejected: [{ seg: s.from / DPAGE, reason: "end-merkle" }], matchedPages: [...matchedPages], scanned }, t0);
+      }
+    }
+    chain = segChain;
+    // SCAN (only reached for a verified segment)
+    for (let i = 0; i < count; i++) {
+      const entry = bytes.subarray(i * ENTRY_LEN, i * ENTRY_LEN + ENTRY_LEN);
+      let pos = 0; for (let k = 0; k < 8; k++) pos = pos * 256 + entry[k];
+      if (pos < t.from0) continue;
+      if (pos < t.eff) { matchedPages.add(pageOf(pos)); continue; }
+      if (matcher(entry).match) matchedPages.add(pageOf(pos));
+    }
+    scanned += count;
   }
-  parentPort.postMessage({ id: t.id, rejected: false, matchedPages: [...matchedPages], scanned: count, elapsedNs: Number(process.hrtime.bigint() - t0) });
+  reply(t.id, { rejected: [], matchedPages: [...matchedPages], scanned }, t0);
 }
 
-function reject(id, reason, t0) {
-  parentPort.postMessage({ id, rejected: true, reason, matchedPages: [], scanned: 0, elapsedNs: Number(process.hrtime.bigint() - t0) });
+function reply(id, fields, t0) {
+  parentPort.postMessage({ id, rejected: fields.rejected ?? [], matchedPages: fields.matchedPages ?? [], scanned: fields.scanned ?? 0, elapsedNs: Number(process.hrtime.bigint() - t0) });
 }
 
-parentPort.on("message", (msg) => {
-  if (msg.stop) { parentPort.close(); return; }
-  processTask(msg);
-});
+parentPort.on("message", (msg) => { if (msg.stop) return parentPort.close(); processChunk(msg); });

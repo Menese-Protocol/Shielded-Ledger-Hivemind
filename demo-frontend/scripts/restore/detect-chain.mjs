@@ -77,6 +77,28 @@ export function merkleProof(leafValues, j) {
   return path;
 }
 
+// Precompute all tree levels once; extract O(log) proofs cheaply (avoids O(n) rebuild per proof).
+export function merkleTree(leafValues) {
+  const levels = [leafValues.map(leafHash)];
+  while (levels[levels.length - 1].length > 1) {
+    const cur = levels[levels.length - 1], next = [];
+    for (let i = 0; i < cur.length; i += 2) next.push(i + 1 < cur.length ? nodeHash(cur[i], cur[i + 1]) : cur[i]);
+    levels.push(next);
+  }
+  const root = leafValues.length ? levels[levels.length - 1][0] : ZERO32.slice();
+  const proof = (j) => {
+    const path = []; let idx = j;
+    for (let l = 0; l < levels.length - 1; l++) {
+      const cur = levels[l];
+      if (idx % 2 === 0) { if (idx + 1 < cur.length) path.push({ hash: cur[idx + 1], right: true }); }
+      else path.push({ hash: cur[idx - 1], right: false });
+      idx = Math.floor(idx / 2);
+    }
+    return path;
+  };
+  return { root, proof };
+}
+
 export function verifyMerkle(leafValue, j, path, root) {
   let h = leafHash(leafValue);
   for (const step of path) h = step.right ? nodeHash(h, step.hash) : nodeHash(step.hash, h);

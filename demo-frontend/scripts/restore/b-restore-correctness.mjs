@@ -103,13 +103,14 @@ for (const seed of [1, 2]) {
   const oracleSet = oracle.recognizedSet, parRecog = new Set(par.notes.map((n) => `${n.position}:${n.v}`));
   const eqOracle = oracleSet.size === parRecog.size && [...oracleSet].every((k) => parRecog.has(k));
   record(`correctness/seed${seed} proof4(parallel==oracle)`, eqOracle, `oracle=${oracleSet.size} parallel=${parRecog.size}`);
-  // Proof 5: resume in two halves == single-shot
+  // Proof 5: resume == single-shot. Interrupt after a checkpoint that covers the first few
+  // segments, then resume from that checkpoint (same total) — must reproduce the one-shot set.
   let ckpt = null;
-  const half = Math.floor((TOTAL / DPAGE) / 2) * DPAGE || DPAGE;
-  const firstHalf = await parallelScan({ mode: "native", workers: 4, ...common, total: half, onCheckpoint: (c) => (ckpt = c) });
-  const resumed = await parallelScan({ mode: "native", workers: 4, ...common, checkpoint: { cursorSeg: Math.floor(half / DPAGE), matchedPages: firstHalf.matchedPages } });
-  record(`correctness/seed${seed} proof5(resume==oneshot)`, canon(resumed.notes) === canon(parNative.notes),
-    `resumed=${resumed.notes.length} oneshot=${parNative.notes.length}`);
+  const stopAfter = 2; // capture the checkpoint once >=2 segments are done, then "crash"
+  await parallelScan({ mode: "native", workers: 4, ...common, chunkSegments: 1, onCheckpoint: (c) => { if (c.doneSegs.length >= stopAfter && !ckpt) ckpt = c; } });
+  const resumed = await parallelScan({ mode: "native", workers: 4, ...common, checkpoint: ckpt });
+  record(`correctness/seed${seed} proof5(resume==oneshot)`, ckpt != null && canon(resumed.notes) === canon(parNative.notes),
+    `resumed=${resumed.notes.length} oneshot=${parNative.notes.length} ckptSegs=${ckpt?.doneSegs.length}`);
   // RED teeth: dropped-tail injection MUST miss the last planted note (proves census has teeth)
   const injured = await parallelScan({ mode: "native", workers: 4, ...common, injectDropTail: true });
   const missedLast = !setPos(injured.notes).has(TOTAL - 1) && setPos(par.notes).has(TOTAL - 1);

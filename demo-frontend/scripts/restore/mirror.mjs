@@ -6,7 +6,7 @@
 // trusted anchor before scanning; tamper batteries corrupt only the mirror path.
 import crypto from "node:crypto";
 import nacl from "tweetnacl";
-import { DPAGE, ENTRY_LEN, posBE8, buildStream, merkleProof } from "./detect-chain.mjs";
+import { DPAGE, ENTRY_LEN, posBE8, buildStream, merkleTree } from "./detect-chain.mjs";
 import { sharedKey } from "./kernel.mjs";
 
 const enc = new TextEncoder();
@@ -19,16 +19,19 @@ function viewTag(shared) {
 // ---- synthetic stream (scale mode): deterministic non-owned entries + a few planted owned ----
 // plantedMap: Map<position, {ephPk:Uint8Array(32), tag:Uint8Array(8)}> for owned notes.
 export function makeSynthetic(seedText, plantedMap = new Map()) {
-  const seed = crypto.createHash("sha256").update(seedText).digest();
+  // A cheap deterministic PRNG fills the non-owned 40 payload bytes (a valid X25519 u-coord + a
+  // non-matching tag). Generation is a STAND-IN for the network download — a real client receives
+  // these bytes from a mirror, it does not compute them — so it is deliberately light; the real
+  // per-note cost (ECDH + chain verify) is unchanged. Anchor build and worker regen use this same
+  // function, so bytes are byte-identical on both sides.
+  const seedNum = (crypto.createHash("sha256").update(seedText).digest().readUInt32LE(0)) >>> 0;
   return function entryAt(i) {
     const e = new Uint8Array(ENTRY_LEN);
     e.set(posBE8(i), 0);
     const planted = plantedMap.get(i);
     if (planted) { e.set(planted.ephPk, 8); e.set(planted.tag, 40); return e; }
-    const r = crypto.createHash("sha256").update(seed).update(posBE8(i)).digest();
-    e.set(new Uint8Array(r.buffer, 0, 32), 8);   // ephPk (valid X25519 u-coord)
-    const t = crypto.createHash("sha256").update(seed).update("tag").update(posBE8(i)).digest();
-    e.set(new Uint8Array(t.buffer, 0, 8), 40);   // non-matching tag
+    let x = (seedNum ^ (Math.imul(i, 2654435761))) >>> 0; x = x || 1;
+    for (let b = 8; b < ENTRY_LEN; b++) { x ^= x << 13; x >>>= 0; x ^= x >>> 17; x ^= x << 5; x >>>= 0; e[b] = x & 0xff; }
     return e;
   };
 }
@@ -54,10 +57,11 @@ export function plantOwned(account, wasmShim, position, seedByte) {
 // Trusted anchor over an entry generator (models the ledger's certified detect_stream leaf).
 export function buildAnchor(entryAt, total) {
   const st = buildStream(entryAt, total);
+  const tree = merkleTree(st.boundaries); // precompute once → O(log) proofs
   return {
     root: st.root, cTip: st.cTip, noteCount: total, leaf: st.leaf, boundaries: st.boundaries,
     // boundary proof for leaf j (0-based complete-segment index)
-    proofFor: (j) => ({ leaf: st.boundaries[j], path: merkleProof(st.boundaries, j) }),
+    proofFor: (j) => ({ leaf: st.boundaries[j], path: tree.proof(j) }),
   };
 }
 
