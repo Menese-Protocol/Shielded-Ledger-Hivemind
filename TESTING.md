@@ -257,6 +257,31 @@ cost probes, an inner-loop micro-bench, and a keyless-observer privacy battery.
 
 All numbers land in `docs/PIR-SPEC.md` §V2.7.
 
+## 3c. The Poseidon frontier harness: differential gate + malicious-oracle battery + cost probe
+
+The in-canister Poseidon Merkle frontier (`src/PoseidonTree.mo`, default-off behind a single
+admin-gated switch in `src/Main.mo`) is proven oracle-first: the ledger's root computation is
+byte-compared against the real arkworks code path before it is ever trusted, and the external
+tree oracle it replaces is demoted to a cross-check that the ledger itself polices.
+
+- **Source-of-truth oracle** — `cargo run --release --manifest-path Cargo.toml --bin
+  frontier-oracle -- constants|vectors <seed> <name>`: dumps the Poseidon sponge constants and
+  seeded input/output vectors from the vendored arkworks tree code (bls12-381), with in-binary
+  self-checks. The committed `tests/FrontierVectorsA/B.mo` fixtures are its output.
+- **Differential gate** — compile `tests/PoseidonDifferential.mo` with `moc $(mops sources)
+  -wasi-system-api` and run under wasmtime: 2 passes × 9,180 comparisons across seeded
+  absorb/permute/frontier-append families; traps on the first divergence with its coordinates.
+  Formula-mutant negative controls prove the gate turns red.
+- **Malicious-oracle battery** — `cargo run --release --manifest-path soak/Cargo.toml --bin
+  frontier_battery`: 38 checks. Honest-oracle cross-check mode, standalone mode (oracle fully
+  detached, ledger computes every root alone), four corruption families from an adversarial
+  oracle (wrong root, stale, truncated, corrupt lane — all rejected, historical roots never
+  polluted, the fail-closed guard latches sticky), and an upgrade-safety leg (flag and
+  authoritative root survive a canister upgrade).
+- **Cost probe** — `cargo run --release --manifest-path soak/Cargo.toml --bin
+  probe_frontier_cost`: per-append instructions and response bytes for the allocation-flat
+  `src/groth16/FrFlat.mo` backend, committed against the measured bound before integration.
+
 ## 4. Motoko unit tests
 
 - `tests/ICRC3HashTest.mo`, `tests/ICRC2BlockTest.mo`: hashing and exact block matching
