@@ -188,7 +188,7 @@ a deliberately leaky harness variant.
   hint-page Merkle structure's job (pending, above), and the per-record commitment prefix +
   envelope Poly1305 (§V2.4) authenticate decrypted records end-to-end regardless.
 - **Metering dial and production policy.** The striping design drops into metered update
-  execution unchanged — a stripe measured as an update call costs the same 1.098×10⁹
+  execution unchanged — a stripe measured as an update call costs the same 1.078×10⁹
   instructions as the query call (probe, both modes). The demo ships the unmetered query
   path. **Production policy: real-value deployments serve stripes as caller-paid update
   calls (the metered mode), fronted by boundary-side rate limiting**; the unmetered query
@@ -234,8 +234,8 @@ IS the 10⁸-scale stripe measurement.
 
 | quantity | measured | note |
 |---|---|---|
-| append hint maintenance | 198.2M instr, 2.54 MB alloc / record | **flat across 10⁴/10⁶/4×10⁶**; small next to the ~9B-instr Groth16 verify already on the append path |
-| stripe matvec | 258–280 instr/madd; K=486 → 1.098e9 instr | `target_dependent_branches = 0`; **flat across tiers** |
+| fold hint maintenance | 196.1M instr, 2.35 MB alloc / record | **flat across 10⁴/10⁶/4×10⁶**; runs in the background fold chunk (20 records ≈ 4×10⁹ instr ≤ the 5×10⁹ budget), NEVER in the money message |
+| stripe matvec | 255–261 instr/madd; K=486 → 1.078e9 instr | `target_dependent_branches = 0`; **flat across tiers**; instruction count EXACTLY equal across targets (S-1 gate, fixed-width word lanes) |
 | inner loop | 283 instr/madd (pure-Nat32 widening) | measured winner of 7 variants (v6); vs 360 for the Nat64 shape |
 | query wire | 4·m_cols(pinned) | 34,956 B at a 2¹⁸ shard's full fill |
 | response wire | 4·m_rows = 34,560 B / stripe | ≪ 2 MiB per message |
@@ -250,7 +250,7 @@ the probe). At S = 2²⁰: K ≈ 600 columns/stripe satisfies both.
 **Scaling law to 10⁸:** append and stripe costs are N-independent by construction and
 measured flat across three tiers; a full-size stripe at 10⁸-scale content is directly runnable
 (a stripe is bounded by (K, m_rows)). The 10⁸ table: 96 shards, query 69.9 KB/shard, response
-69.1 KB/stripe, hint 79.6 MB/frozen shard, append 198M instr — all measured constants.
+69.1 KB/stripe, hint 79.6 MB/frozen shard, fold 196M instr/record — all measured constants.
 
 ### V2.8 Flag, migration, boundaries
 

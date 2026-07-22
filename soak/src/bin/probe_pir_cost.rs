@@ -184,7 +184,7 @@ fn main() {
         candid::encode_args((nat(0u64), nat(shard_size), nat(0u64), nat(486u64), &qu_full)).unwrap(),
     );
     let (_, trace): (Vec<u8>, StripeTrace) = candid::decode_args(&raw).unwrap();
-    println!("[metered] stripe K=1024 as update call: {} instr", trace.instructions);
+    println!("[metered] stripe K=486 as update call: {} instr", trace.instructions);
 
     // Backfill strategy comparison at one size (240 records = 4 columns at rpc 60).
     let batch = record_batch(0xB0, 120);

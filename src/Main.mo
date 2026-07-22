@@ -315,7 +315,7 @@ persistent actor ZkLedger {
   var pir2_backfilling : Bool = false;
   var pir2_backfill_cursor : Nat = 0;
   // Records per fold chunk — the per-record fold is ~198M instr (measured, n=1152), so a
-  // chunk of 20 (~4.0e9 + decode overhead) stays under the 5e9 committed budget.
+  // chunk of 20 (~4.0e9 incl. decode overhead, measured 196M/record) stays under the 5e9 committed budget.
   let PIR2_BACKFILL_PER_TICK : Nat = 20;
   let PIR2_FOLD_FAILURE_LIMIT : Nat = 3;
   let PIR2_CHAIN_REPLAY_PER_CHUNK : Nat = 256;
