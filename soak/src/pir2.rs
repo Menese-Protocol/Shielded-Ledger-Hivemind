@@ -2,8 +2,8 @@
 //! surface implements, in independent Rust, used to byte-compare server answers and to prove
 //! client round-trip correctness before and after the Motoko integration.
 //!
-//! Scheme (docs/PIR-SPEC.md v2): LWE with n = 1024, q = 2^32 (native wrapping u32), p = 2^8
-//! (one database cell = one byte), Δ = 2^24, noise σ = 6.4 (rounded Gaussian), uniform Z_q
+//! Scheme (docs/PIR-SPEC.md v2): LWE with n = 1152, q = 2^32 (native wrapping u32), p = 2^8
+//! (one database cell = one byte), Δ = 2^24, noise σ = 12.8 (rounded Gaussian), uniform Z_q
 //! secret, fresh per query. The database is the note log projected to fixed 288-byte records
 //! (commitment(32) ‖ note_ciphertext[0..256) zero-padded), arranged per shard as an
 //! m_rows × m_cols byte matrix in column-major record fill; the hint H = D·A is maintained
@@ -12,10 +12,10 @@
 
 use sha2::{Digest, Sha256};
 
-pub const N: usize = 1024;
+pub const N: usize = 1152;
 pub const P_BITS: u32 = 8;
 pub const DELTA: u32 = 1 << 24;
-pub const SIGMA: f64 = 6.4;
+pub const SIGMA: f64 = 12.8;
 pub const RECORD_BYTES: usize = 288;
 pub const COMMITMENT_BYTES: usize = 32;
 pub const ENVELOPE_BYTES: usize = RECORD_BYTES - COMMITMENT_BYTES;
@@ -90,7 +90,7 @@ pub fn isqrt(v: usize) -> usize {
 }
 
 /// A[c, :] for one column of one shard: block k of 8 little-endian u32 words is
-/// SHA-256(A_DOMAIN ‖ shard_le64 ‖ c_le64 ‖ k_le64); n/8 = 128 blocks exactly.
+/// SHA-256(A_DOMAIN ‖ shard_le64 ‖ c_le64 ‖ k_le64); n/8 = 144 blocks exactly.
 pub fn a_row(shard: u64, c: u64) -> Vec<u32> {
     let mut out = Vec::with_capacity(N);
     for k in 0..(N / 8) as u64 {
@@ -519,9 +519,10 @@ mod tests {
         }
         let sigma_hat = (sum_sq / n_samples as f64).sqrt();
         assert!((sigma_hat - SIGMA).abs() < 0.5, "measured σ {sigma_hat}");
-        // Worst-case phase-error std at m = 17,477 with all-255 cells:
+        // Worst-case phase-error std at m = 17,477 with all-255 cells; at sigma 12.8 the
+        // headroom is ~19.4 sigma against the Delta/2 decode threshold.
         let worst = 255.0 * sigma_hat * (17_477f64).sqrt();
         let margin = (DELTA as f64 / 2.0) / worst;
-        assert!(margin > 30.0, "worst-case decode margin {margin} too small");
+        assert!(margin > 15.0, "worst-case decode margin {margin} too small");
     }
 }

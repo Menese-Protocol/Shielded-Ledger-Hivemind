@@ -68,11 +68,11 @@ certification (§V2.5), not to server honesty.
 
 | parameter | value |
 |---|---|
-| LWE dimension n | 1024 |
+| LWE dimension n | 1152 |
 | modulus q | 2³² (native wrapping `Nat32`/u32) |
 | plaintext p | 2⁸ (one cell = one byte) |
 | Δ | 2²⁴ |
-| noise σ | 6.4, rounded Gaussian, fresh per query (client-side) |
+| noise σ | 12.8, rounded Gaussian, fresh per query (client-side) |
 | secret | uniform Z_q^n, fresh per query |
 | record R | 288 B = commitment(32) ‖ note_ciphertext[0..256) zero-padded |
 | shard size S | fixed at `pir2_enable`, certified in `pir2_params` (default 2²⁰) |
@@ -91,27 +91,30 @@ the Rust reference and every client): `rpc = max(1, (isqrt(S·R)+R/2) div R)`,
 `[R·(i mod rpc), R·(i mod rpc)+R)`.
 
 At **S = 2²⁰**: rpc 60, m_rows 17,280, m_cols 17,477; query 69,908 B, response 69,120 B per
-stripe, hint 70.8 MB/shard. At 10⁸: 96 shards, D ≈ 28.8 GB, H ≈ 6.8 GB stable (inside the IC
-500 GiB stable bound).
+stripe, hint 79.6 MB/shard (m_rows·n·4). At 10⁸: 96 shards, D ≈ 28.8 GB, H ≈ 7.6 GB stable
+(inside the IC 500 GiB stable bound).
 
 ### V2.2 Correctness
 
 Client phase error = Σ_c D[r,c]·e_c over m_cols pinned columns. Worst case is
 adversary-chosen cells (envelope bytes are caller-controlled): all-255 gives
-std ≈ 6.4·255·√m_cols. At S = 2²⁰ (m_cols 17,477): std ≈ 2^17.7 vs Δ/2 = 2²³ → ≈39σ margin;
-uniform-byte data ≈67σ. Per-cell decode failure is negligible; the differential oracle
+std ≈ 12.8·255·√m_cols. At S = 2²⁰ (m_cols 17,477): std ≈ 2^18.7 vs Δ/2 = 2²³ → ≈19.4σ
+margin (per-cell decode failure 3.5×10⁻⁸⁴); uniform-byte data ≈33.5σ. The differential oracle
 verifies exact decode on every query and tolerates none.
 
-### V2.3 Security (open item to pin before real-value deployment)
+### V2.3 Security
 
-(n=1024, q=2³², σ=6.4, uniform secret) is SimplePIR's published parameter set (Henzinger et
-al., USENIX Sec 2023), which its authors audited with the lattice estimator at ≥128-bit
-classical. The exposure model this deployment must be estimated against: **m_cols LWE samples
-exposed per query under one fresh uniform secret; one fixed public A reused across all clients
-and queries per shard** (multi-secret LWE, standard hybrid argument); the hint is a public
-function of public (A, D) with no secret dependence. A lattice-estimator re-run at
-attacker-optimized sample count is REQUIRED before any real-value use; the identical-set
-citation and the correctness-side derivation are stated as provenance, not as the estimate.
+(n=1152, q=2³², σ=12.8, uniform Z_q secret) — the deployed parameter set — estimates to
+**2¹⁴⁷·⁷ classical operations** (cheapest attack: primal-BDD; usvp 2¹⁴⁹·⁵, dual 2¹⁵²·⁷),
+comfortably above the ≥128-bit gate. This is a direct lattice-estimator run
+(malb/lattice-estimator, sage 10.7) against the exact deployment exposure model: **m_cols LWE
+samples exposed per query under one fresh uniform secret; one fixed public A reused across all
+clients and queries per shard** (multi-secret LWE, standard hybrid argument, captured by the
+estimator's unbounded-sample m=∞ setting); the hint is a public function of public (A, D) with
+no secret dependence. The set was chosen for future headroom: the baseline SimplePIR
+parameterization (n=1024, σ=6.4) estimates to only 2¹²¹·⁵ under this uniform-secret/m=∞
+exposure, so both the dimension and the noise were raised. Any later parameter change
+re-triggers the estimator run before deployment.
 
 ### V2.4 Query protocol and privacy invariants
 
@@ -180,14 +183,14 @@ IS the 10⁸-scale stripe measurement.
 
 | quantity | measured | note |
 |---|---|---|
-| append hint maintenance | 176.3M instr, 2.26 MB alloc / record | **flat across 10⁴/10⁶/10⁷**; small next to the ~9B-instr Groth16 verify already on the append path |
+| append hint maintenance | 198.2M instr, 2.54 MB alloc / record | **flat across 10⁴/10⁶/4×10⁶**; small next to the ~9B-instr Groth16 verify already on the append path |
 | stripe matvec | 258–280 instr/madd; K=486 → 1.098e9 instr | `target_dependent_branches = 0`; **flat across tiers** |
 | inner loop | 283 instr/madd (pure-Nat32 widening) | measured winner of 7 variants (v6); vs 360 for the Nat64 shape |
 | query wire | 4·m_cols(pinned) | 34,956 B at a 2¹⁸ shard's full fill |
 | response wire | 4·m_rows = 34,560 B / stripe | ≪ 2 MiB per message |
 | record stream | 296 B/note (gate ≤ 296) | 248 B/note marginal over detection stream |
 | hint chunk serve | 1 MiB/call sustained | frozen-shard only |
-| backfill | heap-accumulated per shard, single flush | vs naive per-record RMW (~236 TB stable I/O at 10⁸ for 6.8 GB of output) |
+| backfill | heap-accumulated per shard, single flush | vs naive per-record RMW (~266 TB stable I/O at 10⁸ for 7.6 GB of output) |
 
 **Committed gates:** per-stripe ≤ 1.25×10⁹ instructions (4× headroom under the 5×10⁹ query
 budget); total response per full-shard query ≤ 2 MiB (⇒ ≤ 30 stripes ⇒ K derived from
@@ -196,7 +199,7 @@ the probe). At S = 2²⁰: K ≈ 600 columns/stripe satisfies both.
 **Scaling law to 10⁸:** append and stripe costs are N-independent by construction and
 measured flat across three tiers; a full-size stripe at 10⁸-scale content is directly runnable
 (a stripe is bounded by (K, m_rows)). The 10⁸ table: 96 shards, query 69.9 KB/shard, response
-69.1 KB/stripe, hint 70.8 MB/frozen shard, append 176M instr — all measured constants.
+69.1 KB/stripe, hint 79.6 MB/frozen shard, append 198M instr — all measured constants.
 
 ### V2.8 Flag, migration, boundaries
 

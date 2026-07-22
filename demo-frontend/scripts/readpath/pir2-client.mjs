@@ -1,15 +1,15 @@
 // PIR v2 client model + request-logging mock server for the B12 privacy battery
-// (Menese DeFi Team). Faithful to src/Pir2.mo / soak/src/pir2.rs: n=1024, q=2^32, p=2^8,
-// Delta=2^24, sigma=6.4, uniform secret; A expanded from the fixed domain constant. This is
+// (Menese DeFi Team). Faithful to src/Pir2.mo / soak/src/pir2.rs: n=1152, q=2^32, p=2^8,
+// Delta=2^24, sigma=12.8, uniform secret; A expanded from the fixed domain constant. This is
 // the JS twin used to assert transcript indistinguishability and selector statistics — byte
 // equality against the ledger is the Rust differential's job, not this file's.
 
 import { createHash } from "node:crypto";
 
-export const N = 1024;
+export const N = 1152;
 export const Q = 2 ** 32;
 export const DELTA = 2 ** 24;
-export const SIGMA = 6.4;
+export const SIGMA = 12.8;
 export const RECORD_BYTES = 288;
 const A_DOMAIN = Buffer.from("zk-ledger/pir2/v1/A");
 
@@ -41,7 +41,7 @@ export function place(g, i) {
 }
 export const pinnedColumns = (g, fill) => Math.ceil(fill / g.rpc);
 
-// A[c,:] for shard s — 128 SHA-256 blocks, 8 LE u32 words each.
+// A[c,:] for shard s — 144 SHA-256 blocks, 8 LE u32 words each.
 export function aRow(shard, c) {
   const out = new Uint32Array(N);
   for (let k = 0; k < N / 8; k++) {

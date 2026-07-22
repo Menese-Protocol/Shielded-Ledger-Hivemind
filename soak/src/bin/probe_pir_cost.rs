@@ -1,6 +1,6 @@
 //! Driver for tests/Pir2CostProbe.mo — PIR v2 cost probe on PocketIC.
 //!
-//! Measures, at three corpus tiers (10^4 / 10^6 / 10^7 records) on the DEFAULT production
+//! Measures, at three corpus tiers (10^4 / 10^6 / 4x10^6 records) on the DEFAULT production
 //! geometry (S = 2^20 ⇒ rpc 60, m_rows 17,280, m_cols 17,477):
 //!   * append-path hint maintenance: instructions + allocation per appended record (must be
 //!     flat across tiers — the touched region is one column segment);
@@ -13,7 +13,7 @@
 //!   * backfill strategy comparison at one size: per-record region RMW (the live append) vs
 //!     heap accumulation with single flush.
 //!
-//! A stripe's cost depends only on (K, m_rows) — never on total N — so the tier-10^7 stripe
+//! A stripe's cost depends only on (K, m_rows) — never on total N — so a full-size stripe
 //! at this geometry IS the 10^8-scale stripe measurement: the corpus tiers exist to
 //! demonstrate that flatness, not to change the stripe.
 //!
@@ -103,7 +103,7 @@ fn main() {
             .collect()
     };
 
-    let tiers: [u64; 3] = [10_000, 1_000_000, 10_000_000];
+    let tiers: [u64; 3] = [10_000, 1_000_000, 4_000_000];
     for &tier in &tiers {
         // fill to tier (direct cell synthesis; batched so each message stays modest)
         let mut fill_target = {

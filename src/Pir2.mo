@@ -9,12 +9,12 @@
 /// of (fill, stripe) only; the scan touches every cell in bounds and never branches on
 /// ciphertext content.
 ///
-/// Scheme constants (docs/PIR-SPEC.md v2): n = 1024, q = 2^32 (wrapping u32), p = 2^8,
-/// Δ = 2^24, noise σ = 6.4 (client-side), uniform Z_q secret, fresh per query. The public
+/// Scheme constants (docs/PIR-SPEC.md v2): n = 1152, q = 2^32 (wrapping u32), p = 2^8,
+/// Δ = 2^24, noise σ = 12.8 (client-side), uniform Z_q secret, fresh per query. The public
 /// matrix A is expanded from a fixed domain-separated SHA-256 counter construction — never
 /// chosen by anyone, never shipped: block k of column c in shard s is
 /// SHA-256("zk-ledger/pir2/v1/A" ‖ s_le64 ‖ c_le64 ‖ k_le64), consumed as 8 little-endian
-/// u32 words; n/8 = 128 blocks exactly.
+/// u32 words; n/8 = 144 blocks exactly.
 ///
 /// Storage: three stable Regions (packed cells D, hints H, stream-chain boundary digests),
 /// each with magic + layout-version headers in the StableLog discipline. Every u32 vector on
@@ -33,7 +33,7 @@ import Prim "mo:⛔";
 import Sha256 "mo:sha2/Sha256";
 
 module {
-  public let LWE_N : Nat = 1024;
+  public let LWE_N : Nat = 1152;
   public let DELTA : Nat64 = 16_777_216; // 2^24
   public let RECORD_BYTES : Nat = 288;
   public let COMMITMENT_BYTES : Nat = 32;
