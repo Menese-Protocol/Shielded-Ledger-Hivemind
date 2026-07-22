@@ -19,6 +19,7 @@ import Nat32 "mo:core/Nat32";
 import Nat64 "mo:core/Nat64";
 import Nat8 "mo:core/Nat8";
 import Principal "mo:core/Principal";
+import Region "mo:core/Region";
 import Runtime "mo:core/Runtime";
 import Sha256 "mo:sha2/Sha256";
 import Text "mo:core/Text";
@@ -312,6 +313,11 @@ persistent actor ZkLedger {
   // A fresh configure() installs the recipient-bound v2 statement immediately.
   var transfer_statement_version : Nat = 1;
   var test_fail_after_token_once : Bool = false;
+  // Fault-injection hook for the PIR fold (AC-D1/AC-D4 battery; test_fail_after_token_once
+  // precedent): while > 0, the fold path traps. In the synchronous wiring the in-message
+  // rollback keeps the counter armed (every transfer traps until disarmed) — the exact
+  // money-path coupling the derived-index decoupling removes.
+  var test_pir2_fold_trap_remaining : Nat = 0;
   let stable_layout_version : Nat = STABLE_LAYOUT_VERSION;
 
   // ==== background stable-state audit (postupgrade-scale fix) ====
@@ -1119,6 +1125,7 @@ persistent actor ZkLedger {
   /// backfilled state is bit-identical to one built incrementally.
   func pir2BackfillTick() : async () {
     if (not pir2_backfilling) return;
+    maybeTrapPir2Fold();
     var processed = 0;
     label chunk while (processed < PIR2_BACKFILL_PER_TICK and pir2_state.record_count < noteCount()) {
       let block = blockAt(pir2_state.record_count);
@@ -1179,6 +1186,36 @@ persistent actor ZkLedger {
       case (?(digest, covered)) #ok({ digest; covered });
       case null #err("REJECT:pir2-no-boundary");
     }
+  };
+
+  /// Fault-injection point for the PIR fold path (consumed wherever the fold executes).
+  func maybeTrapPir2Fold() {
+    if (test_pir2_fold_trap_remaining > 0) Runtime.trap("pir2-fold:test-trap");
+  };
+
+  /// Arm `count` forced fold traps (admin; AC-D1 containment battery). Arming with 0 disarms.
+  /// Touches ONLY test state, never ledger state, so it carries no guard check — the battery
+  /// must be able to disarm while degraded.
+  public shared ({ caller }) func test_arm_pir2_fold_trap(count : Nat) : async Result<()> {
+    if (not isAdministrator(caller)) return #err("REJECT:not-administrator");
+    test_pir2_fold_trap_remaining := count;
+    #ok(())
+  };
+
+  /// Deliberately corrupt `len` bytes of shard `shard`'s hint region at byte `offset`
+  /// (XOR 0xFF), bounded to the shard's span — the AC-D4 repairability battery's injection
+  /// (admin; the repair path must restore byte-identity from the authoritative log).
+  public shared ({ caller }) func test_pir2_corrupt_hint(shard : Nat, offset : Nat, len : Nat) : async Result<()> {
+    if (not isAdministrator(caller)) return #err("REJECT:not-administrator");
+    if (not pir2_state.enabled) return #err("REJECT:pir2-not-enabled");
+    let g = Pir2.geometry(pir2_state.shard_size);
+    let total = Nat64.toNat(Pir2.hintBytesPerShard(g));
+    if (offset >= total or len == 0 or offset + len > total) return #err("REJECT:corrupt-range");
+    let base = Pir2.hRowOffset(g, shard, 0) + Nat64.fromNat(offset);
+    let bytes = Blob.toArray(Region.loadBlob(pir2_state.h_region, base, len));
+    let flipped = Array.tabulate<Nat8>(len, func(i) { bytes[i] ^ 0xFF });
+    Region.storeBlob(pir2_state.h_region, base, Blob.fromArray(flipped));
+    #ok(())
   };
 
   /// Fail-closed rejection for every state-mutating endpoint while the guard is set.
@@ -1526,6 +1563,7 @@ persistent actor ZkLedger {
     // its cursor chases the growing tail); once caught up the hook maintains every new note.
     if (pir2_state.enabled and not pir2_backfilling) {
       if (pir2_state.record_count != position) Runtime.trap("stable-state:pir2-position");
+      maybeTrapPir2Fold();
       Pir2.append(pir2_state, output.commitment, output.note_ciphertext);
     };
   };
