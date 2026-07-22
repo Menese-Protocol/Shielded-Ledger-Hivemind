@@ -26,6 +26,10 @@ struct ExpectedTuple {
     /// digest of the background audit verdict leaf (ICRC-3 map hash of {state:"pass"}
     /// on a healthy ledger); callers assert audit PASS before fetching
     audit_digest: Vec<u8>,
+    /// optional PIR-v2 record-stream boundary leaf (digest(32) ‖ covered 8B BE) — present
+    /// only on deployments with the pir2 layer enabled AND a DPAGE boundary reached; the
+    /// canonical tree without it is byte-identical to the pre-pir2 one
+    pir2_boundary: Option<Vec<u8>>,
     minimum_tip: u64,
 }
 
@@ -81,6 +85,13 @@ fn expected(args: &[String]) -> Result<ExpectedTuple, String> {
         archive_manifest: hex::decode(argument(args, "--archive-manifest")?)
             .map_err(|e| e.to_string())?,
         audit_digest: hex::decode(argument(args, "--audit-digest")?).map_err(|e| e.to_string())?,
+        pir2_boundary: match args.iter().position(|value| value == "--pir2-boundary") {
+            Some(position) => Some(
+                hex::decode(args.get(position + 1).ok_or("missing value for --pir2-boundary")?)
+                    .map_err(|e| e.to_string())?,
+            ),
+            None => None,
+        },
         minimum_tip: argument(args, "--minimum-tip")?
             .parse()
             .map_err(|e| format!("minimum tip: {e}"))?,
@@ -112,7 +123,13 @@ fn canonical_tree(tuple: &ExpectedTuple, tip_index_leaf: Vec<u8>, note_root: Vec
                         labeled("encoding_version", leaf(leb128(tuple.encoding_version))),
                         fork(
                             labeled("note_count", leaf(leb128(tuple.note_count))),
-                            labeled("note_root", leaf(note_root)),
+                            match &tuple.pir2_boundary {
+                                Some(boundary) => fork(
+                                    labeled("note_root", leaf(note_root)),
+                                    labeled("pir2_boundary", leaf(boundary.clone())),
+                                ),
+                                None => labeled("note_root", leaf(note_root)),
+                            },
                         ),
                     ),
                 ),
