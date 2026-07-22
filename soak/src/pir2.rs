@@ -506,6 +506,82 @@ mod tests {
         assert_eq!(from_wire(&to_wire(&words)), words);
     }
 
+    // R2-SAMPLER (S-3): committed moment/tail regression for gaussian_error, with mutation
+    // teeth. Bounds committed BEFORE running (seeded → deterministic):
+    //   |mean| <= 4σ/√n; σ̂ within σ·(1±0.01) both directions (sd(σ̂) ≈ σ/√(2n) ≈ 0.16%·σ;
+    //   the rounded-Gaussian variance σ²+1/12 adds +0.025% — inside the window);
+    //   count(|e|>4σ) >= 3 (a clipped/thin-tailed sampler yields 0; healthy expectation ~11);
+    //   count(|e|>6.5σ) == 0 (P ≈ 8e-11/sample; Box–Muller hard cap is 8.57σ);
+    //   zero-fraction within ±10% of erf(0.5/(σ√2)) ≈ 0.031157.
+    fn sampler_failures(samples: &[i64], sigma: f64) -> Vec<String> {
+        let n = samples.len() as f64;
+        let mut fails = Vec::new();
+        let mean = samples.iter().map(|&e| e as f64).sum::<f64>() / n;
+        let sigma_hat = (samples.iter().map(|&e| (e as f64) * (e as f64)).sum::<f64>() / n).sqrt();
+        let zeros = samples.iter().filter(|&&e| e == 0).count() as f64;
+        let tail4 = samples.iter().filter(|&&e| (e as f64).abs() > 4.0 * sigma).count();
+        let tail65 = samples.iter().filter(|&&e| (e as f64).abs() > 6.5 * sigma).count();
+        if mean.abs() > 4.0 * sigma / n.sqrt() {
+            fails.push(format!("mean {mean}"));
+        }
+        if sigma_hat < sigma * 0.99 || sigma_hat > sigma * 1.01 {
+            fails.push(format!("sigma_hat {sigma_hat}"));
+        }
+        if tail4 < 3 {
+            fails.push(format!("tail4 {tail4}"));
+        }
+        if tail65 != 0 {
+            fails.push(format!("tail65 {tail65}"));
+        }
+        let p0 = libm_erf(0.5 / (sigma * std::f64::consts::SQRT_2));
+        let f0 = zeros / n;
+        if f0 < p0 * 0.9 || f0 > p0 * 1.1 {
+            fails.push(format!("zero-fraction {f0} vs {p0}"));
+        }
+        fails
+    }
+
+    // Abramowitz–Stegun 7.1.26 (|err| < 1.5e-7, far inside the ±10% zero-fraction window)
+    fn libm_erf(x: f64) -> f64 {
+        let t = 1.0 / (1.0 + 0.3275911 * x);
+        let y = 1.0
+            - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t
+                + 0.254829592)
+                * t
+                * (-x * x).exp();
+        if x >= 0.0 { y } else { -y }
+    }
+
+    #[test]
+    fn sampler_moments_committed() {
+        let mut r = rng(20260722);
+        let n = 200_000;
+        let samples: Vec<i64> =
+            (0..n).map(|_| gaussian_error(|| r.next_u32()) as i32 as i64).collect();
+        let fails = sampler_failures(&samples, SIGMA);
+        assert!(fails.is_empty(), "sampler bounds violated: {fails:?}");
+    }
+
+    #[test]
+    fn sampler_moments_have_teeth() {
+        let mut r = rng(20260722);
+        let n = 200_000;
+        let base: Vec<i64> = (0..n).map(|_| gaussian_error(|| r.next_u32()) as i32 as i64).collect();
+        // every mutation must trip at least one committed bound
+        let scaled: Vec<i64> = base.iter().map(|&e| (e as f64 * 1.05).round() as i64).collect();
+        assert!(!sampler_failures(&scaled, SIGMA).is_empty(), "scaled sampler not detected");
+        let biased: Vec<i64> = base.iter().map(|&e| e.abs()).collect();
+        assert!(!sampler_failures(&biased, SIGMA).is_empty(), "abs-biased sampler not detected");
+        let clip = (3.0 * SIGMA) as i64;
+        let clipped: Vec<i64> = base.iter().map(|&e| e.clamp(-clip, clip)).collect();
+        assert!(!sampler_failures(&clipped, SIGMA).is_empty(), "clipped sampler not detected");
+        let zero_suppressed: Vec<i64> = base.iter().map(|&e| if e == 0 { 1 } else { e }).collect();
+        assert!(
+            !sampler_failures(&zero_suppressed, SIGMA).is_empty(),
+            "zero-suppressed sampler not detected"
+        );
+    }
+
     // R2-NOISE: empirical noise scale sits near σ and far inside the decode margin at the
     // default geometry's worst case (all-255 database, m_cols terms).
     #[test]

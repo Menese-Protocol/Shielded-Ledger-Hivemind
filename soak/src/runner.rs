@@ -308,6 +308,10 @@ pub struct Runner {
     executed_start: u64,
     next_upgrade_start: usize,
     pub started: Instant,
+    /// per-accepted-op message instruction counts (MutationResult.instructions), in submit
+    /// order — the pirdx battery compares these across flag-off/flag-on runs at the same
+    /// seed to prove the money-path delta is zero (AC-D6a)
+    pub op_instructions: Vec<u64>,
 }
 
 #[derive(Default)]
@@ -402,6 +406,7 @@ impl Runner {
                         executed_start: executed,
                         next_upgrade_start: next_upgrade,
                         started: Instant::now(),
+                        op_instructions: Vec::new(),
                     };
                     // consistency: the reloaded canister must agree with the reloaded model
                     let status = runner.env.ledger_status();
@@ -489,6 +494,7 @@ impl Runner {
             executed_start: 0,
             next_upgrade_start: 0,
             started: Instant::now(),
+            op_instructions: Vec::new(),
         }
     }
 
@@ -1010,7 +1016,10 @@ impl Runner {
             .collect()
     }
 
-    fn assert_state_matches(&self, m: &ct::MutationResult, context: &str) {
+    fn assert_state_matches(&mut self, m: &ct::MutationResult, context: &str) {
+        if let Some(instr) = m.instructions {
+            self.op_instructions.push(instr);
+        }
         let root = f_bytes(&self.model.mirror.root());
         assert_eq!(m.note_root.as_slice(), root.as_slice(), "{context}: note_root diverged from model");
         assert_eq!(

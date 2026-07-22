@@ -59,9 +59,12 @@ self-computes) a one-time **hint H = D·A**, then sends a single `m_cols`-length
 public column-range stripes. The client recovers its record from `D·qu − (D·A)·s = Δ·D[:,c*]`.
 
 The distinguishing property from textbook SimplePIR: **there is no offline preprocessing
-step.** The ledger is append-only, so each append folds exactly one column segment into H
-inside the same replicated, instruction-metered transaction that writes the note — the ledger
-IS the preprocessor, and consensus replicates it. Hint integrity therefore reduces to ledger
+step.** The ledger is append-only and the ledger itself maintains H as a **recoverable
+derived index**: a replicated background fold driver trails the authoritative note log and
+folds one column segment per record into H, with an explicit freshness watermark
+`indexed_upto` (§V2.8a). The financial append is complete without the index — a PIR fault
+can degrade index freshness, never the money path — while every fold still executes as
+replicated, instruction-metered consensus work. Hint integrity therefore reduces to ledger
 certification (§V2.5), not to server honesty.
 
 ### V2.1 Parameters
@@ -72,7 +75,7 @@ certification (§V2.5), not to server honesty.
 | modulus q | 2³² (native wrapping `Nat32`/u32) |
 | plaintext p | 2⁸ (one cell = one byte) |
 | Δ | 2²⁴ |
-| noise σ | 12.8, rounded Gaussian, fresh per query (client-side) |
+| noise σ | 12.8, rounded Gaussian, fresh per query (client-side); see sampler note below |
 | secret | uniform Z_q^n, fresh per query |
 | record R | 288 B = commitment(32) ‖ note_ciphertext[0..256) zero-padded |
 | shard size S | fixed at `pir2_enable`, certified in `pir2_params` (default 2²⁰) |
@@ -84,6 +87,19 @@ read as 8 little-endian u32 words. Every client and the reference COMPILE IN the
 MUST trap if `pir2_params` echoes a different one (certification proves what the canister
 says, not that a seed is honest; the compiled constant is the actual defense against a
 trapdoored A).
+
+**Sampler note (measured by the S-3 battery, with mutation teeth):** every client draws the
+noise by Box–Muller over 53-bit uniforms and rounds to an integer. Two properties are
+inherent and accepted: (1) a hard tail cap at `sqrt(2·ln(2^53+1)) ≈ 8.57σ` — the true
+Gaussian mass beyond it is ≈ 1e-17, far below any decode or security margin at these
+parameters; (2) ROUNDING adds variance: a rounded Gaussian has variance `σ² + 1/12`
+(+0.025% at σ = 12.8), which is security-CONSERVATIVE relative to the estimator's
+discrete-Gaussian model (more noise, never less) and negligible for correctness (the 19.4σ
+worst-case margin already includes it). The moment/tail regression
+(`soak pir2::sampler` tests + `demo-frontend/scripts/readpath/s3-sampler-battery.mjs`)
+asserts mean, σ̂ (both directions), tail mass, and zero-fraction with committed thresholds
+for the Rust reference, the JS battery twin, AND the shipped wasm client (noise recovered
+from real `pir_selectors` ciphertexts with a known secret).
 
 **Derived geometry** (pure integer function of S, R; `src/Pir2.mo:geometry`, byte-identical in
 the Rust reference and every client): `rpc = max(1, (isqrt(S·R)+R/2) div R)`,
@@ -125,7 +141,8 @@ by default, quantizing the sync-point fingerprint):
 2. Per stripe `pir2_query(σ, f, stripe, kCols, qu)` scans EXACTLY the stripe's pinned columns
    — bounds are public functions of `(f, stripe)`, never of the target. Response = dense
    `m_rows`-word partial vector + a trace (`cells_scanned`, `target_dependent_branches`,
-   `instructions`) + the current fill (client requires ≥ f, catching lagging replicas).
+   `instructions`, `indexed_upto`); the client requires `indexed_upto ≥ f`, catching lagging
+   replicas exactly.
 3. Client sums the stripe partials and decodes its R rows; **integrity for free**: decrypted
    cells [0..32) MUST equal the target's expected commitment from the detection stream, and
    the envelope's Poly1305 authenticates the rest.
@@ -136,22 +153,40 @@ keyword candidates (§V2.6); pin fills to column boundaries. The privacy battery
 detects a partial-schedule client (B12 proof C).
 
 **Auditable invariants:** every stripe's trace carries `records_scanned = full stripe` and
-`target_dependent_branches = 0` as canister state, replayable by anyone. `answerStripe`
-carries no data-dependent branch on cell or query content.
+`target_dependent_branches = 0`. These counters are **auditable declarations over
+inspectable loop bounds** — the scan loop's bounds are public functions of `(f, stripe)`
+and the source carries no data-dependent branch on cell or query content — NOT dynamic
+information-flow evidence. The measured claim is enforced separately: the differential's
+S-1 gate asserts the trace's `instructions` field EXACTLY equal across different-target
+queries at identical `(σ, f, stripe, kCols)` on a deterministic replica (word assembly runs
+in fixed-width lanes so the count cannot depend on wire content), with teeth proven against
+a deliberately leaky harness variant.
 
 ### V2.5 Certification — the on-chain novelty
 
-- **The ledger is the preprocessor.** Preprocessing is replicated, instruction-metered, and
-  transactional with the append. No offline step exists.
-- **Certified frozen hints.** Only frozen shards serve hint downloads. At freeze a chunked job
-  Merkle-digests 64 KB hint pages and publishes the root in the certified tree next to
-  `note_root`; `pir2_hint_chunk` responses verify against the IC certificate. SimplePIR's
-  silent-wrong-hint failure becomes detectable equivocation.
+- **The ledger is the preprocessor.** Preprocessing is replicated and instruction-metered,
+  maintained by the ledger's own background fold driver behind the `indexed_upto` watermark
+  (§V2.8a). No offline step and no third-party preprocessor exists.
+- **Frozen-hint integrity — what holds today.** Only frozen shards serve hint downloads. A
+  client verifies a downloaded hint by recomputing the fold from the CERTIFIED record stream
+  (the fold is deterministic and byte-reproducible — the differential oracle proves it), so
+  a wrong hint is detectable by any client willing to stream the shard once; synced wallets
+  never download hints at all. A compact per-page proof (freeze-time Merkle digest of 64 KB
+  hint pages with the root in the certified tree, making `pir2_hint_chunk` responses verify
+  directly against the IC certificate) is DESIGNED but not yet in the artifact — pending
+  operator approval of `for-team/proposal-pir2-hint-root-certification.md`. Until it lands,
+  hint distribution to non-streaming clients trusts replica honesty up to the
+  stream-recompute check.
 - **Certified record stream.** `pir2_record_stream` serves densely packed
   `(position 8B BE ‖ 288 cells)` (296 B/note, measured — the tail hint's verifiable inputs).
-  A per-append chained digest `chain_i = SHA-256(chain_{i−1} ‖ cells_i)` with boundaries every
-  4,096 records; the latest boundary lives in the certified tree, so a streaming client's
-  recomputed chain is anchored.
+  A per-fold chained digest `chain_i = SHA-256(chain_{i−1} ‖ cells_i)` with boundaries every
+  4,096 records; the latest boundary digest (with its covered count, as
+  `digest(32) ‖ count(8B BE)` under the `pir2_boundary` label) lives in the certified tree,
+  so a streaming client's recomputed chain is anchored to consensus. The chain is
+  **sequential integrity**: it proves a streamed prefix byte-exact against the anchor. There
+  is NO compact independent per-record certificate — random access with integrity is the
+  hint-page Merkle structure's job (pending, above), and the per-record commitment prefix +
+  envelope Poly1305 (§V2.4) authenticate decrypted records end-to-end regardless.
 - **Metering dial and production policy.** The striping design drops into metered update
   execution unchanged — a stripe measured as an update call costs the same 1.098×10⁹
   instructions as the query call (probe, both modes). The demo ships the unmetered query
