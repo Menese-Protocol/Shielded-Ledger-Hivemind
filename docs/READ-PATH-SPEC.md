@@ -114,9 +114,12 @@ from the deploy record, never a guess.
      replaces the single `retrieveMatchedPage` seam with a private single-record fetch.
   2. **Birthday age** — a birthday scan's fetch start reveals the wallet is at least that old.
   3. **The one heavy residual case** — birthday-less full-history restore (~4.8 GB detection stream +
-     ~N ECDH at 100 M, parallelizable). This single case is the OMR justification;
-     `detection_stream` and the OMR clue (block-format change) are independent and
-     coexist. FMD is EXCLUDED by design on transparent-execution infrastructure.
+     ~N ECDH at 100 M). Detection here is Ω(N) by privacy design and stays Ω(N); what was open was
+     whether that honest linear scan is *operationally* affordable. It now is — see
+     "Birthday-less restore at scale" below (certified mirror distribution + a parallel client
+     scanner). This is an OPERATIONAL closure of the linear scan, not sublinear detection: the
+     sublinear leg (on-chain homomorphic detection) remains PARKED per the measured OMR go/no-go,
+     and FMD is EXCLUDED by design on transparent-execution infrastructure.
 
 ## Boundaries at scale (stated openly)
 
@@ -126,3 +129,40 @@ from the deploy record, never a guess.
 2. **Query calls are unmetered on the IC** (same caveat as PIR-SPEC §Known boundaries): a cheap
    caller can force the full `detection_stream`/`icrc3_get_blocks` scan work. Production must bound
    this (metered windows, dedicated replicas); for the valueless demo it is accepted and documented.
+
+## Birthday-less restore at scale (residual #3, closed operationally)
+
+A wallet with no birthday must scan the full detection stream from genesis. Detection stays Ω(N)
+— privacy forbids a recipient index — so closure means making the honest linear scan cheap in
+bytes, in compute, and in trust. Two pieces do that; neither changes consensus or ledger state.
+
+**Certified mirror distribution of the stream.** The detection stream is public, immutable,
+target-independent data, so any untrusted mirror or CDN can serve it — provided the client can
+verify what it received. A per-append SHA-256 chain over the exact 48-B entries
+(`c_{i+1} = SHA256(c_i ‖ pos_i ‖ ciphertext_i[0..40])`) publishes a boundary digest every 4,096
+notes; those boundaries are the leaves of a Merkle tree whose root is folded into the ledger's
+certified tree (the `detect_stream` anchor). A client verifies each 4,096-note segment
+independently — two O(log) Merkle boundary proofs against the certified root, then a chain
+recompute across the segment — and rejects any bit-flip, truncation, reorder, or splice **before**
+that segment's entries touch the owned set. Serving is untrusted; the chain certifies. The anchor
+is additive and default-off: with it disabled the ledger's certified state is byte-for-byte what
+it was before the feature existed.
+
+**Parallel client scanner.** The per-note work — one X25519 ECDH plus one view-tag compare (the
+tag saves the trial decryption, not the ECDH) — parallelizes across cores. A streaming,
+resumable, worker-pool scanner partitions the stream into segments, verifies-then-scans each, and
+unions matched pages; it never holds more than one segment per worker in memory and checkpoints a
+cursor that always lags the durably-recorded matches (crash-safe, no double-count, no gap). The
+recovered owned-note set is byte-identical to a single-threaded reference scan — zero false
+negatives is an absolute gate — and the compute kernel is isolated behind a pure
+`(ephemeral_key, secret) → shared` boundary so a native or WebGPU implementation drops in without
+changing the recognition logic.
+
+**Measured (this reference box, 24 cores).** Verified wire cost is 48 B/note (4.8 GB at 100 M),
+served from a mirror at ordinary CDN speeds and verified once; page verification adds ~0.2% to the
+scan. The scanner scales near-linearly — 6.9× on 8 workers — and recovers a full 100-million-note
+birthday-less history, verified end-to-end, in **about 6.5 minutes** of 8-worker compute, versus the
+hundreds of days an on-chain homomorphic scan would take. Peak memory stays under 1 GB (the 4.8 GB
+stream is never materialized), and zero owned notes are missed. This is an operational closure of
+the linear scan; it does not make detection sublinear, and the sublinear route stays parked pending
+a construction whose cost is operationally sane on transparent-execution infrastructure.

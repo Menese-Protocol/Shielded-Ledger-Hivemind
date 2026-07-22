@@ -1,8 +1,0 @@
-{"N":1000000,"W":1,"chunkSegments":null,"wallSec":28.806752703,"notesPerSec":34714.0828509927,"ownedOk":true,"rejected":0,"chunks":9,"anchorBuildSec":0.978304935,"peakMB":124.93359375,"wireGB":0.04470348358154297}
-{"N":1000000,"W":2,"chunkSegments":null,"wallSec":13.923334381,"notesPerSec":71821.87632903621,"ownedOk":true,"rejected":0,"chunks":17,"anchorBuildSec":1.006049892,"peakMB":150.65234375,"wireGB":0.04470348358154297}
-{"N":1000000,"W":4,"chunkSegments":null,"wallSec":7.383952726,"notesPerSec":135428.81937459466,"ownedOk":true,"rejected":0,"chunks":35,"anchorBuildSec":1.051413146,"peakMB":204.1015625,"wireGB":0.04470348358154297}
-{"N":1000000,"W":8,"chunkSegments":null,"wallSec":4.160864418,"notesPerSec":240334.67557221424,"ownedOk":true,"rejected":0,"chunks":82,"anchorBuildSec":1.00435329,"peakMB":308.9609375,"wireGB":0.04470348358154297}
-{"N":10000000,"W":1,"chunkSegments":null,"wallSec":281.644946491,"notesPerSec":35505.69653242314,"ownedOk":true,"rejected":0,"chunks":9,"anchorBuildSec":9.899196778,"peakMB":197.0703125,"wireGB":0.4470348358154297}
-{"N":10000000,"W":2,"chunkSegments":null,"wallSec":143.872072761,"notesPerSec":69506.19260634398,"ownedOk":true,"rejected":0,"chunks":17,"anchorBuildSec":9.840950738,"peakMB":275.36328125,"wireGB":0.4470348358154297}
-{"N":10000000,"W":4,"chunkSegments":null,"wallSec":75.699718987,"notesPerSec":132100.88668515813,"ownedOk":true,"rejected":0,"chunks":33,"anchorBuildSec":9.949427192,"peakMB":414.93359375,"wireGB":0.4470348358154297}
-{"N":10000000,"W":8,"chunkSegments":null,"wallSec":40.964788143,"notesPerSec":244112.08877956285,"ownedOk":true,"rejected":0,"chunks":65,"anchorBuildSec":10.403407958,"peakMB":665.953125,"wireGB":0.4470348358154297}
