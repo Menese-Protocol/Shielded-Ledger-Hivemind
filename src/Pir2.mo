@@ -9,7 +9,7 @@
 /// of (fill, stripe) only; the scan touches every cell in bounds and never branches on
 /// ciphertext content.
 ///
-/// Scheme constants (docs/PIR-SPEC.md v2): n = 1152, q = 2^32 (wrapping u32), p = 2^8,
+/// Scheme constants (docs/PIR-V2-SPEC.md): n = 1152, q = 2^32 (wrapping u32), p = 2^8,
 /// Δ = 2^24, noise σ = 12.8 (client-side), uniform Z_q secret, fresh per query. The public
 /// matrix A is expanded from a fixed domain-separated SHA-256 counter construction — never
 /// chosen by anyone, never shipped: block k of column c in shard s is

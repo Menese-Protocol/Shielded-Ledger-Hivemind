@@ -283,7 +283,7 @@ cost probes, an inner-loop micro-bench, and a keyless-observer privacy battery.
   the shipped wasm sampler (via `pir_selectors` noise extraction), and `pir_random_u64`;
   mirrored in `cargo test --lib pir2` (`sampler_moments_*`).
 
-All numbers land in `docs/PIR-SPEC.md` §V2.7.
+All numbers land in `docs/PIR-V2-SPEC.md` §V2.7.
 
 ## 3c. The Poseidon frontier harness: differential gate + malicious-oracle battery + cost probe
 
@@ -347,6 +347,48 @@ batteries assert exactly what a wallet fetched) and an adversary-capable mock di
   on-chain counterparts under PocketIC: wire bytes/note and instructions/note for
   `detection_stream`, and the directory's old-to-new upgrade with stable-map survival and
   guard re-verification.
+
+## 5b. The restore battery: `demo-frontend/scripts/restore/`
+
+Node-only, standalone (`node scripts/restore/<file>` from `demo-frontend/`):
+
+- **`b-restore-correctness.mjs`** (12 checks, 2 seeds): the parallel verify-before-scan
+  client's owned set is byte-identical to the sequential reference AND an independent
+  genesis-walk oracle; native == reference kernel; resume == one-shot; planted census
+  exact. RED teeth: a dropped-tail injection misses the last planted note.
+- **`b-restore-tamper.mjs`** (14 checks): mirror corruption classes (bitflip, truncation,
+  reorder, splice, Merkle-path tamper) all rejected BEFORE scan; honest refetch restores
+  the full set. RED teeth: verify disabled → the truncation silently drops a note.
+- **`b-restore-boundary.mjs`** (38 checks): the segment PROTOCOL battery — exact entry
+  count per segment, position continuity (gap/duplicate/overflow-in-parse), partial-tip
+  binding (short/long tail vs the one-certificate noteCount), and cross-certificate
+  mixing (root/cTip/leaf from two certificates, plus the stale-prefix mix) rejected by
+  the mandatory certificate-leaf binding with ZERO mirror traffic. Teeth per case: each
+  corruption re-run with its detector disabled is either accepted silently (chain verify
+  load-bearing) or caught by the independent position-continuity guard (defense in depth).
+- **`bench-envelope.mjs`** (device envelope, one row per invocation) +
+  **`scale-run.mjs`** (A-4 scale proof): the measured rows and zero-FN censuses published
+  in `docs/RESTORE-BENCHMARKS.md`.
+
+## 5c. The detect-chain battery: frontier + persistence
+
+- **Offline half** — `./scripts/detect-battery.sh`: frozen-vector reproducibility
+  (`tests/detect-frontier-vectors.json` regenerates byte-identically from the JS
+  reference), the Motoko frontier differential with planted-mutant teeth
+  (`tests/DetectFrontierDifferential.mo`: exhaustive 0..300, 1,000 seeded random sizes,
+  the 24,414-boundary scale point, rebuild-from-boundaries), cross-language vectors
+  through the production `DetectChain.append` path, the detect-chain unit vectors, and
+  the certified-tuple flag-off byte-identity proof.
+- **Stateful half** — `cargo run --release --manifest-path soak/Cargo.toml --bin
+  detect_battery` (PocketIC, hook wasm): audit teeth (5 corruption classes → exact
+  `detect-chain:*` FAIL codes + sticky guard), rebuild-from-log recovery (byte-identical
+  anchor from the note log alone, including a full wipe), and the populated-chain upgrade
+  drill under the committed postupgrade bounds.
+- **Soak leg** — `SOAK_DETECT_CHAIN=1 cargo run --release --manifest-path soak/Cargo.toml
+  -- run`: the whole corpus maintains the anchor; every upgrade byte-compares it against
+  an independent Rust recompute over the served `detection_stream`; the final certified
+  tuple must carry exactly the recomputed `detect_stream` leaf. Default OFF — the
+  flag-off smoke's STATE-HASH is the byte-identity gate.
 
 ## 6. Reading a soak report
 

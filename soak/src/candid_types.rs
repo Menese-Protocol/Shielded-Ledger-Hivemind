@@ -107,6 +107,22 @@ pub struct PostupgradeStats {
     pub heap_after: Nat,
 }
 
+// Motoko `detect_stream_anchor` payload: { root; c_tip; note_count }
+#[derive(CandidType, Deserialize, Clone, Debug)]
+pub struct DetectAnchor {
+    pub root: Blob,
+    pub c_tip: Blob,
+    pub note_count: Nat,
+}
+
+// Motoko `detect_rebuild_status` payload: { active; cursor; error }
+#[derive(CandidType, Deserialize, Clone, Debug)]
+pub struct DetectRebuildStatus {
+    pub active: bool,
+    pub cursor: Nat,
+    pub error: Option<String>,
+}
+
 #[derive(CandidType, Deserialize, Clone, Debug)]
 pub struct MutationResult {
     pub outcome: String,

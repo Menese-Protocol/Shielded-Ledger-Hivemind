@@ -10,9 +10,18 @@ import { makeMatcher, ENTRY_LEN } from "./kernel.mjs";
 import { DPAGE, foldEntry, verifyMerkle, zero32 } from "./detect-chain.mjs";
 import { makeSynthetic } from "./mirror.mjs";
 
-const { mode, encSk, root: rootArr } = workerData;
+const { mode, encSk, root: rootArr, throttleDuty } = workerData;
 const matcher = makeMatcher(mode, Uint8Array.from(encSk));
 const ROOT = Uint8Array.from(rootArr);
+// Bench-only duty-cycle throttle: after each segment, stall so the worker's CPU share is
+// ~throttleDuty (models background-tab / battery-saver starvation). Atomics.wait on a
+// private buffer = a real blocking sleep with zero busy-CPU.
+const throttleGate = throttleDuty ? new Int32Array(new SharedArrayBuffer(4)) : null;
+const throttlePause = (busyMs) => {
+  if (!throttleGate || !(throttleDuty > 0) || throttleDuty >= 1) return;
+  const stallMs = busyMs * (1 / throttleDuty - 1);
+  if (stallMs >= 1) Atomics.wait(throttleGate, 0, 0, stallMs);
+};
 const PAGE = 512;
 const pageOf = (p) => Math.floor(p / PAGE) * PAGE;
 const u8 = (a) => (a == null ? null : Uint8Array.from(a));
@@ -55,15 +64,24 @@ function processChunk(t) {
       }
     }
     chain = segChain;
+    const segT0 = throttleGate ? process.hrtime.bigint() : 0n;
     // SCAN (only reached for a verified segment)
     for (let i = 0; i < count; i++) {
       const entry = bytes.subarray(i * ENTRY_LEN, i * ENTRY_LEN + ENTRY_LEN);
       let pos = 0; for (let k = 0; k < 8; k++) pos = pos * 256 + entry[k];
+      // POSITION CONTINUITY (defense in depth behind the chain verify): entries of
+      // segment [from, to) carry exactly the positions from+i in order, and any position
+      // beyond Number.isSafeInteger would corrupt page math silently — reject BEFORE the
+      // parsed value is used for anything.
+      if (!Number.isSafeInteger(pos) || pos !== s.from + i) {
+        return reply(t.id, { rejected: [{ seg: s.from / DPAGE, reason: "position-mismatch" }], matchedPages: [...matchedPages], scanned }, t0);
+      }
       if (pos < t.from0) continue;
       if (pos < t.eff) { matchedPages.add(pageOf(pos)); continue; }
       if (matcher(entry).match) matchedPages.add(pageOf(pos));
     }
     scanned += count;
+    if (throttleGate) throttlePause(Number(process.hrtime.bigint() - segT0) / 1e6);
   }
   reply(t.id, { rejected: [], matchedPages: [...matchedPages], scanned }, t0);
 }

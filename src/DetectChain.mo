@@ -19,6 +19,7 @@ import Array "mo:core/Array";
 import List "mo:core/List";
 import Region "mo:core/Region";
 import Nat64 "mo:core/Nat64";
+import Runtime "mo:core/Runtime";
 
 module {
   public let DPAGE : Nat = 4096;
@@ -87,6 +88,70 @@ module {
     sha([root, cTip, u64LE(noteCount)])
   };
 
+  // ---- incremental Merkle frontier over boundary leaves ----
+  // The promote-lone-node tree `merkleRoot` builds admits a binary-counter frontier: after
+  // B appends the stack holds the roots of the perfect subtrees given by B's binary
+  // decomposition (largest/leftmost first); appending leaf B merges once per trailing
+  // 1-bit of B, and the root is the right-to-left fold of the stack. O(log B) amortized
+  // per append, O(log B) stored nodes, no full-array materialization — the root stays
+  // byte-identical to `merkleRoot` over the same leaves (differential-proven with planted
+  // -mutant teeth by tests/DetectFrontierDifferential.mo).
+
+  public type Frontier = { stack : List.List<Blob> }; // perfect-subtree roots, largest..smallest
+
+  public func emptyFrontier() : Frontier { { stack = List.empty<Blob>() } };
+
+  /// Fold one boundary leaf VALUE into the frontier. `countBefore` must equal the number
+  /// of leaves already folded (the caller's covered counter before this append).
+  public func frontierAppend(f : Frontier, countBefore : Nat, leafValue : Blob) {
+    var cur = leafHash(leafValue);
+    var t = countBefore;
+    while (t % 2 == 1) {
+      switch (List.removeLast(f.stack)) {
+        case (?left) cur := nodeHash(left, cur);
+        case null Runtime.trap("detect-chain:frontier-underflow");
+      };
+      t /= 2;
+    };
+    List.add(f.stack, cur);
+  };
+
+  /// Root of the same promote-lone-node tree from the frontier: right-to-left fold of the
+  /// perfect-subtree roots (empty frontier ⇒ the empty-tree root, 0^32).
+  public func frontierRoot(f : Frontier) : Blob {
+    let n = List.size(f.stack);
+    if (n == 0) return zero32();
+    var acc = switch (List.get(f.stack, n - 1)) {
+      case (?v) v;
+      case null Runtime.trap("detect-chain:frontier-index");
+    };
+    var i : Nat = n - 1;
+    while (i > 0) {
+      i -= 1;
+      acc := switch (List.get(f.stack, i)) {
+        case (?left) nodeHash(left, acc);
+        case null Runtime.trap("detect-chain:frontier-index");
+      };
+    };
+    acc
+  };
+
+  /// Rebuild a frontier from a persisted boundary list (upgrade path). O(B) hashing over
+  /// the boundary COUNT only — ≤ 24,414 leaves at the 10^8-note scale target.
+  public func frontierFromBoundaries(boundaries : List.List<Blob>) : Frontier {
+    let f = emptyFrontier();
+    var i = 0;
+    let n = List.size(boundaries);
+    while (i < n) {
+      switch (List.get(boundaries, i)) {
+        case (?leaf) frontierAppend(f, i, leaf);
+        case null Runtime.trap("detect-chain:frontier-rebuild-index");
+      };
+      i += 1;
+    };
+    f
+  };
+
   // ---- stateful anchor maintained on the append path (flag-gated in Main.mo) ----
   public type State = {
     var chain : Blob;              // c_{note_count}
@@ -100,15 +165,19 @@ module {
     { var chain = zero32(); var root = zero32(); boundaries = List.empty<Blob>(); var covered = 0; var count = 0 }
   };
 
-  /// Fold one note's detection entry; on a DPAGE boundary append a leaf and recompute the root
-  /// (root only changes once per DPAGE appends — cheap amortized).
-  public func append(s : State, position : Nat, ciphertext : [Nat8]) {
+  /// Fold one note's detection entry; on a DPAGE boundary append a leaf and refresh the
+  /// cached root through the incremental frontier: O(log B) hashing, no boundary-array
+  /// materialization (the old full `merkleRoot(List.toArray(...))` recompute was an O(B)
+  /// spike per boundary — a scaling ceiling). `frontier` must be the frontier maintained
+  /// alongside this state (rebuilt from `boundaries` after an upgrade).
+  public func append(s : State, frontier : Frontier, position : Nat, ciphertext : [Nat8]) {
     s.chain := fold(s.chain, entryBytes(position, ciphertext));
     s.count += 1;
     if (s.count % DPAGE == 0) {
       List.add(s.boundaries, s.chain);
+      frontierAppend(frontier, s.covered, s.chain);
       s.covered += 1;
-      s.root := merkleRoot(List.toArray(s.boundaries));
+      s.root := frontierRoot(frontier);
     };
   };
 

@@ -2,7 +2,7 @@
 //! surface implements, in independent Rust, used to byte-compare server answers and to prove
 //! client round-trip correctness before and after the Motoko integration.
 //!
-//! Scheme (docs/PIR-SPEC.md v2): LWE with n = 1152, q = 2^32 (native wrapping u32), p = 2^8
+//! Scheme (docs/PIR-V2-SPEC.md): LWE with n = 1152, q = 2^32 (native wrapping u32), p = 2^8
 //! (one database cell = one byte), Δ = 2^24, noise σ = 12.8 (rounded Gaussian), uniform Z_q
 //! secret, fresh per query. The database is the note log projected to fixed 288-byte records
 //! (commitment(32) ‖ note_ciphertext[0..256) zero-padded), arranged per shard as an

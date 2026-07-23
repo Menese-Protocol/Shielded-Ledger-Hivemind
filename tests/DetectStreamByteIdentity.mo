@@ -33,8 +33,9 @@ let oldTree : CT.HashTree = #fork(
   oldZk);
 let oldDigest = CT.digest(oldTree);
 
-// NEW build with detect_stream = null (flag OFF)
-let tOff : CT.Tuple = { last_block_index = ?idx; last_block_hash = ?tipHash; note_count = nc; note_root = noteRoot; encoding_version = ev; archive_manifest = archive; audit_digest = audit; detect_stream = null };
+// NEW build with detect_stream = null (flag OFF; pir2_boundary null too — the all-None
+// tuple is the 44692fc-identical baseline)
+let tOff : CT.Tuple = { last_block_index = ?idx; last_block_hash = ?tipHash; note_count = nc; note_root = noteRoot; encoding_version = ev; archive_manifest = archive; audit_digest = audit; pir2_boundary = null; detect_stream = null };
 let offDigest = CT.digest(CT.build(tOff));
 
 // NEW build with detect_stream = Some (flag ON)

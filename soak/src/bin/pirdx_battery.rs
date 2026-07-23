@@ -884,6 +884,8 @@ fn main() {
                 leaf.extend_from_slice(&((r.chain.boundaries.len() * pir2::DPAGE) as u64).to_be_bytes());
                 let tuple = soak::cert::ExpectedTuple {
                     pir2_boundary: Some(leaf),
+                    detect_stream: None, // pirdx runs with the detect chain OFF
+
                     tip_index: blocks.len() as u64 - 1,
                     tip_hash: replay.last_block_hash.expect("chain nonempty"),
                     note_count: blocks.len() as u64,

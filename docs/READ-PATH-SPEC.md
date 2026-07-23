@@ -5,7 +5,7 @@ no recipient index — detection is Ω(N) by privacy design, so the engineering 
 constants (bytes and operations per note) and the range (which notes can possibly be yours), never
 the asymptotic. This document states the wire cost (measured, not assumed), the envelope formats,
 the detection-stream endpoint and its bound, and the boundaries at scale. Companion:
-`docs/PIR-SPEC.md` (private matched-note retrieval); numbers here are the authoritative
+`docs/PIR-V2-SPEC.md` (private matched-note retrieval); numbers here are the authoritative
 reference for `demo-frontend/src/wallet.js` (client) and `src/Main.mo` (ledger `detection_stream`).
 
 ## The problem it replaces (measured, at exact file:line)
@@ -126,7 +126,7 @@ from the deploy record, never a guess.
 1. **Detection is Ω(N).** Privacy forbids a recipient index, so someone scans every note. The
    detection stream makes the constant 48 B + 1 ECDH/note (12× under full blocks); it does not and
    cannot make detection sublinear without added machinery (OMR, probe-gated).
-2. **Query calls are unmetered on the IC** (same caveat as PIR-SPEC §Known boundaries): a cheap
+2. **Query calls are unmetered on the IC** (same caveat as PIR-V2-SPEC §V2.8 stated boundaries): a cheap
    caller can force the full `detection_stream`/`icrc3_get_blocks` scan work. Production must bound
    this (metered windows, dedicated replicas); for the valueless demo it is accepted and documented.
 
@@ -154,9 +154,28 @@ resumable, worker-pool scanner partitions the stream into segments, verifies-the
 unions matched pages; it never holds more than one segment per worker in memory and checkpoints a
 cursor that always lags the durably-recorded matches (crash-safe, no double-count, no gap). The
 recovered owned-note set is byte-identical to a single-threaded reference scan — zero false
-negatives is an absolute gate — and the compute kernel is isolated behind a pure
+negatives across the complete 100-million-record acceptance corpus and all published test
+variants is an absolute gate — and the compute kernel is isolated behind a pure
 `(ephemeral_key, secret) → shared` boundary so a native or WebGPU implementation drops in without
-changing the recognition logic.
+changing the recognition logic. Before any mirror traffic, the client re-derives the certified
+leaf `SHA256(root ‖ c_tip ‖ note_count)` from its (root, tip, count) triple and rejects a
+mismatch — the three values MUST come from ONE certificate, so no cross-certificate mix (root
+from one snapshot, count from another) can drive a scan. Inside a verified segment, entry
+positions are additionally checked for exact continuity and 53-bit-safe parsing before use.
+
+**Anchor persistence and maintenance (ledger side).** The anchor's state is deliberately tiny
+and log-derived: the 32-B running chain, one 32-B leaf per complete 4,096-note segment
+(24,415 leaves ≈ 0.78 MB at 10⁸ notes), the cached root, and two counters. The root is
+maintained by an incremental Merkle frontier — O(log B) hashing per boundary, ≤ ⌈log₂ B⌉
+cached nodes (11 at 10⁸-note scale), never a full-tree recompute on the append path. The
+frontier itself is transient and rebuilt from the persisted boundary list at every upgrade
+(O(B) hashing over the boundary COUNT only — a sub-percent slice of the committed
+2-billion-instruction postupgrade bound, measured in the soak's upgrade drill), so the stable
+memory layout is unchanged by the feature. The background chunked audit re-derives the entire
+anchor from the note log on every pass — every boundary leaf, the chain tip, both counters,
+and the root — and any mismatch fail-closes the ledger with a `detect-chain:*` code; because
+the anchor is a pure function of the note log, an admin `detect_chain_rebuild` reconstructs it
+from scratch in bounded chunks and swaps it in atomically, which a re-run audit then re-proves.
 
 **Measured (this reference box, 24 cores).** Verified wire cost is 48 B/note (4.8 GB at 100 M),
 served from a mirror at ordinary CDN speeds and verified once; page verification adds ~0.2% to the
