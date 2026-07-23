@@ -12,7 +12,7 @@
 //   3. `pir_random_u64` uniformity smoke via the same ciphertexts' `a` words (chi-square on
 //      byte marginals).
 //
-// The math (documented in docs/PIR-SPEC.md §V2.1 note): Box–Muller over 53-bit uniforms has
+// The math (documented in docs/PIR-V2-SPEC.md §V2.1 note): Box–Muller over 53-bit uniforms has
 // a hard tail cap at sqrt(2·ln(2^53+1)) ≈ 8.57σ (true-Gaussian mass beyond ≈ 1e-17), and
 // ROUNDED Gaussians carry variance σ² + 1/12 (at σ=12.8: +0.025%, security-conservative
 // vs the estimator's discrete-Gaussian model).
