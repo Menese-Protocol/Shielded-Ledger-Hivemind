@@ -24,9 +24,9 @@ if [[ "${1:-}" == "--fast" ]]; then
 else
   # GATE TIER (default): substantial, deterministic, fits the <=3h budget when run
   # SEQUENTIALLY. The FULL committed tiers (§2 millions, §3 100k/family, §6 200, §9 2M, §10
-  # 2000 probes, §7 250k/decoder) are each run separately for the evidence packet
-  # (for-team/EVIDENCE-fortress.md) — override any knob below to reproduce a full tier, e.g.
-  # FORTRESS_PROP_SCALE=1 scripts/fortress-properties.sh. Only knobs not already set win.
+  # 2000 probes, §7 250k/decoder) are each runnable separately — override any knob below to
+  # reproduce a full tier, e.g. FORTRESS_PROP_SCALE=1 scripts/fortress-properties.sh. Only
+  # knobs not already set win.
   : "${FORTRESS_DIV:=1}"                 # §2 full millions (fast: bigint ops are cheap)
   : "${FORTRESS_PROP_SCALE:=20}"         # §3 5k/family (100k full is ~30min alone)
   : "${FORTRESS_META_N:=40}"             # §6 40 bases (200 full)

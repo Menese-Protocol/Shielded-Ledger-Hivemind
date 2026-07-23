@@ -4,9 +4,9 @@
 //! parse and asserts it is a total function: no panic, no unbounded allocation, and it never
 //! accepts a length/shape-inconsistent key.
 //!
-//! (The RAW arkworks deserializer is unbounded on a malformed length prefix — finding F-1 in
-//! for-team/FINDINGS-fortress.md; that path is demonstrated by `decode_vk_raw` and is NOT on
-//! any untrusted-input path in production.)
+//! (The RAW arkworks deserializer is unbounded on a malformed length prefix — finding F-1,
+//! described in docs/VERIFICATION-FORTRESS.md "Provenance / finding"; that path is
+//! demonstrated by `decode_vk_raw` and is NOT on any untrusted-input path in production.)
 #![no_main]
 use libfuzzer_sys::fuzz_target;
 

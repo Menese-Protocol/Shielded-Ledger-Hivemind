@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # TEETH for §2/§3: prove every differential detector goes RED on a planted bug.
 #
-# A detector never shown to catch a planted bug is a stub (mission rule 3). For each
+# A detector never shown to catch a planted bug is a stub. For each
 # planted mutation we stage a COPY of the production module with ONE wrong element,
 # run the relevant Motoko differential program against the (unmutated) oracle, and
 # assert the affected class(es) DIVERGE — and that at least one class does. The mutation

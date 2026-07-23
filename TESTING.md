@@ -21,7 +21,7 @@ Deterministic, offline, teeth-first. Each section (`scripts/fortress-*.sh`) asse
 detectors AND runs a planted-bug teeth proof that turns the detector RED. Published seeds;
 one-command reproduction; PocketIC/proving sections default to a gate tier
 (env-overridable to the committed full tier). See `docs/VERIFICATION-FORTRESS.md` for what is
-proven vs. testimonial, and `for-team/EVIDENCE-fortress.md` for exact numbers and seeds. The
+proven vs. testimonial; every section driver prints its seed and tier on each run. The
 fortress composes with (never replaces) the five surfaces below and reuses their oracles
 (`cross_oracle/`, `circuit/`, `src/groth16/`, `verifier-lab/`, `soak/`).
 

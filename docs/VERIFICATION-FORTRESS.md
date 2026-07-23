@@ -8,8 +8,8 @@ pass. This composes with — never replaces — the existing batteries (`scripts
 `e2e.py`, `soak/`, the read-path battery).
 
 Run it all: `scripts/fortress.sh` (add `--fast` for a smoke pass). Each section also has its
-own one-command driver under `scripts/fortress-*.sh`. Exact numbers, seeds, and reproduction
-per acceptance item: `for-team/EVIDENCE-fortress.md`.
+own one-command driver under `scripts/fortress-*.sh`. Every driver prints its seed and tier
+on each run; the committed full-tier knobs are documented per section in `scripts/fortress.sh`.
 
 ## The teeth-first principle
 
@@ -84,7 +84,7 @@ uses); the L3-flat verifier — interpreter-hostile by measurement — runs comp
 
 ## Provenance / finding
 
-§7 surfaced finding **F-1** (`for-team/FINDINGS-fortress.md`): arkworks' raw VerifyingKey
+§7 surfaced finding **F-1**: arkworks' raw VerifyingKey
 deserializer performs an unbounded allocation on a malformed length prefix. It is not a
 production exposure (VKs decode only through the bounded wire parsers); the gate target fuzzes
 the bounded parser the system actually uses.
