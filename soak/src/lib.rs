@@ -12,6 +12,7 @@ pub mod candid_types;
 pub mod cert;
 pub mod checkpoint;
 pub mod crypto;
+pub mod fortress_gate;
 pub mod icrc3_hash;
 pub mod keys;
 pub mod linkage;

@@ -16,6 +16,7 @@ import Nat64 "mo:core/Nat64";
 import Nat8 "mo:core/Nat8";
 import Principal "mo:core/Principal";
 import Text "mo:core/Text";
+import Runtime "mo:core/Runtime";
 import Time "mo:core/Time";
 import ICRC2 "../src/ICRC2";
 import ICRC3 "../src/ICRC3";
@@ -94,6 +95,10 @@ persistent actor IcpLedgerFixture {
   var encoded_blocks : [Blob] = [];
   var created_at_presence : [Bool] = [];
   var fee_e8s : Nat = 10_000;
+  // §9 seam-2 injection (test-only; defaults false -> zero behavior change unarmed):
+  // when armed, the NEXT icrc2_transfer_from traps mid-call, exercising the backend's
+  // rollback of a failed token inter-canister call.
+  var trap_next_transfer_from : Bool = false;
   var decimals : Nat8 = 8;
   var archive_id : ?Principal = null;
   var archived_count : Nat = 0;
@@ -453,6 +458,7 @@ persistent actor IcpLedgerFixture {
   };
 
   public shared ({ caller }) func icrc2_transfer_from(args : ICRC2.TransferFromArgs) : async ICRC2.TransferFromResult {
+    if (trap_next_transfer_from) { trap_next_transfer_from := false; Runtime.trap("TEST_ONLY:token-call-trap") };
     switch (validateTime(args.created_at_time)) {
       case (#tooOld) return #Err(#TooOld);
       case (#future(value)) return #Err(#CreatedInFuture({ ledger_time = value }));
@@ -623,6 +629,7 @@ persistent actor IcpLedgerFixture {
   public shared func test_set_dedup_mode(mode : DedupMode) : async () { dedup_mode := mode };
   public query func test_mode() : async DedupMode { dedup_mode };
   public shared func test_set_fee(value : Nat) : async () { fee_e8s := value };
+  public shared func test_arm_transfer_from_trap() : async () { trap_next_transfer_from := true };
   public shared func test_set_decimals(value : Nat8) : async () { decimals := value };
   public shared func test_set_archive(id : ?Principal, count : Nat) : async () {
     assert count <= legacy_blocks.size();

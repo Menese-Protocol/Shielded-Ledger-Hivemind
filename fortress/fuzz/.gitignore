@@ -1,0 +1,4 @@
+/target
+/artifacts
+# fuzzer-grown corpus entries (40-hex-char names); curated named seeds are tracked
+corpus/*/[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*

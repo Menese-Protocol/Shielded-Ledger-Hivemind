@@ -1,9 +1,10 @@
 # Testing map
 
-Everything in this repository that asserts something, what it asserts, and how to run it. Five
+Everything in this repository that asserts something, what it asserts, and how to run it. Six
 independent surfaces cover the system: an offline security battery, a stateful replica suite, a
-randomized model-checked soak under PocketIC, the wallet read-path battery, and the Motoko unit
-tests the first two drive.
+randomized model-checked soak under PocketIC, the wallet read-path battery, the Motoko unit
+tests the first two drive, and the verification fortress (deterministic teeth-first
+cross-implementation gate).
 
 | Surface | Command | What it proves |
 |---|---|---|
@@ -12,6 +13,17 @@ tests the first two drive.
 | Randomized soak (this document, `soak/`) | `cargo run --release --manifest-path soak/Cargo.toml -- run` | Tens of thousands of seeded random operations against a reference model, with full-population verification. |
 | Wallet read-path battery | `cd demo-frontend && npm run test:readpath` | Pagination, view tags, encrypted cache, birthday recovery, fetch-transcript privacy oracles. 75 checks. |
 | Motoko unit tests | driven by the two suites above | Codec, stable storage, block matching. |
+| Verification fortress (`docs/VERIFICATION-FORTRESS.md`) | `./scripts/fortress.sh` (`--fast` to smoke) | Teeth-first cross-implementation gate: 3-verifier taxonomy (§1), per-op arithmetic differential (§2/§3), independent reference model + violation matrix (§4), under-constrained detection (§5), metamorphic (§6), coverage-guided fuzzing (§7), stateful-invariant model tier (§9), differential side-channel (§10), ceremony PoK. Every detector proven RED-capable by a planted bug. |
+
+## 0. The verification fortress: `scripts/fortress.sh`
+
+Deterministic, offline, teeth-first. Each section (`scripts/fortress-*.sh`) asserts its
+detectors AND runs a planted-bug teeth proof that turns the detector RED. Published seeds;
+one-command reproduction; PocketIC/proving sections default to a gate tier
+(env-overridable to the committed full tier). See `docs/VERIFICATION-FORTRESS.md` for what is
+proven vs. testimonial; every section driver prints its seed and tier on each run. The
+fortress composes with (never replaces) the five surfaces below and reuses their oracles
+(`cross_oracle/`, `circuit/`, `src/groth16/`, `verifier-lab/`, `soak/`).
 
 ## 1. The offline security battery: `scripts/security-gate.sh`
 

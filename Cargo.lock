@@ -1077,6 +1077,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "fortress"
+version = "0.1.0"
+dependencies = [
+ "ark-bls12-381",
+ "ark-ec",
+ "ark-ff",
+ "ark-serialize",
+ "ark-std",
+ "blst",
+ "num-bigint",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "frontier-oracle"
 version = "0.1.0"
 dependencies = [
