@@ -124,7 +124,7 @@ fn main() {
     let root = repo_root();
     let keyset_for = || {
         let manifest = std::fs::read_to_string(root.join("fixtures/pool-vectors-bls12-381/SETUP-MANIFEST.json")).unwrap();
-        keys::regenerate_and_verify(&manifest).expect("keyset")
+        keys::regenerate_and_verify(&manifest, true).expect("keyset")
     };
     println!("[battery] building wasms (ledger + token + honest oracle)...");
     let wasms = pic_env::build_wasms(&root, &root.join("soak/target/wasms"));

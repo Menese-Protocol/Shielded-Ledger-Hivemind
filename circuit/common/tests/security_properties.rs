@@ -107,6 +107,7 @@ fn transfer_case(
     TransferCircuit {
         cfg: cfg.clone(),
         enforce_range: true,
+        legacy_statement: false,
         anchor: Some(anchor),
         nf: [Some(nullifiers[0]), Some(nullifiers[1])],
         cm_out: [Some(output_commitments[0]), Some(output_commitments[1])],

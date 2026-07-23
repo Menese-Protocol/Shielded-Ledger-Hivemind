@@ -724,7 +724,7 @@ fn main() {
     let manifest_json =
         std::fs::read_to_string(root.join("fixtures/pool-vectors-bls12-381/SETUP-MANIFEST.json"))
             .expect("read setup manifest");
-    let keyset = keys::regenerate_and_verify(&manifest_json).expect("keyset");
+    let keyset = keys::regenerate_and_verify(&manifest_json, true).expect("keyset");
     let wasms = pic_env::build_wasms(&root, &root.join("soak/target/wasms-pirdx"));
     println!("[build] ledger wasm sha256 {}", wasms.ledger_sha256);
 

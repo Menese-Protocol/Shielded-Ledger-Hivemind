@@ -453,7 +453,7 @@ fn main() {
         std::fs::read_to_string(root.join("fixtures/pool-vectors-bls12-381/SETUP-MANIFEST.json"))
             .expect("read SETUP-MANIFEST.json");
     println!("[B1a] regenerating keyset (seed 20260712)...");
-    let keyset = keys::regenerate_and_verify(&manifest_json).expect("B1a keyset gate");
+    let keyset = keys::regenerate_and_verify(&manifest_json, true).expect("B1a keyset gate");
     println!("[B1a] PASS");
     keys::verify_frozen_fixtures(&root.join("fixtures/pool-vectors-bls12-381"), &keyset)
         .expect("B1b frozen fixtures");
@@ -577,6 +577,7 @@ fn main() {
             let prepared = prover::prepare_transfer(
                 &cfg,
                 &keyset.transfer_pk,
+                keyset.legacy_statement,
                 &crypto,
                 (&in1, &in2),
                 (&accounts[0], &accounts[0]),

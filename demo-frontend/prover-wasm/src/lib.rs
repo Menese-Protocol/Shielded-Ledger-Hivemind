@@ -128,6 +128,47 @@ pub fn assert_pk_matches_vk(pk_bytes: &[u8], ledger_vk_hex: &str) -> Result<bool
 }
 
 // ---------------------------------------------------------------------------------------------
+// transfer statement inference
+// ---------------------------------------------------------------------------------------------
+
+/// Finalized witness count of the given transfer statement, synthesized once in setup mode —
+/// the exact mode Groth16 setup uses, so the count matches key generation.
+fn transfer_witness_count(cfg: &PoseidonCfg<F>, legacy_statement: bool) -> Result<usize, JsValue> {
+    use ark_relations::r1cs::{ConstraintSystem, OptimizationGoal, SynthesisMode};
+    let circuit = if legacy_statement {
+        TransferCircuit::blank_legacy(cfg)
+    } else {
+        TransferCircuit::blank(cfg)
+    };
+    let cs = ConstraintSystem::<F>::new_ref();
+    cs.set_optimization_goal(OptimizationGoal::Constraints);
+    cs.set_mode(SynthesisMode::Setup);
+    ark_relations::r1cs::ConstraintSynthesizer::generate_constraints(circuit, cs.clone())
+        .map_err(|_| err("transfer statement synthesis failed"))?;
+    cs.finalize();
+    Ok(cs.num_witness_variables())
+}
+
+/// Infer which transfer statement a supplied proving key was set up for. A Groth16 proving
+/// key carries exactly one `l_query` element per witness variable, and the two statements
+/// have distinct witness counts (pinned by the circuit crate's `statement_dims` test), so the
+/// length identifies the statement. Returns `legacy_statement` for `TransferCircuit`; errors
+/// if the key matches neither statement (wrong key entirely — refuse to prove).
+fn transfer_statement_of_pk(
+    cfg: &PoseidonCfg<F>,
+    pk: &ProvingKey<Bls12_381>,
+) -> Result<bool, JsValue> {
+    let l = pk.l_query.len();
+    if l == transfer_witness_count(cfg, false)? {
+        return Ok(false);
+    }
+    if l == transfer_witness_count(cfg, true)? {
+        return Ok(true);
+    }
+    Err(err("proving key matches neither the hardened nor the legacy transfer statement"))
+}
+
+// ---------------------------------------------------------------------------------------------
 // deposit (shield) proving
 // ---------------------------------------------------------------------------------------------
 
@@ -260,9 +301,15 @@ pub fn prove_transfer(pk_bytes: &[u8], witness_json: &str) -> Result<String, JsV
     let cm_out1 = note_commitment(&cfg, w.out1.v, out1_pk, nf1, out1_rcm);
     let cm_out2 = note_commitment(&cfg, w.out2.v, out2_pk, nf2, out2_rcm);
 
+    // The witness must be assembled for the SAME statement the supplied proving key was set up
+    // for — the wallet keeps working across a verifying-key rotation without an API change.
+    let key = load_pk(pk_bytes)?;
+    let legacy_statement = transfer_statement_of_pk(&cfg, &key)?;
+
     let circuit = TransferCircuit {
         cfg: cfg.clone(),
         enforce_range: true,
+        legacy_statement,
         anchor: Some(anchor),
         nf: [Some(nf1), Some(nf2)],
         cm_out: [Some(cm_out1), Some(cm_out2)],
@@ -280,7 +327,6 @@ pub fn prove_transfer(pk_bytes: &[u8], witness_json: &str) -> Result<String, JsV
         out_rcm: [Some(out1_rcm), Some(out2_rcm)],
     };
     let publics = circuit.public_inputs();
-    let key = load_pk(pk_bytes)?;
     let proof = Groth16::<Bls12_381>::prove(&key, circuit, &mut rng())
         .map_err(|_| err("transfer proof failed (witness does not satisfy the circuit?)"))?;
     if !Groth16::<Bls12_381>::verify(&key.vk, &publics, &proof).map_err(|_| err("verify errored"))? {
@@ -445,6 +491,7 @@ pub fn spike_transfer_prove() -> String {
     let circuit = TransferCircuit {
         cfg: cfg.clone(),
         enforce_range: true,
+        legacy_statement: false, // self-consistent bench: hardened setup two lines below
         anchor: Some(anchor),
         nf: [Some(nf1), Some(nf2)],
         cm_out: [Some(out1.cm(&cfg)), Some(out2.cm(&cfg))],

@@ -2,6 +2,9 @@
 name = "gen"
 version = "0.1.0"
 edition = "2021"
+# `cargo run -p gen` must keep meaning the vector generator (the security gate's step-2
+# invocation) even though the package also ships the `circuit_oracle` helper binary.
+default-run = "gen"
 
 [dependencies]
 common = { path = "../common" }

@@ -264,6 +264,7 @@ mod params_tests {
         let c = TransferCircuit {
             cfg: cfg.clone(),
             enforce_range: true,
+            legacy_statement: false,
             anchor: Some(anchor),
             nf: [Some(nf1), Some(nf2)],
             cm_out: [Some(out1.cm(&cfg)), Some(out2.cm(&cfg))],

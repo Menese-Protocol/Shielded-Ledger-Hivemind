@@ -42,11 +42,33 @@ diff -u \
 rm -rf "$REGENERATED"
 trap - EXIT
 
+step "Hardened-statement vector reproducibility (in-circuit conservation hardening)"
+REGENERATED="$(mktemp -d)"
+trap 'rm -rf "$REGENERATED"' EXIT
+cargo run --quiet --release --manifest-path "$CIRCUIT/Cargo.toml" -p gen --features bls12-381 -- \
+  "$REGENERATED" --setup insecure-deterministic-test --statement hardened
+for generated in "$REGENERATED"/*; do
+  name="$(basename "$generated")"
+  case "$name" in
+    *_pk.bin|ORACLE.txt) continue ;;
+  esac
+  cmp "$generated" "$ROOT/fixtures/pool-vectors-bls12-381-hardened/$name"
+done
+diff -u \
+  <(sed -E 's/(PROVE-TIME.*=) [0-9]+ ms/\1 <normalized>/' "$REGENERATED/ORACLE.txt") \
+  <(sed -E 's/(PROVE-TIME.*=) [0-9]+ ms/\1 <normalized>/' "$ROOT/fixtures/pool-vectors-bls12-381-hardened/ORACLE.txt")
+rm -rf "$REGENERATED"
+trap - EXIT
+
 step "Randomized circuit properties and Groth16 mutation battery"
 cargo test --manifest-path "$CIRCUIT/Cargo.toml" -p common --features bls12-381 --test security_properties
 
 step "Circuit semantic-completeness audit (twelve-row UNSAT + mutation-kill battery)"
 cargo test --manifest-path "$CIRCUIT/Cargo.toml" -p common --features bls12-381 --test semantic_audit
+
+step "Statement shape pins and legacy/hardened verifying-key binding proofs"
+cargo test --release --manifest-path "$CIRCUIT/Cargo.toml" -p common --features bls12-381 \
+  --test statement_dims --test statement_binding
 
 step "Browser prover compiles for wasm32 and uses the identical circuit"
 cargo check --manifest-path demo-frontend/prover-wasm/Cargo.toml --target wasm32-unknown-unknown

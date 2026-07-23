@@ -62,15 +62,20 @@ impl SetupMode {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: gen <output-dir> --setup <insecure-deterministic-test|os-csprng-single-party>\n\
+        "usage: gen <output-dir> --setup <insecure-deterministic-test|os-csprng-single-party> \
+[--statement <legacy|hardened>]\n\
          \n\
          insecure-deterministic-test: reproducible oracle fixtures only; NEVER deploy its keys\n\
-         os-csprng-single-party: removes the public-seed flaw; still NOT an MPC ceremony"
+         os-csprng-single-party: removes the public-seed flaw; still NOT an MPC ceremony\n\
+         --statement legacy (default): the pre-hardening transfer statement — reproduces the\n\
+                     frozen vectors byte-for-byte (the deployed verifying key's statement)\n\
+         --statement hardened: the hardened conservation statement (in-circuit fee/v_pub_out\n\
+                     ranges + input-note distinctness) — distinct keys, own fixture set"
     );
     std::process::exit(2)
 }
 
-fn parse_args() -> (String, SetupMode) {
+fn parse_args() -> (String, SetupMode, bool) {
     let mut args = std::env::args().skip(1);
     let dir = args.next().unwrap_or_else(|| usage());
     let flag = args.next().unwrap_or_else(|| usage());
@@ -81,11 +86,28 @@ fn parse_args() -> (String, SetupMode) {
     } else {
         usage()
     };
+    let legacy_statement = match args.next() {
+        None => true,
+        Some(flag) => {
+            let statement = if flag == "--statement" {
+                args.next().unwrap_or_else(|| usage())
+            } else if let Some(value) = flag.strip_prefix("--statement=") {
+                value.to_owned()
+            } else {
+                usage()
+            };
+            match statement.as_str() {
+                "legacy" => true,
+                "hardened" => false,
+                _ => usage(),
+            }
+        }
+    };
     if args.next().is_some() {
         usage()
     }
     let mode = SetupMode::parse(&value).unwrap_or_else(|| usage());
-    (dir, mode)
+    (dir, mode, legacy_statement)
 }
 
 fn file_sha256(path: &str) -> String {
@@ -114,7 +136,7 @@ impl Out {
 }
 
 fn main() {
-    let (dir, setup_mode) = parse_args();
+    let (dir, setup_mode, legacy_statement) = parse_args();
     std::fs::create_dir_all(&dir).unwrap();
     let mut out = Out { dir, oracle: String::new() };
     let cfg = poseidon_config();
@@ -122,6 +144,11 @@ fn main() {
     // is never passed to Groth16 setup. Browser proofs use WebCrypto-backed randomness instead.
     let mut rng = ark_std::rand::rngs::StdRng::seed_from_u64(INSECURE_TEST_SEED);
     out.oracle_line(&format!("SETUP-MODE {}", setup_mode.name()));
+    // The legacy statement's oracle text is FROZEN (diffed byte-for-byte by the security gate);
+    // only the hardened statement announces itself, in its own fixture directory.
+    if !legacy_statement {
+        out.oracle_line("STATEMENT hardened (in-circuit fee/v_pub_out ranges + input-note distinctness)");
+    }
     match setup_mode {
         SetupMode::InsecureDeterministicTest => out.oracle_line(
             "SETUP-WARNING PUBLIC FIXED SEED; TEST VECTORS ONLY; DEPLOYMENT FORBIDDEN",
@@ -165,6 +192,7 @@ fn main() {
     let mk_circuit = || TransferCircuit {
         cfg: cfg.clone(),
         enforce_range: true,
+        legacy_statement,
         anchor: Some(anchor),
         nf: [Some(nf1), Some(nf2)],
         cm_out: [Some(out1.cm(&cfg)), Some(out2.cm(&cfg))],
@@ -196,12 +224,17 @@ fn main() {
     }
 
     // ---------------- Groth16 setup + proofs (transfer) ----------------
+    let transfer_blank = || if legacy_statement {
+        TransferCircuit::blank_legacy(&cfg)
+    } else {
+        TransferCircuit::blank(&cfg)
+    };
     let (tpk, tvk) = match setup_mode {
         SetupMode::InsecureDeterministicTest =>
-            Groth16::<Curve>::circuit_specific_setup(TransferCircuit::blank(&cfg), &mut rng).unwrap(),
+            Groth16::<Curve>::circuit_specific_setup(transfer_blank(), &mut rng).unwrap(),
         SetupMode::OsCsprngSingleParty => {
             let mut setup_rng = OsRng;
-            Groth16::<Curve>::circuit_specific_setup(TransferCircuit::blank(&cfg), &mut setup_rng).unwrap()
+            Groth16::<Curve>::circuit_specific_setup(transfer_blank(), &mut setup_rng).unwrap()
         },
     };
     let circuit = mk_circuit();
@@ -246,6 +279,7 @@ fn main() {
     let fake_circuit = TransferCircuit {
         cfg: cfg.clone(),
         enforce_range: true,
+        legacy_statement,
         anchor: Some(fake_anchor),
         nf: [Some(fnf1), Some(nf2)],
         cm_out: [Some(fout1.cm(&cfg)), Some(fout2.cm(&cfg))],
@@ -334,6 +368,7 @@ fn main() {
         let wc = TransferCircuit {
             cfg: cfg.clone(),
             enforce_range: true,
+            legacy_statement,
             anchor: Some(anchor2),
             nf: [Some(wnf1), Some(wnf2)],
             cm_out: [Some(wout1.cm(&cfg)), Some(wout2.cm(&cfg))],

@@ -2,15 +2,22 @@
 //! UNSAT battery (proven against the SHIPPED circuit) and a mutation-kill test (the SAME witness
 //! flips SAT against a faithful test-local mirror with exactly one mapped constraint removed).
 //!
-//! Discipline (mission `for-team/MISSION-circuit-semantic-audit.md`, plan §WS-2):
-//!   * The shipped `common::TransferCircuit` / `common::DepositCircuit` are NEVER modified.
+//! Discipline:
 //!   * Every UNSAT proof runs against the SHIPPED circuit — no drift risk on the property claim.
 //!   * The mirror below is a byte-faithful transcription of `lib.rs::generate_constraints` gated
 //!     by per-constraint knockout switches; it is used ONLY to prove a constraint is load-bearing.
-//!   * `mirror_is_faithful_to_shipped_circuit` proves mirror(ko=none) ≡ shipped over the whole
-//!     witness battery (honest + every adversarial witness), anchoring the mirror to the original.
+//!   * `mirror_is_faithful_to_shipped_circuit` proves mirror(ko=none) ≡ shipped-hardened AND
+//!     mirror(ko=legacy) ≡ shipped-legacy over the whole witness battery (honest + every
+//!     adversarial witness), anchoring the mirror to the original in BOTH statements.
 //!
 //! Two proofs per row: the UNSAT result AND the mutation-kill SAT flip.
+//!
+//! STATEMENTS. The shipped `TransferCircuit` carries two statements (`legacy_statement` flag):
+//! the hardened conservation statement (default — in-circuit fee/v_pub_out ranges under
+//! `enforce_range`, unconditional input-note distinctness) and the byte-identical pre-hardening
+//! statement. Rows 08/11 and the distinctness test prove all three hardening constraints
+//! load-bearing on the hardened statement AND keep demonstrating the gap they close on the
+//! legacy statement (SAT there — the reason rotating the deployed verifying key matters).
 
 use ark_crypto_primitives::sponge::{
     constraints::CryptographicSpongeVar,
@@ -88,28 +95,30 @@ fn merkle_root_gadget(
 
 // ---------------------------------------------------------------------------
 // Per-constraint knockout switches. `KnockOut::none()` reproduces the shipped
-// circuit exactly (range on, nothing dropped, no proposed hardening).
+// HARDENED statement exactly (all ranges on, distinctness on, nothing dropped);
+// `KnockOut::legacy()` reproduces the shipped LEGACY statement exactly.
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy)]
 struct KnockOut {
-    drop_recipient: bool,        // row 7  — lib.rs:381
-    drop_pk_binding: bool,       // row 4  — lib.rs:405 (pk becomes a free witness)
-    drop_merkle: bool,           // row 5/9 — lib.rs:408
-    drop_nullifier: bool,        // row 3  — lib.rs:411
-    drop_rho_chain: bool,        // row 6  — lib.rs:428 (rho_out becomes a free witness)
-    drop_output_commitment: bool,// row 6/10 — lib.rs:432
-    drop_conservation: bool,     // row 1/8/11 — lib.rs:441
-    range_inputs: bool,          // row 2  — lib.rs:414-416 (mirrors enforce_range for inputs)
-    range_outputs: bool,         // row 2/10 — lib.rs:434-436
-    // PROPOSED defense-in-depth (NOT in the shipped circuit): in-circuit range on fee/v_pub_out
-    // and input-note distinctness. See for-team/PROPOSAL-circuit-indepth-conservation-hardening.md.
-    range_fee: bool,             // row 11 hardening
-    range_v_pub_out: bool,       // row 8 hardening
-    harden_distinctness: bool,   // input-distinctness hardening: nf[0] != nf[1]
+    drop_recipient: bool,        // row 7  — lib.rs:410
+    drop_pk_binding: bool,       // row 4  — lib.rs:443 (pk becomes a free witness)
+    drop_merkle: bool,           // row 5/9 — lib.rs:446
+    drop_nullifier: bool,        // row 3  — lib.rs:449
+    drop_rho_chain: bool,        // row 6  — lib.rs:478 (rho_out becomes a free witness)
+    drop_output_commitment: bool,// row 6/10 — lib.rs:482
+    drop_conservation: bool,     // row 1/8/11 — lib.rs:491
+    range_inputs: bool,          // row 2  — lib.rs:452-454 (mirrors enforce_range for inputs)
+    range_outputs: bool,         // row 2/10 — lib.rs:484-486
+    // The three HARDENED-statement constraints (shipped since the conservation hardening; the
+    // legacy statement omits them — that omission is the audited gap the hardening closed).
+    range_fee: bool,             // row 11 — lib.rs:417
+    range_v_pub_out: bool,       // row 8 — lib.rs:418
+    harden_distinctness: bool,   // input distinctness nf[0] != nf[1] — lib.rs:465
 }
 
 impl KnockOut {
+    /// Nothing knocked out: faithful to the shipped HARDENED statement (`blank()` default).
     fn none() -> Self {
         KnockOut {
             drop_recipient: false,
@@ -121,9 +130,20 @@ impl KnockOut {
             drop_conservation: false,
             range_inputs: true,
             range_outputs: true,
+            range_fee: true,
+            range_v_pub_out: true,
+            harden_distinctness: true,
+        }
+    }
+
+    /// Faithful to the shipped LEGACY statement (`legacy_statement = true`): the three
+    /// hardening constraints absent, everything else identical.
+    fn legacy() -> Self {
+        KnockOut {
             range_fee: false,
             range_v_pub_out: false,
             harden_distinctness: false,
+            ..Self::none()
         }
     }
 }
@@ -205,7 +225,7 @@ impl ConstraintSynthesizer<F> for MirrorTransfer {
             recipient_binding_witness.enforce_equal(&recipient_binding)?;
         }
 
-        // Proposed hardening (absent from the shipped circuit).
+        // Hardened-statement public-term ranges (lib.rs:416-419; absent from the legacy statement).
         let fee_val = self
             .fee_field_override
             .or_else(|| self.inner.fee.map(F::from));
@@ -267,7 +287,7 @@ impl ConstraintSynthesizer<F> for MirrorTransfer {
             in_value_sum += v;
         }
 
-        // PROPOSED input-note distinctness (absent from the shipped circuit).
+        // Hardened-statement input-note distinctness (lib.rs:464-466; absent from legacy).
         if ko.harden_distinctness {
             nf_vars[0].enforce_not_equal(&nf_vars[1])?;
         }
@@ -308,11 +328,15 @@ impl ConstraintSynthesizer<F> for MirrorTransfer {
 // Satisfiability harness
 // ---------------------------------------------------------------------------
 
-/// Is the SHIPPED transfer circuit satisfied by this witness?
+/// Is the SHIPPED transfer circuit satisfied by this witness? A synthesis error counts as a
+/// rejection — that is how `enforce_not_equal` signals infeasibility for equal nullifiers (no
+/// witness assignment exists, so no proof can be produced); see `mirror_rejects`.
 fn shipped_satisfied(circuit: &TransferCircuit) -> bool {
     let cs = ConstraintSystem::<F>::new_ref();
-    circuit.clone().generate_constraints(cs.clone()).unwrap();
-    cs.is_satisfied().unwrap()
+    match circuit.clone().generate_constraints(cs.clone()) {
+        Err(_) => false,
+        Ok(()) => cs.is_satisfied().unwrap(),
+    }
 }
 
 /// Is the MIRROR satisfied under the given knockout?
@@ -428,6 +452,7 @@ fn build_honest(
     let circuit = TransferCircuit {
         cfg: cfg.clone(),
         enforce_range: true,
+        legacy_statement: false,
         anchor: Some(anchor),
         nf: [Some(nullifiers[0]), Some(nullifiers[1])],
         cm_out: [Some(cm_out[0]), Some(cm_out[1])],
@@ -506,12 +531,25 @@ fn mirror_is_faithful_to_shipped_circuit() {
             _ => {}
         }
 
+        // Hardened statement: mirror(ko=none) must agree with the shipped default circuit.
         let shipped = shipped_satisfied(&built.circuit);
         let mirror = mirror_satisfied(MirrorTransfer::new(built.circuit.clone(), KnockOut::none()));
         assert_eq!(
             shipped, mirror,
-            "mirror(ko=none) disagreed with shipped circuit on case {case} \
+            "mirror(ko=none) disagreed with shipped HARDENED circuit on case {case} \
              (shipped={shipped}, mirror={mirror}) — mirror is not faithful"
+        );
+
+        // Legacy statement: mirror(ko=legacy) must agree with the shipped legacy circuit.
+        let legacy_circuit =
+            TransferCircuit { legacy_statement: true, ..built.circuit.clone() };
+        let shipped_legacy = shipped_satisfied(&legacy_circuit);
+        let mirror_legacy =
+            mirror_satisfied(MirrorTransfer::new(built.circuit.clone(), KnockOut::legacy()));
+        assert_eq!(
+            shipped_legacy, mirror_legacy,
+            "mirror(ko=legacy) disagreed with shipped LEGACY circuit on case {case} \
+             (shipped={shipped_legacy}, mirror={mirror_legacy}) — mirror is not faithful"
         );
     }
 }
@@ -523,7 +561,7 @@ fn mirror_is_faithful_to_shipped_circuit() {
 #[derive(Clone)]
 struct MirrorDeposit {
     inner: DepositCircuit,
-    drop_commitment: bool, // lib.rs:485
+    drop_commitment: bool, // lib.rs:535
 }
 
 impl ConstraintSynthesizer<F> for MirrorDeposit {
@@ -555,7 +593,7 @@ fn mirror_deposit_satisfied(m: MirrorDeposit) -> bool {
 }
 
 // ===========================================================================
-// ROW 1 — Value conservation (lib.rs:441). Kill: drop_conservation.
+// ROW 1 — Value conservation (lib.rs:491). Kill: drop_conservation.
 // ===========================================================================
 #[test]
 fn row01_value_conservation() {
@@ -566,7 +604,7 @@ fn row01_value_conservation() {
         assert_shipped_sat(&built.circuit, "row1 honest");
 
         // Adversarial: output 0 worth one more unit, with a matching commitment so ONLY the
-        // conservation equality (441) is violated — outputs now exceed inputs by 1.
+        // conservation equality (491) is violated — outputs now exceed inputs by 1.
         let mut adv = built.circuit.clone();
         let bumped = adv.out_v[0].unwrap() + F::one();
         adv.out_v[0] = Some(bumped);
@@ -576,12 +614,12 @@ fn row01_value_conservation() {
         assert_shipped_unsat(&adv, "row1 outputs exceed inputs by 1");
 
         let ko = KnockOut { drop_conservation: true, ..KnockOut::none() };
-        assert_kill_flip(MirrorTransfer::new(adv, ko), "row1 conservation (441)");
+        assert_kill_flip(MirrorTransfer::new(adv, ko), "row1 conservation (491)");
     }
 }
 
 // ===========================================================================
-// ROW 2 — Range constraints (enforce_u64_range, lib.rs:236-254; calls 414/434).
+// ROW 2 — Range constraints (enforce_u64_range, lib.rs:236-254; calls 452/484).
 // Kill: shipped enforce_range=false, and mirror range_outputs / range_inputs off.
 // ===========================================================================
 #[test]
@@ -608,12 +646,12 @@ fn row02_range_constraints_field_wrap_mint() {
         vuln.enforce_range = false;
         assert_shipped_sat(&vuln, "row2 KILL: enforce_range=false accepts the mint");
 
-        // Mirror kill isolating the OUTPUT range invocation (lib.rs:434-436).
+        // Mirror kill isolating the OUTPUT range invocation (lib.rs:484-486).
         let ko = KnockOut { range_outputs: false, ..KnockOut::none() };
-        assert_kill_flip(MirrorTransfer::new(adv, ko), "row2 output range (434)");
+        assert_kill_flip(MirrorTransfer::new(adv, ko), "row2 output range (484)");
     }
 
-    // INPUT range invocation (lib.rs:414-416) isolated: a note whose committed value is 2^64
+    // INPUT range invocation (lib.rs:452-454) isolated: a note whose committed value is 2^64
     // (just past u64) sits in the tree; outputs are in-range and conserve. The shipped struct types
     // in_v as u64 so this is expressed against the faithful mirror via in_v_field_override.
     let mut rng = StdRng::from_seed([0x2f; 32]);
@@ -642,6 +680,7 @@ fn row02_range_constraints_field_wrap_mint() {
     let base = TransferCircuit {
         cfg: cfg.clone(),
         enforce_range: true,
+        legacy_statement: false,
         anchor: Some(anchor),
         nf: [Some(nf0), Some(nf1)],
         cm_out: [
@@ -663,14 +702,14 @@ fn row02_range_constraints_field_wrap_mint() {
     };
     let mut on = MirrorTransfer::new(base.clone(), KnockOut::none());
     on.in_v_field_override[0] = Some(over);
-    assert!(!mirror_satisfied(on), "row2 input range (414): 2^64 input rejected");
+    assert!(!mirror_satisfied(on), "row2 input range (452): 2^64 input rejected");
     let mut off = MirrorTransfer::new(base, KnockOut { range_inputs: false, ..KnockOut::none() });
     off.in_v_field_override[0] = Some(over);
-    assert!(mirror_satisfied(off), "row2 KILL input range (414): 2^64 input accepted when dropped");
+    assert!(mirror_satisfied(off), "row2 KILL input range (452): 2^64 input accepted when dropped");
 }
 
 // ===========================================================================
-// ROW 3 — Nullifier derivation (lib.rs:410-411). Kill: drop_nullifier.
+// ROW 3 — Nullifier derivation (lib.rs:448-449). Kill: drop_nullifier.
 // ===========================================================================
 #[test]
 fn row03_nullifier_derivation() {
@@ -680,18 +719,18 @@ fn row03_nullifier_derivation() {
         let built = build_honest(&mut rng, &cfg, [40_000, 60_000], 7, 500, 30_000);
         assert_shipped_sat(&built.circuit, "row3 honest");
 
-        // Public nullifier disagrees with H(2,nk,rho) — only line 411 fails.
+        // Public nullifier disagrees with H(2,nk,rho) — only line 449 fails.
         let mut adv = built.circuit.clone();
         adv.nf[0] = Some(adv.nf[0].unwrap() + F::one());
         assert_shipped_unsat(&adv, "row3 nf_pub != H(2,nk,rho)");
 
         let ko = KnockOut { drop_nullifier: true, ..KnockOut::none() };
-        assert_kill_flip(MirrorTransfer::new(adv, ko), "row3 nullifier binding (411)");
+        assert_kill_flip(MirrorTransfer::new(adv, ko), "row3 nullifier binding (449)");
     }
 }
 
 // ===========================================================================
-// ROW 4 — Note ownership: pk = H(1,nk) feeding cm (lib.rs:405). Kill: drop_pk_binding.
+// ROW 4 — Note ownership: pk = H(1,nk) feeding cm (lib.rs:443). Kill: drop_pk_binding.
 // A party who knows a note's opening but NOT the owner's nk tries to spend it with their own
 // key (minting a valid distinct nullifier). Shipped rejects (wrong pk => wrong cm => not in tree).
 // ===========================================================================
@@ -707,7 +746,7 @@ fn row04_note_ownership() {
         let attacker_nk = F::rand(&mut rng);
         let mut adv = built.circuit.clone();
         adv.in_nk[0] = Some(attacker_nk);
-        // The attacker's nullifier for this note (so line 411 passes on its own).
+        // The attacker's nullifier for this note (so line 449 passes on its own).
         adv.nf[0] = Some(derive_nf(&cfg, attacker_nk, built.in_rho[0]));
         // Output 0 rho chains to the (now attacker) nullifier — keep the output commitment consistent.
         adv.cm_out[0] = Some(cm(
@@ -726,12 +765,12 @@ fn row04_note_ownership() {
         let mut m = MirrorTransfer::new(adv, ko);
         m.in_pk_override[0] = Some(derive_pk(&cfg, built.owner_nk));
         m.in_pk_override[1] = Some(derive_pk(&cfg, built.owner_nk));
-        assert_kill_flip(m, "row4 pk=H(1,nk) ownership binding (405)");
+        assert_kill_flip(m, "row4 pk=H(1,nk) ownership binding (443)");
     }
 }
 
 // ===========================================================================
-// ROW 5 — Merkle path enforcement (lib.rs:407-408). Kill: drop_merkle.
+// ROW 5 — Merkle path enforcement (lib.rs:445-446). Kill: drop_merkle.
 // ===========================================================================
 #[test]
 fn row05_merkle_path_enforcement() {
@@ -747,19 +786,19 @@ fn row05_merkle_path_enforcement() {
         assert_shipped_unsat(&adv, "row5 tampered path bit");
 
         let ko = KnockOut { drop_merkle: true, ..KnockOut::none() };
-        assert_kill_flip(MirrorTransfer::new(adv, ko), "row5 root==anchor (408)");
+        assert_kill_flip(MirrorTransfer::new(adv, ko), "row5 root==anchor (446)");
 
         // Also: a fabricated anchor is rejected, and dropping merkle accepts it.
         let mut adv2 = built.circuit.clone();
         adv2.anchor = Some(adv2.anchor.unwrap() + F::one());
         assert_shipped_unsat(&adv2, "row5 fabricated anchor");
         let ko2 = KnockOut { drop_merkle: true, ..KnockOut::none() };
-        assert_kill_flip(MirrorTransfer::new(adv2, ko2), "row5 fabricated anchor (408)");
+        assert_kill_flip(MirrorTransfer::new(adv2, ko2), "row5 fabricated anchor (446)");
     }
 }
 
 // ===========================================================================
-// ROW 6 — Output commitment formation (lib.rs:431-432) AND rho-chaining (lib.rs:428).
+// ROW 6 — Output commitment formation (lib.rs:481-482) AND rho-chaining (lib.rs:478).
 // Kills: drop_output_commitment; drop_rho_chain.
 // ===========================================================================
 #[test]
@@ -770,12 +809,12 @@ fn row06_output_commitment_and_rho_chaining() {
         let built = build_honest(&mut rng, &cfg, [80_000, 40_000], 4, 200, 70_000);
         assert_shipped_sat(&built.circuit, "row6 honest");
 
-        // (A) commitment binding: public cm_out disagrees with H(3,...) => line 432 fails.
+        // (A) commitment binding: public cm_out disagrees with H(3,...) => line 482 fails.
         let mut adv_cm = built.circuit.clone();
         adv_cm.cm_out[0] = Some(adv_cm.cm_out[0].unwrap() + F::one());
         assert_shipped_unsat(&adv_cm, "row6A cm_out != H(3,v,pk,rho_out,rcm)");
         let ko = KnockOut { drop_output_commitment: true, ..KnockOut::none() };
-        assert_kill_flip(MirrorTransfer::new(adv_cm, ko), "row6A output commitment (432)");
+        assert_kill_flip(MirrorTransfer::new(adv_cm, ko), "row6A output commitment (482)");
 
         // (B) Faerie-Gold rho-chaining: output 0 commits to a rho OTHER than nf_0. Shipped forces
         // rho_out = nf_0, so the computed cm != the claimed cm => UNSAT.
@@ -794,12 +833,12 @@ fn row06_output_commitment_and_rho_chaining() {
         let mut m = MirrorTransfer::new(adv_rho, ko_rho);
         m.out_rho_override[0] = Some(rogue_rho);
         m.out_rho_override[1] = Some(built.nullifiers[1]);
-        assert_kill_flip(m, "row6B rho_out = nf chaining (428)");
+        assert_kill_flip(m, "row6B rho_out = nf chaining (478)");
     }
 }
 
 // ===========================================================================
-// ROW 7 — Recipient binding (lib.rs:381). The shipped struct hardwires the witness mirror to the
+// ROW 7 — Recipient binding (lib.rs:410). The shipped struct hardwires the witness mirror to the
 // public field, so a differing witness is expressible only against the faithful mirror (proven
 // == shipped by the anchor test). Complementary proof-level binding: the existing
 // security_properties test mutates public-input position 7 and shows Groth16 rejects it.
@@ -817,30 +856,32 @@ fn row07_recipient_binding() {
         m_on.recipient_witness_override = Some(built.circuit.recipient_binding.unwrap() + F::one());
         assert!(
             !mirror_satisfied(m_on),
-            "row7 recipient witness != public rejected (381 present)"
+            "row7 recipient witness != public rejected (410 present)"
         );
 
-        // Kill: drop line 381 => recipient_binding referenced by zero constraints => the differing
+        // Kill: drop line 410 => recipient_binding referenced by zero constraints => the differing
         // witness is accepted (recipient malleable).
         let mut m_off =
             MirrorTransfer::new(built.circuit.clone(), KnockOut { drop_recipient: true, ..KnockOut::none() });
         m_off.recipient_witness_override = Some(built.circuit.recipient_binding.unwrap() + F::one());
         assert!(
             mirror_satisfied(m_off),
-            "row7 KILL: dropping 381 unbinds the recipient"
+            "row7 KILL: dropping 410 unbinds the recipient"
         );
     }
 }
 
 // ===========================================================================
-// ROW 8 — Public withdrawal treatment (v_pub_out). The circuit has NO range gadget on v_pub_out;
-// its [0,2^64) bound is at the interface (candid Nat64 + nat64Field, Main.mo:1130/2106). The
-// shipped struct types v_pub_out as u64 so the field-wrap witness is expressible only against the
-// compiled R1CS (via the faithful mirror). GAP: mirror accepts a wrapped v_pub_out that mints;
-// FIX (proposal): mirror with range_v_pub_out on rejects it.
+// ROW 8 — Public withdrawal treatment (v_pub_out). HARDENED statement: v_pub_out is range-bound
+// in-circuit (lib.rs:418) — the field-wrap mint witness is REJECTED by the R1CS itself, and the
+// kill-flip (knocking only that gadget out) proves the new constraint is load-bearing. LEGACY
+// statement: no range gadget — the same witness is SAT (the audited gap; there the [0,2^64)
+// bound lives only at the interface: candid Nat64 + nat64Field, Main.mo:1561/2779). The shipped
+// struct types v_pub_out as u64, so the wrapped witness is expressible only against the
+// faithful mirror (anchored to BOTH shipped statements by the faithfulness test).
 // ===========================================================================
 #[test]
-fn row08_public_withdrawal_field_wrap_gap_and_fix() {
+fn row08_public_withdrawal_field_wrap_enforced_and_legacy_gap() {
     let cfg = poseidon_config();
     for seed in [0x81u8, 0x82] {
         let mut rng = StdRng::from_seed([seed; 32]);
@@ -853,28 +894,38 @@ fn row08_public_withdrawal_field_wrap_gap_and_fix() {
         adv.cm_out[0] = Some(cm(&cfg, bumped, built.out_pk[0], built.nullifiers[0], built.out_rcm[0]));
         let wrapped = -F::from(50_000u64); // r - 50_000, canonical, NOT a u64
 
-        // GAP: faithful mirror (ko=none) with the raw wrapped v_pub_out => SATISFIED (over-mint).
-        let mut gap = MirrorTransfer::new(adv.clone(), KnockOut::none());
+        // ENFORCED: the hardened statement (mirror ko=none ≡ shipped hardened) REJECTS the wrap.
+        let mut hardened = MirrorTransfer::new(adv.clone(), KnockOut::none());
+        hardened.v_pub_out_field_override = Some(wrapped);
+        assert!(
+            !mirror_satisfied(hardened),
+            "row8 ENFORCED: hardened statement must reject a field-wrapped v_pub_out"
+        );
+
+        // KILL-FLIP: knocking out ONLY the v_pub_out range gadget re-admits the mint — the
+        // hardening constraint, and it alone, is load-bearing against this witness.
+        let mut killed =
+            MirrorTransfer::new(adv.clone(), KnockOut { range_v_pub_out: false, ..KnockOut::none() });
+        killed.v_pub_out_field_override = Some(wrapped);
+        assert!(
+            mirror_satisfied(killed),
+            "row8 KILL: dropping the v_pub_out range gadget must re-admit the wrap mint"
+        );
+
+        // LEGACY GAP (what the verifying-key rotation removes): the legacy statement accepts it.
+        let mut gap = MirrorTransfer::new(adv, KnockOut::legacy());
         gap.v_pub_out_field_override = Some(wrapped);
         assert!(
             mirror_satisfied(gap),
-            "row8 GAP: shipped R1CS accepts a field-wrapped v_pub_out (mint of 50k)"
-        );
-
-        // FIX: the proposed in-circuit range on v_pub_out rejects the wrapped value.
-        let mut fix = MirrorTransfer::new(adv, KnockOut { range_v_pub_out: true, ..KnockOut::none() });
-        fix.v_pub_out_field_override = Some(wrapped);
-        assert!(
-            !mirror_satisfied(fix),
-            "row8 FIX: in-circuit range on v_pub_out rejects the wrap"
+            "row8 LEGACY GAP: legacy R1CS accepts a field-wrapped v_pub_out (mint of 50k)"
         );
     }
 }
 
 // ===========================================================================
 // ROW 9 — Dummy-input behavior. There is NO dummy slot: fixed 2-in arity, no is_dummy flag, no
-// conditional on any input (lib.rs:386-418). A dummy/fabricated input (not a real tree member) is
-// rejected by the Merkle membership constraint (408). Kill: drop_merkle. Padding is via zero-value
+// conditional on any input (lib.rs:424-456). A dummy/fabricated input (not a real tree member) is
+// rejected by the Merkle membership constraint (446). Kill: drop_merkle. Padding is via zero-value
 // REAL notes (row 10).
 // ===========================================================================
 #[test]
@@ -892,7 +943,7 @@ fn row09_no_dummy_input_slot() {
         assert_shipped_unsat(&adv, "row9 fabricated/dummy input not in tree");
 
         let ko = KnockOut { drop_merkle: true, ..KnockOut::none() };
-        assert_kill_flip(MirrorTransfer::new(adv, ko), "row9 membership is mandatory (408)");
+        assert_kill_flip(MirrorTransfer::new(adv, ko), "row9 membership is mandatory (446)");
     }
 }
 
@@ -919,22 +970,24 @@ fn row10_zero_value_notes() {
     assert_shipped_sat(&built_in.circuit, "row10 honest zero-value input");
 
     // Adversarial: output 0 carries 0 in the conservation sum but its public commitment encodes 5.
-    // Conservation still holds (0 + 100_000); ONLY the commitment (432) fails.
+    // Conservation still holds (0 + 100_000); ONLY the commitment (482) fails.
     let mut adv = built_out.circuit.clone();
     adv.cm_out[0] = Some(cm(
         &cfg, F::from(5u64), built_out.out_pk[0], built_out.nullifiers[0], built_out.out_rcm[0],
     ));
     assert_shipped_unsat(&adv, "row10 zero in sum but commitment to 5");
     let ko = KnockOut { drop_output_commitment: true, ..KnockOut::none() };
-    assert_kill_flip(MirrorTransfer::new(adv, ko), "row10 commitment binds value (432)");
+    assert_kill_flip(MirrorTransfer::new(adv, ko), "row10 commitment binds value (482)");
 }
 
 // ===========================================================================
-// ROW 11 — Fee accounting. Same shape as row 8: no in-circuit range on `fee`; [0,2^64) bound is at
-// the interface (candid Nat64 + nat64Field, Main.mo:1130/2105). GAP + FIX via the faithful mirror.
+// ROW 11 — Fee accounting. Same shape as row 8 for `fee`. HARDENED: in-circuit range
+// (lib.rs:417) rejects the field-wrapped fee, kill-flip proves it load-bearing. LEGACY: the
+// same witness is SAT (gap; interface-only bound via candid Nat64 + nat64Field,
+// Main.mo:1561/2778).
 // ===========================================================================
 #[test]
-fn row11_fee_field_wrap_gap_and_fix() {
+fn row11_fee_field_wrap_enforced_and_legacy_gap() {
     let cfg = poseidon_config();
     for seed in [0xb1u8, 0xb2] {
         let mut rng = StdRng::from_seed([seed; 32]);
@@ -945,18 +998,29 @@ fn row11_fee_field_wrap_gap_and_fix() {
         adv.cm_out[0] = Some(cm(&cfg, bumped, built.out_pk[0], built.nullifiers[0], built.out_rcm[0]));
         let wrapped = -F::from(50_000u64); // r - 50_000, a canonical field element, not a u64
 
-        let mut gap = MirrorTransfer::new(adv.clone(), KnockOut::none());
+        // ENFORCED on the hardened statement.
+        let mut hardened = MirrorTransfer::new(adv.clone(), KnockOut::none());
+        hardened.fee_field_override = Some(wrapped);
+        assert!(
+            !mirror_satisfied(hardened),
+            "row11 ENFORCED: hardened statement must reject a field-wrapped fee"
+        );
+
+        // KILL-FLIP: only the fee range gadget removed => the mint is re-admitted.
+        let mut killed =
+            MirrorTransfer::new(adv.clone(), KnockOut { range_fee: false, ..KnockOut::none() });
+        killed.fee_field_override = Some(wrapped);
+        assert!(
+            mirror_satisfied(killed),
+            "row11 KILL: dropping the fee range gadget must re-admit the wrap mint"
+        );
+
+        // LEGACY GAP preserved (SAT) — what the rotation removes.
+        let mut gap = MirrorTransfer::new(adv, KnockOut::legacy());
         gap.fee_field_override = Some(wrapped);
         assert!(
             mirror_satisfied(gap),
-            "row11 GAP: shipped R1CS accepts a field-wrapped fee (mint of 50k)"
-        );
-
-        let mut fix = MirrorTransfer::new(adv, KnockOut { range_fee: true, ..KnockOut::none() });
-        fix.fee_field_override = Some(wrapped);
-        assert!(
-            !mirror_satisfied(fix),
-            "row11 FIX: in-circuit range on fee rejects the wrap"
+            "row11 LEGACY GAP: legacy R1CS accepts a field-wrapped fee (mint of 50k)"
         );
     }
 }
@@ -964,7 +1028,7 @@ fn row11_fee_field_wrap_gap_and_fix() {
 // ===========================================================================
 // ROW 12 — Field-reduction / non-canonical encoding ambiguity. NOT an R1CS constraint: rejected at
 // the ledger canonical-decode (Groth16Wire.mo:72 -> Fr.mo:19, `x < P`). Rust mirror: f_from_hex /
-// deserialize_compressed enforces `< modulus` (lib.rs:513). Teeth: a canonical encoding round-trips;
+// deserialize_compressed enforces `< modulus` (lib.rs:563). Teeth: a canonical encoding round-trips;
 // a non-canonical one (== modulus) is REJECTED; and a REDUCING decode would alias it to 0 — the
 // two-openings ambiguity the rejection prevents.
 // ===========================================================================
@@ -998,7 +1062,7 @@ fn row12_field_reduction_ambiguity() {
 }
 
 // ===========================================================================
-// DEPOSIT circuit — commitment binding (lib.rs:485), zero-value + max-value (rows 6/10/2-by-type).
+// DEPOSIT circuit — commitment binding (lib.rs:535), zero-value + max-value (rows 6/10/2-by-type).
 // Kill: MirrorDeposit drop_commitment.
 // ===========================================================================
 #[test]
@@ -1028,19 +1092,21 @@ fn deposit_commitment_formation_and_edges() {
         // Kill: drop the commitment binding => SAT.
         assert!(
             mirror_deposit_satisfied(MirrorDeposit { inner: adv, drop_commitment: true }),
-            "deposit KILL commitment binding (485) v={value}"
+            "deposit KILL commitment binding (535) v={value}"
         );
     }
 }
 
 // ===========================================================================
-// EXTRA finding (verify-loop pass 2) — no in-circuit input-note distinctness. The shipped circuit
-// accepts the SAME note in both input slots (value doubling); closed end-to-end at the canister
-// (nullifier_1 == nullifier_2 rejected, Main.mo:2087-2088). Proposed fix (harden_distinctness):
-// nf[0] != nf[1] rejects it in-circuit.
+// Input-note distinctness. HARDENED statement: nf[0] != nf[1] is enforced in-circuit
+// (lib.rs:464-466) — loading the SAME note into both input slots (value doubling + shared
+// output rho, the Faerie-Gold collision) is rejected by the R1CS itself, directly against the
+// shipped struct. LEGACY statement: no such constraint — the doubled witness is SAT (gap),
+// closed there only at the ledger boundary (nullifier_1 == nullifier_2 rejected,
+// Main.mo:2760-2762).
 // ===========================================================================
 #[test]
-fn extra_input_note_distinctness_gap_and_fix() {
+fn input_note_distinctness_enforced_and_legacy_gap() {
     let cfg = poseidon_config();
     let mut rng = StdRng::from_seed([0xdd; 32]);
 
@@ -1063,6 +1129,7 @@ fn extra_input_note_distinctness_gap_and_fix() {
     let doubled = TransferCircuit {
         cfg: cfg.clone(),
         enforce_range: true,
+        legacy_statement: false,
         anchor: Some(anchor),
         nf: [Some(nf), Some(nf)],
         cm_out: [
@@ -1082,23 +1149,66 @@ fn extra_input_note_distinctness_gap_and_fix() {
         out_pk: [Some(out_pk0), Some(out_pk1)],
         out_rcm: [Some(out_rcm0), Some(out_rcm1)],
     };
-    // GAP: the shipped circuit is SATISFIED by the same-note-twice witness.
-    assert_shipped_sat(&doubled, "distinctness GAP: same note in both input slots doubles value");
-
-    // FIX: the proposed nf[0] != nf[1] constraint rejects it (as a synthesis infeasibility).
-    let fix = MirrorTransfer::new(doubled, KnockOut { harden_distinctness: true, ..KnockOut::none() });
+    // ENFORCED: the shipped HARDENED circuit rejects the same-note-twice witness DIRECTLY
+    // (synthesis infeasibility of the not-equal gadget counts as rejection — no proof exists).
     assert!(
-        mirror_rejects(fix),
-        "distinctness FIX: in-circuit nf[0] != nf[1] rejects the doubled note"
+        !shipped_satisfied(&doubled),
+        "distinctness ENFORCED: shipped hardened circuit must reject the doubled note"
+    );
+    // ... and so does the faithful mirror with nothing knocked out.
+    assert!(
+        mirror_rejects(MirrorTransfer::new(doubled.clone(), KnockOut::none())),
+        "distinctness ENFORCED: mirror(ko=none) must reject the doubled note"
     );
 
-    // The proposed constraint does NOT break an honest transfer (two distinct input notes).
+    // KILL-FLIP: knocking out ONLY the distinctness constraint re-admits the doubling.
+    assert!(
+        mirror_satisfied(MirrorTransfer::new(
+            doubled.clone(),
+            KnockOut { harden_distinctness: false, ..KnockOut::none() },
+        )),
+        "distinctness KILL: dropping nf[0] != nf[1] must re-admit the doubled note"
+    );
+
+    // LEGACY GAP preserved: the shipped LEGACY statement is SATISFIED by the doubled witness —
+    // the value-doubling gap the hardened statement closes (and the vk rotation removes).
+    let doubled_legacy = TransferCircuit { legacy_statement: true, ..doubled };
+    assert!(
+        shipped_satisfied(&doubled_legacy),
+        "distinctness LEGACY GAP: same note in both input slots doubles value on legacy"
+    );
+
+    // The constraint does NOT break an honest transfer (two distinct input notes) — shipped
+    // hardened struct AND mirror agree.
     let mut rng2 = StdRng::from_seed([0xdc; 32]);
     let honest = build_honest(&mut rng2, &cfg, [70_000, 30_000], 5, 0, 60_000);
-    let honest_hardened =
-        MirrorTransfer::new(honest.circuit, KnockOut { harden_distinctness: true, ..KnockOut::none() });
+    assert_shipped_sat(&honest.circuit, "distinctness: honest hardened transfer");
     assert!(
-        mirror_satisfied(honest_hardened),
-        "distinctness FIX: honest distinct-nullifier transfer still satisfies the hardened circuit"
+        mirror_satisfied(MirrorTransfer::new(honest.circuit, KnockOut::none())),
+        "distinctness: honest distinct-nullifier transfer still satisfies the hardened circuit"
     );
+}
+
+// ===========================================================================
+// HARDENED-statement honest coverage: ≥12 randomized honest transfers (varying values, fees,
+// public outputs, tree positions) must ALL satisfy the shipped hardened circuit, and the same
+// witnesses must satisfy the shipped legacy circuit (the hardening admits every honest
+// statement the legacy circuit admitted).
+// ===========================================================================
+#[test]
+fn hardened_honest_transfers_satisfiable_across_seeds() {
+    let cfg = poseidon_config();
+    for seed in 1u8..=12 {
+        let mut rng = StdRng::from_seed([seed; 32]);
+        let a = 10_000 + (seed as u64) * 31_337;
+        let b = 5_000 + (seed as u64) * 17_741;
+        let total = a + b;
+        let fee = (seed as u64) % 97;
+        let public_out = if seed % 3 == 0 { (seed as u64) * 1_000 } else { 0 };
+        let first = (total - fee - public_out) / ((seed as u64 % 4) + 2);
+        let built = build_honest(&mut rng, &cfg, [a, b], fee, public_out, first);
+        assert_shipped_sat(&built.circuit, "hardened honest seed");
+        let legacy = TransferCircuit { legacy_statement: true, ..built.circuit };
+        assert_shipped_sat(&legacy, "legacy honest seed");
+    }
 }

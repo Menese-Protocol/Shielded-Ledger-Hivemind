@@ -32,6 +32,11 @@ pub struct Keyset {
     pub deposit_vk: VerifyingKey<Bls12_381>,
     pub transfer_vk_hex: String,
     pub deposit_vk_hex: String,
+    /// Which transfer statement these keys belong to (`true` = the pre-hardening statement of
+    /// `fixtures/pool-vectors-bls12-381`; `false` = the hardened conservation statement). Every
+    /// proof the harness builds must construct its circuit with the SAME statement or proving
+    /// fails against these keys.
+    pub legacy_statement: bool,
 }
 
 #[derive(serde::Deserialize)]
@@ -63,8 +68,9 @@ fn vk_hex_file_sha256(vk_hex: &str) -> String {
 
 /// Regenerate the keyset and gate it against the manifest. Returns the keyset on success; errors
 /// (aborting the whole run) if the setup mode is not the deterministic test mode or any SHA
-/// mismatches.
-pub fn regenerate_and_verify(manifest_json: &str) -> Result<Keyset, String> {
+/// mismatches. `legacy_statement` selects which transfer statement to set up — it must match the
+/// manifest the caller passes (each statement has its own fixture manifest).
+pub fn regenerate_and_verify(manifest_json: &str, legacy_statement: bool) -> Result<Keyset, String> {
     let manifest: Manifest =
         serde_json::from_str(manifest_json).map_err(|e| format!("manifest parse: {e}"))?;
     if manifest.setup_mode != "insecure-deterministic-test" {
@@ -77,8 +83,13 @@ pub fn regenerate_and_verify(manifest_json: &str) -> Result<Keyset, String> {
     for _ in 0..NOTE_DRAWS_BEFORE_TRANSFER_SETUP {
         let _ = F::rand(&mut rng);
     }
+    let transfer_blank = if legacy_statement {
+        TransferCircuit::blank_legacy(&cfg)
+    } else {
+        TransferCircuit::blank(&cfg)
+    };
     let (transfer_pk, transfer_vk) =
-        Groth16::<Bls12_381>::circuit_specific_setup(TransferCircuit::blank(&cfg), &mut rng)
+        Groth16::<Bls12_381>::circuit_specific_setup(transfer_blank, &mut rng)
             .map_err(|e| format!("transfer setup: {e}"))?;
 
     for _ in 0..DRAWS_BETWEEN_SETUPS {
@@ -112,6 +123,7 @@ pub fn regenerate_and_verify(manifest_json: &str) -> Result<Keyset, String> {
         deposit_vk,
         transfer_vk_hex,
         deposit_vk_hex,
+        legacy_statement,
     })
 }
 
