@@ -28,7 +28,7 @@ RED, the detector has regressed and the gate fails.
 | §2 | Per-op arithmetic differential | 63 op classes of the production Motoko field/tower/curve/pairing/decode layers match an independent arkworks/blst oracle over millions of seeded cases | wrong RR/PINV limb, wrong modulus bit, broken Fp2 mul, wrong curve b |
 | §3 | Algebraic properties | Field/curve/pairing identities hold on the production L2/L3 layers (field 100k/family incl a·a⁻¹=1, sqr=mul, Frobenius order; curve [a+b]P=[a]P+[b]P, [r]P=O, [2]P=P+P; pairing bilinearity, additivity, degeneracy) | a broken-distributivity Fp2 mutant |
 | §4 | Independent reference model + violation matrix | An independent (stdlib-Python) Poseidon + circuit model reproduces every production value; 13 single-rule circuit violations are all unsatisfiable | non-stdlib import, wrong round constant, a satisfied violation |
-| §5 | Under-constrained detection | Every one of the transfer circuit's 20,213 witness variables is constrained and noticed; no unconstrained witnesses | a planted dead witness + a boolean missing its booleanity |
+| §5 | Under-constrained detection | Every one of the transfer circuit's 20,213 witness variables participates in (is noticed by) at least one constraint — a participation/coverage proof; it does not prove each constraint is semantically correct (that rests on §4's rule matrix and circuit review) | a planted dead witness + a boolean missing its booleanity |
 | §6 | Metamorphic | Validity-preserving proof transforms stay accepted; validity-destroying transforms are rejected — all 3-way | a destroying transform mislabeled preserving |
 | §7 | Coverage-guided fuzzing | Ten cargo-fuzz decoder targets + a Motoko-side battery (≥250k inputs/decoder): every wire/crypto/ceremony/ICRC-3/checkpoint decoder is total on arbitrary bytes (no panic, no unbounded alloc, no non-canonical accept) | a decoder with a deliberate out-of-bounds panic |
 | §9 | Stateful financial invariants | Model tier: 2,000,000 seeded ops, custody/pool/conservation/nullifier invariants hold after every op with atomic seam rollback. Live tier: the two remaining in-canister seams (during-token-call, during-cert-update) injected via hook wasm, ≥25 each, every message rolled back | a double-mint credited without matching custody |
@@ -43,8 +43,10 @@ RED, the detector has regressed and the gate fails.
   per-op differentials — a shared misreading of the BLS12-381/Groth16 spec across all three
   is the only way a verifier bug survives, and §4's independent-lineage Poseidon closes even
   the shared-Poseidon-parameter window.
-- The transfer circuit rejects every single-rule violation and has no unconstrained witness
-  variable (the highest-value ZK bug class).
+- The transfer circuit rejects every single-rule violation, and every witness variable
+  participates in at least one constraint (no dead witnesses — the highest-value ZK bug
+  class). Participation is what §5 proves mechanically; the semantic correctness of each
+  individual constraint rests on §4's rule matrix and circuit review, not on §5.
 - The wire decoders are total functions on arbitrary bytes.
 - The ledger's value-conservation / custody / nullifier invariants hold across millions of
   abstract operations with failure injection at every logical seam.

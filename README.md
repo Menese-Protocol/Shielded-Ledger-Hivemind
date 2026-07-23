@@ -116,8 +116,11 @@ assertions, and the stated boundaries are in [`docs/READ-PATH-SPEC.md`](docs/REA
 
 A wallet restored from seed phrase alone (no birthday metadata) uses the certified
 detection stream: a per-entry hash chain with Merkle anchors served by any untrusted
-mirror, scanned by a parallel verify-before-scan client (10^8 notes in minutes, zero
-false negatives proven at scale) — full-history restore without trusting a server.
+mirror, scanned by a parallel verify-before-scan client — 10^8 notes in minutes, with
+zero false negatives across the complete 100-million-record acceptance corpus and all
+published test variants — full-history restore without trusting a server. What that
+costs on constrained devices (4-core caps, 10/50 Mbps links, background throttling,
+kill-and-resume) is measured in [`docs/RESTORE-BENCHMARKS.md`](docs/RESTORE-BENCHMARKS.md).
 
 ## What the node provider sees
 
@@ -147,7 +150,7 @@ untrusted mirror or CDN and verify locally — the chain certifies; it does not 
 serve. In production the expensive stripe computation runs as caller-paid metered calls
 behind boundary rate limiting; the open unmetered query mode is for demos. The full
 parameter table, the estimate, the cost model, and the stated scaling boundaries are in
-[`docs/PIR-SPEC.md`](docs/PIR-SPEC.md).
+[`docs/PIR-V2-SPEC.md`](docs/PIR-V2-SPEC.md).
 
 *The ledger answers without knowing the question.*
 
