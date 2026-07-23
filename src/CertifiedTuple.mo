@@ -19,6 +19,10 @@ module {
     // digest of the background stable-state audit verdict (state tag + code/index iff
     // failed — a pure function of the audited ledger state, never of cursor/epoch/time)
     audit_digest : Blob;
+    // latest PIR-v2 record-stream chain boundary, as digest(32) ‖ covered-count(8B BE) —
+    // present ONLY when the pir2 layer is enabled AND a DPAGE boundary exists, so the tree
+    // (and its root digest) is byte-identical to the pre-pir2 one on every other deployment
+    pir2_boundary : ?Blob;
   };
 
   public type HashTree = {
@@ -34,7 +38,15 @@ module {
   };
 
   func zkTree(tuple : Tuple) : HashTree {
-    // labels stay alphabetical: archive_manifest < audit < encoding_version < note_count < note_root
+    // labels stay alphabetical:
+    //   archive_manifest < audit < encoding_version < note_count < note_root < pir2_boundary
+    let tail : HashTree = switch (tuple.pir2_boundary) {
+      case (?boundary) #fork(
+        labeledLeaf("note_root", tuple.note_root),
+        labeledLeaf("pir2_boundary", boundary),
+      );
+      case null labeledLeaf("note_root", tuple.note_root);
+    };
     #labeled(
       Text.encodeUtf8("zk"),
       #fork(
@@ -45,7 +57,7 @@ module {
             labeledLeaf("encoding_version", Blob.fromArray(leb128Nat(tuple.encoding_version))),
             #fork(
               labeledLeaf("note_count", Blob.fromArray(leb128Nat(tuple.note_count))),
-              labeledLeaf("note_root", tuple.note_root),
+              tail,
             ),
           ),
         ),

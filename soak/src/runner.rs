@@ -308,6 +308,10 @@ pub struct Runner {
     executed_start: u64,
     next_upgrade_start: usize,
     pub started: Instant,
+    /// per-accepted-op message instruction counts (MutationResult.instructions), in submit
+    /// order — the pirdx battery compares these across flag-off/flag-on runs at the same
+    /// seed to prove the money-path delta is zero (AC-D6a)
+    pub op_instructions: Vec<u64>,
 }
 
 #[derive(Default)]
@@ -402,6 +406,7 @@ impl Runner {
                         executed_start: executed,
                         next_upgrade_start: next_upgrade,
                         started: Instant::now(),
+                        op_instructions: Vec::new(),
                     };
                     // consistency: the reloaded canister must agree with the reloaded model
                     let status = runner.env.ledger_status();
@@ -489,6 +494,7 @@ impl Runner {
             executed_start: 0,
             next_upgrade_start: 0,
             started: Instant::now(),
+            op_instructions: Vec::new(),
         }
     }
 
@@ -1010,7 +1016,10 @@ impl Runner {
             .collect()
     }
 
-    fn assert_state_matches(&self, m: &ct::MutationResult, context: &str) {
+    fn assert_state_matches(&mut self, m: &ct::MutationResult, context: &str) {
+        if let Some(instr) = m.instructions {
+            self.op_instructions.push(instr);
+        }
         let root = f_bytes(&self.model.mirror.root());
         assert_eq!(m.note_root.as_slice(), root.as_slice(), "{context}: note_root diverged from model");
         assert_eq!(
@@ -1273,7 +1282,24 @@ impl Runner {
         }
     }
 
-    fn upgrade(&mut self, at_op: u64) {
+    /// Drive exactly `n` ops through the normal plan→prove→submit pipeline with no
+    /// upgrades/recycles/checkpoints — the pirdx battery's building block for interleaving
+    /// transfers with PIR fold fault injection. Returns ops executed.
+    pub fn step_ops(&mut self, n: usize) -> u64 {
+        let mut executed = 0u64;
+        while (executed as usize) < n {
+            let want = self.tier.batch.min(n - executed as usize);
+            let plan = self.plan_batch(want);
+            let ops = self.prove_batch(plan);
+            for op in ops {
+                self.submit(op);
+                executed += 1;
+            }
+        }
+        executed
+    }
+
+    pub fn upgrade(&mut self, at_op: u64) {
         let rts = self.env.ledger_rts();
         self.progress(&format!(
             "upgrade #{} at op {} STARTING (mode upgrade, same wasm) | pre-upgrade rts: mem {:.2}GiB heap {:.2}GiB max-live {:.2}GiB",
@@ -1616,6 +1642,7 @@ impl Runner {
         )]))
         .to_vec();
         let tuple = cert::ExpectedTuple {
+            pir2_boundary: None, // flag-off soak: the certified tree must be pre-pir2-identical
             tip_index: blocks.len() as u64 - 1,
             tip_hash: replayer_tip_hash,
             note_count: blocks.len() as u64,

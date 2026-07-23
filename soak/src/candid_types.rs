@@ -116,6 +116,9 @@ pub struct MutationResult {
     pub nullifier_count: Nat,
     pub pool_value: Nat,
     pub epoch: Nat,
+    /// message-slice instruction counter at response construction (absent on pre-pirdx
+    /// wasms — Option so old-wasm checkpoints still decode)
+    pub instructions: Option<u64>,
 }
 
 #[derive(CandidType, Clone, Debug)]

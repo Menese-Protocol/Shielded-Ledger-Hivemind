@@ -20,6 +20,10 @@ pub struct ExpectedTuple {
     /// digest of the background audit verdict — the runner asserts audit PASS before
     /// fetching the certificate, then expects the ICRC-3 map hash of {state: "pass"}
     pub audit_digest: Vec<u8>,
+    /// pir2 record-stream boundary leaf (digest(32) ‖ covered 8B BE) — present only when
+    /// the pir2 layer is enabled AND a DPAGE boundary exists (flag-off runs pass None and
+    /// the canonical tree is byte-identical to the pre-pir2 one)
+    pub pir2_boundary: Option<Vec<u8>>,
 }
 
 fn leb128(value: u64) -> Vec<u8> {
@@ -47,7 +51,13 @@ fn canonical_tree(t: &ExpectedTuple, tip_index_leaf: Vec<u8>, note_root: Vec<u8>
                         labeled("encoding_version", leaf(leb128(t.encoding_version))),
                         fork(
                             labeled("note_count", leaf(leb128(t.note_count))),
-                            labeled("note_root", leaf(note_root)),
+                            match &t.pir2_boundary {
+                                Some(b) => fork(
+                                    labeled("note_root", leaf(note_root)),
+                                    labeled("pir2_boundary", leaf(b.clone())),
+                                ),
+                                None => labeled("note_root", leaf(note_root)),
+                            },
                         ),
                     ),
                 ),
