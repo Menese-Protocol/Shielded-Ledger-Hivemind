@@ -126,3 +126,50 @@
 
   // Read-back of pool_value for the seam battery's solvency sweep.
   public query func test_pool_value() : async Nat { pool_value };
+
+  // ===== detect-chain corruption primitives (AC-2 audit teeth; hook-wasm ONLY) =====
+  // One primitive per audited field: chain tip, cached root, covered counter, note
+  // counter, and one boundary leaf. Each must turn the background audit RED with its
+  // exact `detect-chain:*` code; `detect_chain_rebuild` + `restart_audit` is the
+  // recovery path under test.
+  public shared ({ caller }) func test_detect_corrupt(field : Text) : async () {
+    if (not isAdministrator(caller)) Runtime.trap("test-hook:not-administrator");
+    func flip(b : Blob) : Blob {
+      let bytes = Blob.toVarArray(b);
+      bytes[0] := bytes[0] ^ 0x01;
+      Blob.fromVarArray(bytes)
+    };
+    if (field == "chain") { detect_chain_state.chain := flip(detect_chain_state.chain) }
+    else if (field == "root") { detect_chain_state.root := flip(detect_chain_state.root) }
+    else if (field == "covered") { detect_chain_state.covered += 1 }
+    else if (field == "count") { detect_chain_state.count += 1 }
+    else if (field == "boundary") {
+      switch (List.get(detect_chain_state.boundaries, 0)) {
+        case (?leaf) List.put(detect_chain_state.boundaries, 0, flip(leaf));
+        case null Runtime.trap("test-hook: no boundary to corrupt");
+      };
+    } else Runtime.trap("test-hook: unknown detect field");
+  };
+
+  // Wipe the in-memory anchor entirely (recovery-from-scratch drill: the rebuild must
+  // reconstruct the identical anchor from the note log alone).
+  public shared ({ caller }) func test_detect_wipe() : async () {
+    if (not isAdministrator(caller)) Runtime.trap("test-hook:not-administrator");
+    detect_chain_state.chain := Blob.fromArray(Array.repeat<Nat8>(0, 32));
+    detect_chain_state.root := Blob.fromArray(Array.repeat<Nat8>(0, 32));
+    detect_chain_state.covered := 0;
+    detect_chain_state.count := 0;
+    List.clear(detect_chain_state.boundaries);
+    List.clear(detect_chain_frontier.stack);
+  };
+
+  // Anchor read-back for the battery's byte-compare (query; hook wasm only).
+  public query func test_detect_anchor() : async { root : Blob; c_tip : Blob; note_count : Nat; covered : Nat; boundary_count : Nat } {
+    {
+      root = detect_chain_state.root;
+      c_tip = detect_chain_state.chain;
+      note_count = detect_chain_state.count;
+      covered = detect_chain_state.covered;
+      boundary_count = List.size(detect_chain_state.boundaries);
+    }
+  };

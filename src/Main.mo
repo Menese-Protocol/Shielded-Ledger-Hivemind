@@ -413,6 +413,32 @@ persistent actor ZkLedger {
   // Genesis-only enable keeps the chain covering the FULL history without a backfill path.
   var detect_chain_enabled : Bool = false;
   let detect_chain_state : DetectChain.State = DetectChain.newState();
+  // Incremental boundary-Merkle frontier (O(log B) per boundary; replaces the old O(B)
+  // full-root recompute on the append path). TRANSIENT on purpose: the stable shape of
+  // `detect_chain_state` is unchanged (stable-compatible by construction) and the frontier
+  // is a pure function of the persisted boundary list — rebuilt here on install AND on
+  // every upgrade at O(B) hashing over the boundary COUNT only (B ≤ 24,414 at 10^8 notes;
+  // measured inside postupgrade_instructions, bounded by the soak's 2B-instruction gate).
+  transient let detect_chain_frontier : DetectChain.Frontier = DetectChain.frontierFromBoundaries(detect_chain_state.boundaries);
+  // Audit-side detect-chain recompute (flag-gated; small: one 32-B chain + ≤⌈log2 B⌉
+  // frontier nodes). Walked alongside the #notes phase and compared to the live anchor
+  // ONLY in the message where the cursor catches the live noteCount() — the same
+  // atomic-tail discipline as audit_expected_parent == last_block_hash.
+  var audit_detect_chain : Blob = Blob.fromArray(Array.repeat<Nat8>(0, 32));
+  var audit_detect_covered : Nat = 0;
+  let audit_detect_frontier : DetectChain.Frontier = DetectChain.emptyFrontier();
+  // Detect-chain rebuild (admin recovery): the anchor is a pure function of the note log,
+  // so a corrupted anchor is rebuilt from scratch by a chunked walk that swaps into the
+  // live state atomically in the message that catches the live tail. Progress is stable;
+  // postupgrade re-arms an in-flight rebuild (timers do not survive upgrades).
+  var detect_rebuild_active : Bool = false;
+  var detect_rebuild_error : ?Text = null;
+  var detect_rebuild_cursor : Nat = 0;
+  var detect_rebuild_chain : Blob = Blob.fromArray(Array.repeat<Nat8>(0, 32));
+  var detect_rebuild_covered : Nat = 0;
+  let detect_rebuild_boundaries : List.List<Blob> = List.empty<Blob>();
+  let detect_rebuild_frontier : DetectChain.Frontier = DetectChain.emptyFrontier();
+  var detect_rebuild_retries : Nat = 0;
   var roots_fold_digest : Blob = Blob.fromArray(Array.repeat<Nat8>(0, 32));
   var nullifiers_fold_digest : Blob = Blob.fromArray(Array.repeat<Nat8>(0, 32));
   var shields_fold_digest : Blob = Blob.fromArray(Array.repeat<Nat8>(0, 32));
@@ -1039,6 +1065,9 @@ persistent actor ZkLedger {
             return auditFail("stable-state:transfer-statement-version", 0);
           };
           audit_expected_parent := null;
+          audit_detect_chain := Blob.fromArray(Array.repeat<Nat8>(0, 32));
+          audit_detect_covered := 0;
+          List.clear(audit_detect_frontier.stack);
         };
         var stepped : Nat = 0;
         while (stepped < AUDIT_NOTES_PER_CHUNK and audit_cursor < noteCount()) {
@@ -1050,6 +1079,27 @@ persistent actor ZkLedger {
             case (#err(message)) return auditFail(message, audit_cursor);
             case (#ok(hash)) audit_expected_parent := ?hash;
           };
+          // detect-chain recompute (flag-gated): fold this note's detection entry; at a
+          // DPAGE boundary the recomputed chain must BE the stored boundary leaf (catches
+          // boundary-list corruption exactly — the cached root alone would not).
+          if (detect_chain_enabled) {
+            switch (NoteAudit.ciphertextPrefix(encoded, 40)) {
+              case (?ct) {
+                audit_detect_chain := DetectChain.fold(audit_detect_chain, DetectChain.entryBytes(audit_cursor, ct));
+                if ((audit_cursor + 1) % DetectChain.DPAGE == 0) {
+                  switch (List.get(detect_chain_state.boundaries, audit_detect_covered)) {
+                    case (?stored) {
+                      if (stored != audit_detect_chain) return auditFail("detect-chain:boundary-mismatch", audit_cursor);
+                    };
+                    case null return auditFail("detect-chain:boundary-count", audit_cursor);
+                  };
+                  DetectChain.frontierAppend(audit_detect_frontier, audit_detect_covered, audit_detect_chain);
+                  audit_detect_covered += 1;
+                };
+              };
+              case null return auditFail("detect-chain:ciphertext-extract", audit_cursor);
+            };
+          };
           audit_cursor += 1;
           stepped += 1;
         };
@@ -1058,6 +1108,10 @@ persistent actor ZkLedger {
         if (audit_cursor >= noteCount()) {
           if (audit_expected_parent != last_block_hash) {
             return auditFail("stable-state:last-block-hash", audit_cursor);
+          };
+          switch (detectChainAuditTail()) {
+            case (?code) return auditFail(code, audit_cursor);
+            case null {};
           };
           switch (validateTailAndPendings()) {
             case (#err(message)) return auditFail(message, audit_cursor);
@@ -1074,6 +1128,10 @@ persistent actor ZkLedger {
           audit_phase := #notes;
           return false;
         };
+        switch (detectChainAuditTail()) {
+          case (?code) return auditFail(code, audit_cursor);
+          case null {};
+        };
         switch (validateTailAndPendings()) {
           case (#err(message)) return auditFail(message, audit_cursor);
           case (#ok(_)) {};
@@ -1081,6 +1139,20 @@ persistent actor ZkLedger {
         auditPass()
       };
     }
+  };
+
+  /// Terminal detect-chain comparison (flag-gated): the walk-recomputed chain state vs
+  /// the live anchor — count, chain tip, boundary count, and Merkle root, plus per-
+  /// boundary equality already enforced inside the walk. Called ONLY in a message whose
+  /// walk cursor has caught the live noteCount() (atomic-tail discipline).
+  func detectChainAuditTail() : ?Text {
+    if (not detect_chain_enabled) return null;
+    if (audit_detect_chain != detect_chain_state.chain) return ?"detect-chain:tip-mismatch";
+    if (audit_cursor != detect_chain_state.count) return ?"detect-chain:count-mismatch";
+    if (audit_detect_covered != detect_chain_state.covered) return ?"detect-chain:covered-mismatch";
+    if (List.size(detect_chain_state.boundaries) != audit_detect_covered) return ?"detect-chain:boundary-count";
+    if (DetectChain.frontierRoot(audit_detect_frontier) != detect_chain_state.root) return ?"detect-chain:root-mismatch";
+    null
   };
 
   func auditStatusValue() : AuditStatus {
@@ -1106,6 +1178,102 @@ persistent actor ZkLedger {
     if (not isAdministrator(caller)) return #err("REJECT:not-administrator");
     resetAudit<system>();
     #ok(auditStatusValue())
+  };
+
+  // ==== detect-chain rebuild (admin recovery; chunked, trap-isolated) ====
+  // The anchor is a pure function of the note log, so recovery from a corrupted anchor is
+  // a from-scratch chunked recompute that swaps into the live state ATOMICALLY in the
+  // message that catches the live tail (appends landing mid-rebuild are covered: the walk
+  // reads them from the log before it completes). Guard-EXEMPT like restart_audit: it is
+  // a recovery path and mutates only detect-chain state.
+
+  type RebuildSelf = actor { __detect_rebuild_chunk : shared () -> async Bool };
+
+  func detectRebuildFail(code : Text) : Bool {
+    detect_rebuild_error := ?code;
+    detect_rebuild_active := false;
+    true
+  };
+
+  func detectRebuildTick() : async () {
+    if (not detect_rebuild_active) return;
+    var done = false;
+    try {
+      let self : RebuildSelf = actor (Principal.toText(selfPrincipal()));
+      done := await self.__detect_rebuild_chunk();
+      detect_rebuild_retries := 0;
+    } catch (e) {
+      detect_rebuild_retries += 1;
+      if (detect_rebuild_retries >= AUDIT_CHUNK_FAILURE_LIMIT) {
+        done := detectRebuildFail("detect-rebuild:chunk-failed:" # Error.message(e));
+      };
+    };
+    if (not done) ignore Timer.setTimer<system>(#seconds 0, detectRebuildTick);
+  };
+
+  public shared ({ caller }) func __detect_rebuild_chunk() : async Bool {
+    if (not Principal.equal(caller, selfPrincipal())) Runtime.trap("detect-rebuild:self-only");
+    if (not detect_rebuild_active) return true;
+    var stepped : Nat = 0;
+    while (stepped < AUDIT_NOTES_PER_CHUNK and detect_rebuild_cursor < noteCount()) {
+      let encoded = switch (StableLog.get(note_log, detect_rebuild_cursor)) {
+        case (?value) value;
+        case null return detectRebuildFail("detect-rebuild:missing-note");
+      };
+      switch (NoteAudit.ciphertextPrefix(encoded, 40)) {
+        case (?ct) {
+          detect_rebuild_chain := DetectChain.fold(detect_rebuild_chain, DetectChain.entryBytes(detect_rebuild_cursor, ct));
+          if ((detect_rebuild_cursor + 1) % DetectChain.DPAGE == 0) {
+            List.add(detect_rebuild_boundaries, detect_rebuild_chain);
+            DetectChain.frontierAppend(detect_rebuild_frontier, detect_rebuild_covered, detect_rebuild_chain);
+            detect_rebuild_covered += 1;
+          };
+        };
+        case null return detectRebuildFail("detect-rebuild:ciphertext-extract");
+      };
+      detect_rebuild_cursor += 1;
+      stepped += 1;
+    };
+    if (detect_rebuild_cursor >= noteCount()) {
+      // atomic swap in the SAME message the walk catches the live tail
+      detect_chain_state.chain := detect_rebuild_chain;
+      detect_chain_state.count := detect_rebuild_cursor;
+      detect_chain_state.covered := detect_rebuild_covered;
+      List.clear(detect_chain_state.boundaries);
+      for (b in List.values(detect_rebuild_boundaries)) List.add(detect_chain_state.boundaries, b);
+      List.clear(detect_chain_frontier.stack);
+      for (node in List.values(detect_rebuild_frontier.stack)) List.add(detect_chain_frontier.stack, node);
+      detect_chain_state.root := DetectChain.frontierRoot(detect_chain_frontier);
+      List.clear(detect_rebuild_boundaries);
+      List.clear(detect_rebuild_frontier.stack);
+      detect_rebuild_active := false;
+      refreshCertification();
+      return true;
+    };
+    false
+  };
+
+  /// Admin recovery: rebuild the ENTIRE detect-chain anchor from the note log. Run
+  /// restart_audit afterwards — a green audit over the rebuilt anchor is the recovery
+  /// proof (and the only path to clearing a tripped guard).
+  public shared ({ caller }) func detect_chain_rebuild() : async Result<()> {
+    if (not isAdministrator(caller)) return #err("REJECT:not-administrator");
+    if (not detect_chain_enabled) return #err("REJECT:detect-chain-not-enabled");
+    if (detect_rebuild_active) return #err("REJECT:detect-rebuild-running");
+    detect_rebuild_active := true;
+    detect_rebuild_error := null;
+    detect_rebuild_cursor := 0;
+    detect_rebuild_chain := Blob.fromArray(Array.repeat<Nat8>(0, 32));
+    detect_rebuild_covered := 0;
+    List.clear(detect_rebuild_boundaries);
+    List.clear(detect_rebuild_frontier.stack);
+    detect_rebuild_retries := 0;
+    ignore Timer.setTimer<system>(#seconds 0, detectRebuildTick);
+    #ok(())
+  };
+
+  public query func detect_rebuild_status() : async { active : Bool; cursor : Nat; error : ?Text } {
+    { active = detect_rebuild_active; cursor = detect_rebuild_cursor; error = detect_rebuild_error }
   };
 
   /// Clear the fail-closed guard (admin), permitted ONLY after a NEWER audit epoch has
@@ -1481,6 +1649,8 @@ persistent actor ZkLedger {
       pir2ArmDriver<system>();
       ignore Timer.setTimer<system>(#seconds 0, pir2DriverTick);
     };
+    // re-arm an in-flight detect-chain rebuild (progress is stable; the timer is not)
+    if (detect_rebuild_active) ignore Timer.setTimer<system>(#seconds 0, detectRebuildTick);
     refreshCertification();
     resetAudit<system>();
     postupgrade_heap_before := heap_before;
@@ -1790,7 +1960,7 @@ persistent actor ZkLedger {
     note_log_chain_digest := chain.sum();
     // certified detection-stream anchor: fold this note's 48-B detection entry
     // (pos BE8 ‖ note_ciphertext[0..40]); a DPAGE boundary + Merkle root update happen inside.
-    if (detect_chain_enabled) DetectChain.append(detect_chain_state, position, Blob.toArray(output.note_ciphertext));
+    if (detect_chain_enabled) DetectChain.append(detect_chain_state, detect_chain_frontier, position, Blob.toArray(output.note_ciphertext));
     last_block_hash := ?ICRC3.hashValue(NoteAudit.blockValue(block));
     // NO PIR code here — the append is authoritative and complete without the derived
     // index; the background fold driver trails it (derived-index decoupling, reviewer

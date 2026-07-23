@@ -24,6 +24,10 @@ pub struct ExpectedTuple {
     /// the pir2 layer is enabled AND a DPAGE boundary exists (flag-off runs pass None and
     /// the canonical tree is byte-identical to the pre-pir2 one)
     pub pir2_boundary: Option<Vec<u8>>,
+    /// certified detect-stream anchor leaf SHA256(root ‖ c_tip ‖ note_count LE8) — present
+    /// only when the detect chain is enabled (flag-off runs pass None and the canonical
+    /// tree is byte-identical to the pre-feature one)
+    pub detect_stream: Option<Vec<u8>>,
 }
 
 fn leb128(value: u64) -> Vec<u8> {
@@ -46,7 +50,13 @@ fn canonical_tree(t: &ExpectedTuple, tip_index_leaf: Vec<u8>, note_root: Vec<u8>
             fork(
                 labeled("archive_manifest", leaf(t.archive_manifest.clone())),
                 fork(
-                    labeled("audit", leaf(t.audit_digest.clone())),
+                    match &t.detect_stream {
+                        Some(ds) => fork(
+                            labeled("audit", leaf(t.audit_digest.clone())),
+                            labeled("detect_stream", leaf(ds.clone())),
+                        ),
+                        None => labeled("audit", leaf(t.audit_digest.clone())),
+                    },
                     fork(
                         labeled("encoding_version", leaf(leb128(t.encoding_version))),
                         fork(

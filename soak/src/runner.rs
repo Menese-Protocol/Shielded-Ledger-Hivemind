@@ -453,6 +453,18 @@ impl Runner {
                 println!("[setup] tree oracle DETACHED — ledger computes every root alone");
             }
         }
+        // Optionally arm the certified detect-chain anchor at genesis (default OFF — the
+        // flag-off state hash is the byte-identity gate). The whole corpus then maintains
+        // the anchor, every upgrade exercises the transient-frontier rebuild, and the
+        // end-of-run battery byte-compares anchor + certified detect_stream leaf against
+        // an independent Rust recompute over the SERVED detection_stream bytes.
+        if std::env::var("SOAK_DETECT_CHAIN").is_ok() {
+            let r: ct::MotokoResult<()> = env
+                .update(env.ledger, env.admin, "detect_chain_enable", ())
+                .expect("detect_chain_enable call");
+            r.into_result().expect("enable detect chain");
+            println!("[setup] certified detect-chain anchor ENABLED at genesis");
+        }
         let principals: Vec<Principal> = accounts.iter().map(|a| a.principal).collect();
         println!("[setup] funding {} accounts on the token fixture...", principals.len());
         let t0 = Instant::now();
@@ -1231,16 +1243,38 @@ impl Runner {
         );
     }
 
-    fn audit_status(&self) -> ct::AuditStatus {
+    pub fn audit_status(&self) -> ct::AuditStatus {
         self.env
             .query(self.env.ledger, "audit_status", ())
             .expect("audit_status query")
     }
 
+    /// Independent detect-chain recompute over the ledger's SERVED `detection_stream`
+    /// pages (512 entries/call — the same wire bytes a restoring client consumes).
+    /// Returns (root, c_tip, count, boundary_count) from `crate::detect` (no shared code
+    /// with the Motoko or JS implementations).
+    pub fn detect_recompute(&self) -> ([u8; 32], [u8; 32], u64, usize) {
+        let total = u64::try_from(self.env.ledger_status().note_count.0.clone()).unwrap();
+        let mut stream = crate::detect::Stream::new();
+        while stream.count < total {
+            let page: ct::Blob = self
+                .env
+                .query(
+                    self.env.ledger,
+                    "detection_stream",
+                    (candid::Nat::from(stream.count), candid::Nat::from(512u64)),
+                )
+                .expect("detection_stream");
+            assert!(!page.is_empty(), "detection_stream served an empty page mid-stream");
+            stream.fold_page(&page);
+        }
+        (stream.root(), stream.chain, stream.count, stream.boundaries.len())
+    }
+
     /// audit_status, tolerating a module that predates the audit (a checkpoint resumed
     /// with the OLD wasm still installed — the state upgrade #1 starts from). Returns
     /// None exactly when the method does not exist; any other failure still panics.
-    fn try_audit_status(&self) -> Option<ct::AuditStatus> {
+    pub fn try_audit_status(&self) -> Option<ct::AuditStatus> {
         match self.env.query::<ct::AuditStatus>(self.env.ledger, "audit_status", ()) {
             Ok(s) => Some(s),
             Err(e) if e.contains("no query method") || e.contains("does not exist") => None,
@@ -1251,7 +1285,7 @@ impl Runner {
     /// Drive PocketIC rounds until the background audit reaches a terminal state, with a
     /// HARD BOUND committed up front (bounded-verification: a stalled tick chain must
     /// fail the run loudly, never hang the poll). Returns the terminal status.
-    fn await_audit_terminal(&self, label: &str) -> ct::AuditStatus {
+    pub fn await_audit_terminal(&self, label: &str) -> ct::AuditStatus {
         let notes = u64::try_from(self.env.ledger_status().note_count.0.clone()).unwrap();
         // K=4096 notes/chunk + one chunk per set/log phase + margin; each chunk needs a
         // handful of rounds (timer tick + self-call + reply). 16 ticks/chunk is ~5x the
@@ -1394,6 +1428,29 @@ impl Runner {
                 detached,
                 "upgrade changed the oracle attachment state"
             );
+        }
+        // Detect-chain leg: the flag is stable and the anchor must survive the boundary;
+        // the whole anchor (root, c_tip, count) is byte-compared against an independent
+        // recompute over the SERVED detection_stream — this exercises the transient
+        // frontier rebuild the upgrade just performed, and the post-upgrade audit that
+        // already re-walked the chain above.
+        if std::env::var("SOAK_DETECT_CHAIN").is_ok() {
+            let anchor: ct::MotokoResult<ct::DetectAnchor> = self
+                .env
+                .query(self.env.ledger, "detect_stream_anchor", ())
+                .expect("detect_stream_anchor");
+            let anchor = anchor.into_result().expect("upgrade lost the detect-chain flag");
+            let (root, c_tip, count, boundaries) = self.detect_recompute();
+            assert_eq!(anchor.root.as_slice(), root, "post-upgrade detect root != recompute");
+            assert_eq!(anchor.c_tip.as_slice(), c_tip, "post-upgrade detect c_tip != recompute");
+            assert_eq!(
+                u64::try_from(anchor.note_count.0.clone()).unwrap(),
+                count,
+                "post-upgrade detect count != recompute"
+            );
+            self.progress(&format!(
+                "post-upgrade detect anchor verified against recompute ({count} entries, {boundaries} boundaries)"
+            ));
         }
         self.cheap_invariants();
         self.progress(&format!(
@@ -1641,8 +1698,34 @@ impl Runner {
             crate::icrc3_hash::text("pass"),
         )]))
         .to_vec();
+        // Detect-chain leg (SOAK_DETECT_CHAIN): the anchor endpoint must byte-match the
+        // independent Rust recompute over the served detection_stream, and the certified
+        // tuple must carry EXACTLY the leaf SHA256(root ‖ c_tip ‖ count LE8) computed from
+        // that recompute — two independent proofs (state equality + certificate binding).
+        let detect_stream_leaf: Option<Vec<u8>> = if std::env::var("SOAK_DETECT_CHAIN").is_ok() {
+            let anchor: ct::MotokoResult<ct::DetectAnchor> = self
+                .env
+                .query(self.env.ledger, "detect_stream_anchor", ())
+                .expect("detect_stream_anchor");
+            let anchor = anchor.into_result().expect("detect chain not enabled at verify time");
+            let (root, c_tip, count, boundaries) = self.detect_recompute();
+            assert_eq!(anchor.root.as_slice(), root, "B12: detect anchor root != independent recompute");
+            assert_eq!(anchor.c_tip.as_slice(), c_tip, "B12: detect anchor c_tip != independent recompute");
+            assert_eq!(
+                u64::try_from(anchor.note_count.0.clone()).unwrap(),
+                count,
+                "B12: detect anchor count != independent recompute"
+            );
+            assert_eq!(count, blocks.len() as u64, "B12: detect stream shorter than the block log");
+            push(&mut battery, "B12-detect-chain",
+                format!("PASS (anchor root/c_tip/count == independent recompute over {count} served entries, {boundaries} boundaries)"));
+            Some(crate::detect::detect_leaf(&root, &c_tip, count).to_vec())
+        } else {
+            None
+        };
         let tuple = cert::ExpectedTuple {
             pir2_boundary: None, // flag-off soak: the certified tree must be pre-pir2-identical
+            detect_stream: detect_stream_leaf,
             tip_index: blocks.len() as u64 - 1,
             tip_hash: replayer_tip_hash,
             note_count: blocks.len() as u64,

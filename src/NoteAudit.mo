@@ -63,6 +63,50 @@ module {
 
   func fieldSized(value : Blob) : Bool { value.size() == 32 };
 
+  /// The note's ciphertext prefix (first `take` bytes of `note_ciphertext`), sliced by
+  /// flat offset arithmetic straight off the encoded frame — no scratch copy, no decode
+  /// (the audit walk folds a detection entry per note and needs ONLY these bytes). Frames
+  /// whose magic/version/layout don't match the fast-path shape fall back to a full
+  /// `NoteCodec.decode` (same fast-path + reference-fallback discipline as `Checker`);
+  /// null means even the reference decoder rejected the frame — callers audit-fail.
+  public func ciphertextPrefix(encoded : Blob, take : Nat) : ?[Nat8] {
+    let size = encoded.size();
+    func u32(at : Nat) : ?Nat {
+      if (at + 4 > size) return null;
+      ?(Nat8.toNat(encoded.get(at)) + Nat8.toNat(encoded.get(at + 1)) * 0x100
+        + Nat8.toNat(encoded.get(at + 2)) * 0x1_0000 + Nat8.toNat(encoded.get(at + 3)) * 0x100_0000)
+    };
+    func fallback() : ?[Nat8] {
+      switch (NoteCodec.decode(encoded)) {
+        case (#ok(block)) {
+          let ct = Blob.toArray(block.note_ciphertext);
+          ?Array.tabulate<Nat8>(if (take < ct.size()) take else ct.size(), func i = ct[i])
+        };
+        case (#err(_)) null;
+      }
+    };
+    if (size < 48) return fallback();
+    let magic : [Nat8] = [0x5a, 0x4b, 0x4e, 0x4f, 0x54, 0x45, 0x30, 0x31]; // ZKNOTE01
+    var m = 0;
+    while (m < 8) { if (encoded.get(m) != magic[m]) return fallback(); m += 1 };
+    switch (u32(8)) { case (?1) {}; case _ return fallback() }; // frame version
+    var p : Nat = 48; // FRAME_HEADER_SIZE
+    switch (u32(p)) { case (?7) {}; case _ return fallback() }; // btype length
+    p += 4 + 7; // + "zknote1"
+    if (p >= size) return fallback();
+    let phashTag = encoded.get(p);
+    p += 1;
+    if (phashTag == 1) { p += 32 } else if (phashTag != 0) return fallback();
+    p += 8 + 8 + 32; // version u64 + position u64 + commitment
+    let ephLen = switch (u32(p)) { case (?v) v; case null return fallback() };
+    p += 4 + ephLen;
+    let ctLen = switch (u32(p)) { case (?v) v; case null return fallback() };
+    p += 4;
+    if (p + ctLen > size) return fallback();
+    let base = p;
+    ?Array.tabulate<Nat8>(if (take < ctLen) take else ctLen, func i = encoded.get(base + i))
+  };
+
   /// VERBATIM old walk per-note body (Main.mo:488–521 of the pre-fix tree). Returns the
   /// block's ICRC-3 hash (the next expected_parent) or the exact old error string.
   public func referenceCheck(
