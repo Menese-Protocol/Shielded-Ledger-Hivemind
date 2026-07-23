@@ -23,6 +23,10 @@ module {
     // present ONLY when the pir2 layer is enabled AND a DPAGE boundary exists, so the tree
     // (and its root digest) is byte-identical to the pre-pir2 one on every other deployment
     pir2_boundary : ?Blob;
+    // certified detection-stream anchor leaf (Some only when DETECT_CHAIN is enabled).
+    // None ⇒ the label is ABSENT from the hash tree ⇒ digest byte-identical to the pre-feature
+    // tuple — the mechanism that makes the flag-off state hash identical to 44692fc.
+    detect_stream : ?Blob;
   };
 
   public type HashTree = {
@@ -38,8 +42,9 @@ module {
   };
 
   func zkTree(tuple : Tuple) : HashTree {
-    // labels stay alphabetical:
-    //   archive_manifest < audit < encoding_version < note_count < note_root < pir2_boundary
+    // labels stay alphabetical: archive_manifest < audit < detect_stream < encoding_version <
+    // note_count < note_root < pir2_boundary. Each optional leaf folds in ONLY when Some, so
+    // the all-None (flag-off) tree is byte-identical to the pre-feature five-leaf tree.
     let tail : HashTree = switch (tuple.pir2_boundary) {
       case (?boundary) #fork(
         labeledLeaf("note_root", tuple.note_root),
@@ -47,12 +52,16 @@ module {
       );
       case null labeledLeaf("note_root", tuple.note_root);
     };
+    let auditNode : HashTree = switch (tuple.detect_stream) {
+      case null labeledLeaf("audit", tuple.audit_digest);
+      case (?ds) #fork(labeledLeaf("audit", tuple.audit_digest), labeledLeaf("detect_stream", ds));
+    };
     #labeled(
       Text.encodeUtf8("zk"),
       #fork(
         labeledLeaf("archive_manifest", tuple.archive_manifest),
         #fork(
-          labeledLeaf("audit", tuple.audit_digest),
+          auditNode,
           #fork(
             labeledLeaf("encoding_version", Blob.fromArray(leb128Nat(tuple.encoding_version))),
             #fork(

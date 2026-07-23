@@ -27,6 +27,7 @@ import Time "mo:core/Time";
 import Timer "mo:core/Timer";
 import Prim "mo:⛔";
 import CertifiedTuple "CertifiedTuple";
+import DetectChain "DetectChain";
 import Groth16Multi "groth16/Groth16Multi";
 import Groth16Wire "groth16/Groth16Wire";
 import ICRC1Block "ICRC1Block";
@@ -407,6 +408,11 @@ persistent actor ZkLedger {
   // pre-fix wasm they cover post-migration mutations only (documented; nothing asserts
   // on digests of migrated instances).
   var note_log_chain_digest : Blob = Blob.fromArray(Array.repeat<Nat8>(0, 32));
+  // Certified detection-stream anchor (additive, default OFF). Flag off ⇒ no maintenance and the
+  // certifiedTuple `detect_stream` label is absent ⇒ state hash byte-identical to 44692fc.
+  // Genesis-only enable keeps the chain covering the FULL history without a backfill path.
+  var detect_chain_enabled : Bool = false;
+  let detect_chain_state : DetectChain.State = DetectChain.newState();
   var roots_fold_digest : Blob = Blob.fromArray(Array.repeat<Nat8>(0, 32));
   var nullifiers_fold_digest : Blob = Blob.fromArray(Array.repeat<Nat8>(0, 32));
   var shields_fold_digest : Blob = Blob.fromArray(Array.repeat<Nat8>(0, 32));
@@ -626,6 +632,7 @@ persistent actor ZkLedger {
       archive_manifest = archiveManifest();
       audit_digest = auditLeafDigest();
       pir2_boundary = pir2BoundaryLeaf();
+      detect_stream = if (detect_chain_enabled) ?DetectChain.streamLeaf(detect_chain_state) else null;
     }
   };
 
@@ -1781,6 +1788,9 @@ persistent actor ZkLedger {
     chain.writeBlob(note_log_chain_digest);
     chain.writeBlob(encoded);
     note_log_chain_digest := chain.sum();
+    // certified detection-stream anchor: fold this note's 48-B detection entry
+    // (pos BE8 ‖ note_ciphertext[0..40]); a DPAGE boundary + Merkle root update happen inside.
+    if (detect_chain_enabled) DetectChain.append(detect_chain_state, position, Blob.toArray(output.note_ciphertext));
     last_block_hash := ?ICRC3.hashValue(NoteAudit.blockValue(block));
     // NO PIR code here — the append is authoritative and complete without the derived
     // index; the background fold driver trails it (derived-index decoupling, reviewer
@@ -2193,6 +2203,35 @@ persistent actor ZkLedger {
       };
     };
     Blob.fromArray(List.toArray(out))
+  };
+
+  // ---- certified detection-stream anchor (additive, flag-gated; see src/DetectChain.mo) ----
+  // Enable is GENESIS-ONLY: the chain must cover the full history for a birthday-less restore to
+  // verify every page, and there is no backfill path — so it arms only on an empty log. Additive:
+  // flag off leaves append, certification, and every existing endpoint byte-identical to 44692fc.
+  public shared func detect_chain_enable() : async Result<()> {
+    if (detect_chain_enabled) return #err("REJECT:detect-chain-already-enabled");
+    if (noteCount() != 0) return #err("REJECT:detect-chain-nonempty-log");
+    detect_chain_enabled := true;
+    refreshCertification();
+    #ok(())
+  };
+
+  /// Trusted anchor a light client binds via the certified `detect_stream` tuple leaf
+  /// (leaf == SHA256(root ‖ c_tip ‖ note_count LE8)); root/c_tip are never taken from a mirror.
+  public query func detect_stream_anchor() : async Result<{ root : Blob; c_tip : Blob; note_count : Nat }> {
+    if (not detect_chain_enabled) return #err("REJECT:detect-chain-not-enabled");
+    #ok({ root = detect_chain_state.root; c_tip = detect_chain_state.chain; note_count = detect_chain_state.count })
+  };
+
+  /// Boundary leaf j + its Merkle path — public, mirror-servable data a client verifies against
+  /// the certified root before scanning segment j.
+  public query func detect_boundary_proof(j : Nat) : async Result<{ leaf : Blob; path : [(Blob, Bool)] }> {
+    if (not detect_chain_enabled) return #err("REJECT:detect-chain-not-enabled");
+    switch (DetectChain.boundaryProofAt(detect_chain_state, j)) {
+      case (?p) #ok(p);
+      case null #err("REJECT:detect-chain-no-boundary");
+    }
   };
 
   func pendingById(intentId : Blob) : ?PendingShield {
