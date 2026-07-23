@@ -15,7 +15,7 @@ use common::{
 use rayon::prelude::*;
 use std::time::Instant;
 
-fn sample_transfer_circuit(cfg: &PoseidonCfg<F>, seed: u64) -> TransferCircuit {
+fn sample_transfer_circuit(cfg: &PoseidonCfg<F>, seed: u64, legacy_statement: bool) -> TransferCircuit {
     let mut r = StdRng::seed_from_u64(seed);
     let alice_nk = F::rand(&mut r);
     let bob_nk = F::rand(&mut r);
@@ -34,6 +34,7 @@ fn sample_transfer_circuit(cfg: &PoseidonCfg<F>, seed: u64) -> TransferCircuit {
     TransferCircuit {
         cfg: cfg.clone(),
         enforce_range: true,
+        legacy_statement,
         anchor: Some(anchor),
         nf: [Some(nf1), Some(nf2)],
         cm_out: [Some(out1.cm(cfg)), Some(out2.cm(cfg))],
@@ -84,7 +85,7 @@ pub fn run(keys: &Keyset, allcore_batch: usize) -> BenchReport {
         let _ = Groth16::<Bls12_381>::prove(&keys.deposit_pk, dc, &mut r).unwrap();
         d_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
 
-        let tc = sample_transfer_circuit(&cfg, 2000 + i);
+        let tc = sample_transfer_circuit(&cfg, 2000 + i, keys.legacy_statement);
         let mut r = StdRng::seed_from_u64(7);
         let t0 = Instant::now();
         let _ = Groth16::<Bls12_381>::prove(&keys.transfer_pk, tc, &mut r).unwrap();
@@ -104,7 +105,7 @@ pub fn run(keys: &Keyset, allcore_batch: usize) -> BenchReport {
     });
     let deposit_allcore_per_s = allcore_batch as f64 / t0.elapsed().as_secs_f64();
 
-    let tcs: Vec<TransferCircuit> = (0..allcore_batch as u64).map(|i| sample_transfer_circuit(&cfg, 4000 + i)).collect();
+    let tcs: Vec<TransferCircuit> = (0..allcore_batch as u64).map(|i| sample_transfer_circuit(&cfg, 4000 + i, keys.legacy_statement)).collect();
     let t0 = Instant::now();
     tcs.into_par_iter().for_each(|tc| {
         let mut r = StdRng::seed_from_u64(7);

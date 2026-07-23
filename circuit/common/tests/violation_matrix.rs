@@ -58,6 +58,7 @@ fn honest(rng: &mut StdRng, cfg: &PoseidonCfg<F>) -> TransferCircuit {
     TransferCircuit {
         cfg: cfg.clone(),
         enforce_range: true,
+        legacy_statement: false,
         anchor: Some(anchor),
         nf: [Some(nf[0]), Some(nf[1])],
         cm_out: [Some(cm_out[0]), Some(cm_out[1])],
@@ -76,10 +77,15 @@ fn honest(rng: &mut StdRng, cfg: &PoseidonCfg<F>) -> TransferCircuit {
     }
 }
 
+/// A synthesis error counts as UNSATISFIED: the hardened statement's `enforce_not_equal`
+/// (input-note distinctness) signals infeasibility for equal nullifiers by failing to
+/// synthesize the inverse witness — no assignment exists, so no proof can be produced.
 fn satisfied(c: &TransferCircuit) -> bool {
     let cs = ConstraintSystem::<F>::new_ref();
-    c.clone().generate_constraints(cs.clone()).unwrap();
-    cs.is_satisfied().unwrap()
+    match c.clone().generate_constraints(cs.clone()) {
+        Err(_) => false,
+        Ok(()) => cs.is_satisfied().unwrap(),
+    }
 }
 
 /// Recompute cm_out[j] consistent with a mutated out_v[j] so the ONLY broken rule is the
@@ -181,11 +187,11 @@ fn every_single_rule_violation_is_unsatisfiable() {
             count += 1;
         }
 
-        // 12. duplicate input note (same note in both slots) — the two nullifiers would be
-        //     equal; here we make in1 identical to in0 (incl. path) but keep the distinct
-        //     public nf[1]; the derived nf won't match nf[1] -> unsatisfied. (The equal-nf
-        //     double-spend is caught by the canister; the circuit rejects the public/witness
-        //     mismatch this construction forces.)
+        // 12. duplicate input note (same note in both slots) — the two DERIVED nullifiers
+        //     are equal, so the hardened statement's in-circuit distinctness constraint
+        //     (nf_1 != nf_2) rejects it outright (synthesis infeasibility); independently,
+        //     the distinct public nf[1] cannot match the duplicated witness's derived nf.
+        //     (The ledger boundary additionally rejects equal public nullifiers per tx.)
         let mut m = h.clone();
         m.in_nk[1] = m.in_nk[0];
         m.in_rho[1] = m.in_rho[0];

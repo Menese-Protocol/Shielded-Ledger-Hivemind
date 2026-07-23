@@ -61,7 +61,7 @@ fn main() {
 
     // 2. Regenerate the keys and install the full stack with the hook ledger.
     let manifest = std::fs::read_to_string(root.join("fixtures/pool-vectors-bls12-381/SETUP-MANIFEST.json")).expect("manifest");
-    let ks = keys::regenerate_and_verify(&manifest).expect("keyset");
+    let ks = keys::regenerate_and_verify(&manifest, true).expect("keyset");
     let out_dir = std::env::temp_dir().join(format!("fortress_seam_wasms_{}", std::process::id()));
     let wasms = pic_env::build_wasms(&root, &out_dir);
     let state_dir = std::env::temp_dir().join(format!("fortress_seam_state_{}", std::process::id()));

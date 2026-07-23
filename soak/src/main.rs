@@ -5,12 +5,29 @@ fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf()
 }
 
-fn load_keys(root: &PathBuf) -> keys::Keyset {
-    let manifest_path = root.join("fixtures/pool-vectors-bls12-381/SETUP-MANIFEST.json");
+/// Statement selection for the whole run: `SOAK_STATEMENT=legacy` (default — the statement of
+/// the deployed verifying key and the frozen `fixtures/pool-vectors-bls12-381`) or
+/// `SOAK_STATEMENT=hardened` (the hardened conservation statement with its own fixture set).
+fn statement_from_env() -> (bool, &'static str) {
+    match std::env::var("SOAK_STATEMENT").as_deref() {
+        Err(_) | Ok("legacy") => (true, "fixtures/pool-vectors-bls12-381"),
+        Ok("hardened") => (false, "fixtures/pool-vectors-bls12-381-hardened"),
+        Ok(other) => {
+            eprintln!("SOAK_STATEMENT must be 'legacy' or 'hardened', got '{other}'");
+            std::process::exit(2);
+        }
+    }
+}
+
+fn load_keys(root: &PathBuf, legacy_statement: bool, fixture_dir: &str) -> keys::Keyset {
+    let manifest_path = root.join(fixture_dir).join("SETUP-MANIFEST.json");
     let manifest_json = std::fs::read_to_string(&manifest_path)
         .unwrap_or_else(|e| panic!("read {}: {e}", manifest_path.display()));
-    println!("[B1a] regenerating keyset from the deterministic setup (seed 20260712)...");
-    match keys::regenerate_and_verify(&manifest_json) {
+    println!(
+        "[B1a] regenerating {} keyset from the deterministic setup (seed 20260712)...",
+        if legacy_statement { "legacy-statement" } else { "hardened-statement" }
+    );
+    match keys::regenerate_and_verify(&manifest_json, legacy_statement) {
         Ok(k) => {
             println!("[B1a] PASS: regenerated pk/vk SHA-256 match SETUP-MANIFEST.json");
             k
@@ -26,7 +43,8 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mode = args.get(1).map(String::as_str).unwrap_or("run");
     let root = repo_root();
-    let keyset = load_keys(&root);
+    let (legacy_statement, fixture_dir) = statement_from_env();
+    let keyset = load_keys(&root, legacy_statement, fixture_dir);
 
     match mode {
         "bench" => {
@@ -43,7 +61,7 @@ fn main() {
         }
         "run" => {
             let started = std::time::Instant::now();
-            let fixtures = root.join("fixtures/pool-vectors-bls12-381");
+            let fixtures = root.join(fixture_dir);
             println!("[B1b] verifying frozen fixture proofs under the regenerated keys...");
             keys::verify_frozen_fixtures(&fixtures, &keyset)
                 .unwrap_or_else(|e| panic!("[B1b] FAIL: {e}"));

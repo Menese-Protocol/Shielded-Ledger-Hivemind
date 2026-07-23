@@ -226,6 +226,7 @@ pub fn build_transfer(rng: &mut StdRng, cfg: &PoseidonCfg<Fr>) -> common::Transf
     common::TransferCircuit {
         cfg: cfg.clone(),
         enforce_range: true,
+        legacy_statement: false,
         anchor: Some(anchor),
         nf: [Some(nf[0]), Some(nf[1])],
         cm_out: [Some(cm_out[0]), Some(cm_out[1])],

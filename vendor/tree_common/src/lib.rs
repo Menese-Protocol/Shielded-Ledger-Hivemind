@@ -275,24 +275,43 @@ fn merkle_root_gadget(
 /// Statement (public inputs, in allocation order):
 ///   anchor, nf_1, nf_2, cm_out_1, cm_out_2, fee, v_pub_out, recipient_binding
 /// Witness: for each input note (v, nk, rho, rcm, merkle path); for each output (v', pk', rcm').
-/// Constraints:
+/// Constraints (hardened statement, `legacy_statement = false`):
+///   fee/v_pub_out ranges: fee ∈ [0,2^64) and v_pub_out ∈ [0,2^64) — the two public
+///                      conservation terms are range-bound IN-CIRCUIT, not at the interface.
 ///   for each input i:  pk_i = H(1,nk_i);  cm_i = H(3,v_i,pk_i,rho_i,rcm_i);
 ///                      MerklePath(cm_i) == anchor;  nf_i == H(2,nk_i,rho_i);  v_i ∈ [0,2^64)
+///   input distinctness: nf_1 != nf_2 — the same note cannot occupy both input slots, so the
+///                      rho-chaining below is self-sufficient (distinct nf ⇒ distinct output
+///                      rho) without relying on any external duplicate-nullifier check.
 ///   for each output j: cm_out_j == H(3,v'_j,pk'_j,rho'_j,rcm'_j) with rho'_j := nf_j
 ///                      (Orchard-style uniqueness chaining);  v'_j ∈ [0,2^64)
 ///   recipient binding: a private mirror is constrained equal to the public recipient field, so
 ///                      a proof cannot be replayed with a different public ICRC recipient.
-///   conservation:      v_1 + v_2 == v'_1 + v'_2 + fee + v_pub_out   (exact over Z because every
-///                      term is range-bound: 2·2^64 ≪ p ≈ 2^254 — S1 is meaningless without S3)
+///   conservation:      v_1 + v_2 == v'_1 + v'_2 + fee + v_pub_out   (exact over Z because ALL
+///                      FOUR value terms — input values, output values, fee, and v_pub_out — are
+///                      range-bound: 4·2^64 ≪ p ≈ 2^254 — S1 is meaningless without S3)
+///
+/// `legacy_statement = true` reproduces the PRE-HARDENING statement byte-for-byte: no
+/// fee/v_pub_out range gadgets and no input-distinctness constraint. In that statement those
+/// three properties hold only end-to-end (the ledger builds fee/v_pub_out from candid `Nat64`
+/// and rejects duplicate nullifiers per transaction); the circuit alone accepts a field-wrapped
+/// fee/v_pub_out or a doubled input note. The two statements have DISTINCT verifying keys and
+/// proofs do not cross-verify; the frozen `vectors-bls` fixtures and any verifying key rotated
+/// in before the hardened statement belong to the legacy statement.
 ///
 /// `enforce_range` exists ONLY so `gen` can demonstrate natively that removing S3 lets the
-/// field-wrap mint attack through. The deployed verifying key is generated with
+/// field-wrap mint attack through. Deployment-eligible verifying keys are generated with
 /// `enforce_range = true`; a proof against the no-range variant has a different vk and cannot
-/// be accepted by the canister.
+/// be accepted by the canister. In the hardened statement the flag gates all four range
+/// gadgets (note values AND fee/v_pub_out); the distinctness constraint is not gated.
 #[derive(Clone)]
 pub struct TransferCircuit {
     pub cfg: PoseidonConfig<F>,
     pub enforce_range: bool,
+    /// Statement selector: `false` (the default built by `blank`) = the hardened conservation
+    /// statement; `true` (`blank_legacy`) = the byte-identical pre-hardening statement. See the
+    /// struct docs above for exactly which constraints the flag controls.
+    pub legacy_statement: bool,
     // public
     pub anchor: Option<F>,
     pub nf: [Option<F>; 2],
@@ -315,10 +334,12 @@ pub struct TransferCircuit {
 }
 
 impl TransferCircuit {
+    /// Blank circuit for the HARDENED statement (the canonical statement going forward).
     pub fn blank(cfg: &PoseidonConfig<F>) -> Self {
         TransferCircuit {
             cfg: cfg.clone(),
             enforce_range: true,
+            legacy_statement: false,
             anchor: None,
             nf: [None; 2],
             cm_out: [None; 2],
@@ -338,6 +359,14 @@ impl TransferCircuit {
             out_pk: [None; 2],
             out_rcm: [None; 2],
         }
+    }
+
+    /// Blank circuit for the LEGACY (pre-hardening) statement — the statement of the frozen
+    /// `vectors-bls` fixtures and of any verifying key generated before the hardening. Kept so
+    /// the legacy setup remains byte-for-byte reproducible until every deployment has rotated
+    /// to the hardened statement's verifying key.
+    pub fn blank_legacy(cfg: &PoseidonConfig<F>) -> Self {
+        TransferCircuit { legacy_statement: true, ..Self::blank(cfg) }
     }
 
     /// The public-input vector in the exact order the circuit allocates them.
@@ -380,6 +409,15 @@ impl ConstraintSynthesizer<F> for TransferCircuit {
             FpVar::new_witness(cs.clone(), || opt(self.recipient_binding))?;
         recipient_binding_witness.enforce_equal(&recipient_binding)?;
 
+        // Hardened statement: range-bind the two PUBLIC conservation terms in-circuit, under the
+        // same flag that gates the note-value ranges. Without these two gadgets a field-wrapped
+        // fee or v_pub_out (a canonical element r−k) satisfies the conservation equality below
+        // while outputs exceed inputs by k — over-issuance the circuit alone would accept.
+        if !self.legacy_statement && self.enforce_range {
+            enforce_u64_range(cs.clone(), &fee, self.fee.map(F::from))?;
+            enforce_u64_range(cs.clone(), &v_pub_out, self.v_pub_out.map(F::from))?;
+        }
+
         let mut in_value_sum = FpVar::<F>::zero();
         let mut nf_vars: Vec<FpVar<F>> = Vec::with_capacity(2);
 
@@ -417,14 +455,26 @@ impl ConstraintSynthesizer<F> for TransferCircuit {
             in_value_sum += v;
         }
 
+        // Hardened statement: the two input notes must be DISTINCT (nf_1 != nf_2). Loading the
+        // same note into both slots would double its value in the sum and give both outputs the
+        // same chained rho (the exact Faerie-Gold collision the chaining prevents). Not gated by
+        // `enforce_range`: distinctness is part of the statement, not a demonstration hook.
+        // (For equal nullifiers `enforce_not_equal` has no satisfying assignment — synthesis of
+        // the difference's inverse fails — so no proof can be produced.)
+        if !self.legacy_statement {
+            nf_vars[0].enforce_not_equal(&nf_vars[1])?;
+        }
+
         let mut out_value_sum = FpVar::<F>::zero();
         for j in 0..2 {
             let v = FpVar::new_witness(cs.clone(), || opt(self.out_v[j]))?;
             let pk = FpVar::new_witness(cs.clone(), || opt(self.out_pk[j]))?;
             let rcm = FpVar::new_witness(cs.clone(), || opt(self.out_rcm[j]))?;
 
-            // rho of output j is the nullifier of input j — unique because nullifiers are
-            // globally unique (the canister rejects repeats). Faerie-Gold defence.
+            // rho of output j is the nullifier of input j — Faerie-Gold defence. Within one
+            // transfer the two chained rhos are distinct by the in-circuit nf_1 != nf_2
+            // constraint (hardened statement); across transfers nullifiers are globally unique
+            // (the ledger rejects repeats).
             let rho_out = nf_vars[j].clone();
 
             let tag_cm = FpVar::constant(F::from(TAG_CM));

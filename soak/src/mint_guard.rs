@@ -49,6 +49,10 @@ pub fn native_counterfeit_check() -> MintGuardReport {
     let base = |out_v: [F; 2], v_pub_out: u64, cm_out: [F; 2]| TransferCircuit {
         cfg: cfg.clone(),
         enforce_range: true,
+        // The soak proves against the configured ledger's keys; this guard asserts the
+        // counterfeit class against that SAME statement. The hardened statement additionally
+        // range-binds fee/v_pub_out in-circuit (proven by the semantic-audit battery).
+        legacy_statement: true,
         anchor: Some(anchor),
         nf: [Some(nf1), Some(nf2)],
         cm_out: [Some(cm_out[0]), Some(cm_out[1])],

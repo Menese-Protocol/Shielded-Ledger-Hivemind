@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[derive(Clone)]
 pub struct BuiltWasms {
     pub ledger: Vec<u8>,
     pub ledger_sha256: String,

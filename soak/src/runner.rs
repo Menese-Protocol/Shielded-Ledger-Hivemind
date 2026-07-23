@@ -887,7 +887,7 @@ impl Runner {
                         };
                         let out1_owner = if unshield.is_some() { &accounts[caller] } else { &accounts[recipient] };
                         let prepared = prover::prepare_transfer(
-                            cfg, &keys.transfer_pk, &crypto, (&i1, &i2),
+                            cfg, &keys.transfer_pk, keys.legacy_statement, &crypto, (&i1, &i2),
                             (out1_owner, &accounts[caller]), out_v,
                             fee, v_pub, binding, recipient_account, recipient_idx,
                             seed, index,
@@ -903,7 +903,7 @@ impl Runner {
                         let i2 = plan_input(fresh);
                         let total = i1.v + i2.v;
                         let prepared = prover::prepare_transfer(
-                            cfg, &keys.transfer_pk, &crypto, (&i1, &i2),
+                            cfg, &keys.transfer_pk, keys.legacy_statement, &crypto, (&i1, &i2),
                             (&accounts[caller], &accounts[caller]), (total, 0),
                             0, 0, [0u8; 32], None, None, seed, index,
                         );
@@ -929,7 +929,7 @@ impl Runner {
                         let i2 = plan_input(in2);
                         let total = i1.v + i2.v;
                         let mut prepared = prover::prepare_transfer(
-                            cfg, &keys.transfer_pk, &crypto, (&i1, &i2),
+                            cfg, &keys.transfer_pk, keys.legacy_statement, &crypto, (&i1, &i2),
                             (&accounts[caller], &accounts[caller]), (total, 0),
                             0, 0, [0u8; 32], None, None, seed, index,
                         );
@@ -957,7 +957,7 @@ impl Runner {
                         let i1 = TransferPlanInput { note_index: usize::MAX, leaf_index: l1, v: fn1.v, nk: fn1.nk, rho: fn1.rho, rcm: fn1.rcm };
                         let i2 = TransferPlanInput { note_index: usize::MAX, leaf_index: l2, v: fn2.v, nk: fn2.nk, rho: fn2.rho, rcm: fn2.rcm };
                         let prepared = prover::prepare_transfer(
-                            cfg, &keys.transfer_pk, &crypto, (&i1, &i2),
+                            cfg, &keys.transfer_pk, keys.legacy_statement, &crypto, (&i1, &i2),
                             (&accounts[caller], &accounts[caller]), (1_400_000, 100_000),
                             0, 0, [0u8; 32], None, None, seed, index,
                         );
@@ -970,7 +970,7 @@ impl Runner {
                         let change = total - env_token_fee - v_pub;
                         // proof bound to `bound_to`'s account; submitted with recipient = caller
                         let prepared = prover::prepare_transfer(
-                            cfg, &keys.transfer_pk, &crypto, (&i1, &i2),
+                            cfg, &keys.transfer_pk, keys.legacy_statement, &crypto, (&i1, &i2),
                             (&accounts[caller], &accounts[caller]), (change, 0),
                             env_token_fee, v_pub,
                             binding_for(accounts[bound_to].principal),

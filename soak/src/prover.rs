@@ -213,6 +213,7 @@ pub struct PreparedTransfer {
 pub fn prepare_transfer(
     cfg: &PoseidonCfg<F>,
     transfer_pk: &ark_groth16::ProvingKey<Bls12_381>,
+    legacy_statement: bool,
     crypto: &TransferCrypto,
     inputs: (&TransferPlanInput, &TransferPlanInput),
     out_owners: (&AccountKeys, &AccountKeys),
@@ -242,6 +243,8 @@ pub fn prepare_transfer(
     let circuit = TransferCircuit {
         cfg: cfg.clone(),
         enforce_range: true,
+        // must match the statement of `transfer_pk` or proving fails
+        legacy_statement,
         anchor: Some(anchor_f),
         nf: [Some(nf1), Some(nf2)],
         cm_out: [Some(cm_out1), Some(cm_out2)],
