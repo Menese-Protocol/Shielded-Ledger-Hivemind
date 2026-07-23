@@ -70,10 +70,39 @@ account, verifies the exact payout block on the token ledger, and only then fina
 one byte of any public input, or any of the 192 proof bytes, and verification fails; the
 security gate mutates every one of them to prove it.
 
+The transfer statement is hardened to be independently sound: all four conservation terms —
+both note values, the fee, and the public output — are range-bound inside the circuit, and the
+two input nullifiers are constrained distinct, so a field-wrapped fee/withdrawal amount or the
+same note loaded into both input slots is rejected by the R1CS itself, not merely by the
+canister's input validation. The pre-hardening statement remains reproducible byte-for-byte in
+the circuit crate (`legacy_statement`) because a deployed verifying key of that lineage keeps
+verifying it until rotated; the two statements have distinct verifying keys and their proofs
+do not cross-verify (proven both ways by the statement-binding battery). The wallet prover
+detects which statement a supplied proving key belongs to and assembles the matching witness,
+so it works unchanged on either side of a key rotation.
+
 *The proving key never touches a server.*
 
-Proofs are produced in the user's browser. The transfer circuit is 20,146 constraints and
-proves in about 5 seconds in browser WebAssembly; a deposit proves in about 0.3 seconds.
+Proofs are produced in the user's browser. The hardened transfer circuit is 20,277 constraints
+(20,146 in the legacy statement) and proves in about 5 seconds in browser WebAssembly; a
+deposit proves in about 0.3 seconds.
+
+## Per-transfer fees without a public trail
+
+A visible per-transfer fee payment would put one public token-ledger block next to every
+shielded transfer — a timing side channel that partially rebuilds the transfer graph the pool
+exists to hide. The ledger instead supports a prepaid fee balance, disabled by default behind
+a single admin switch: deposit transparent tokens once into a dedicated fee subaccount over
+the same verified ICRC-2 rail the shield leg uses (idempotency intent, memo-tagged block,
+crash recovery independent of the ledger's dedup window), and every accepted shielded transfer
+then debits the configured rate from the caller's balance as pure canister state — no token
+call, no public block, no per-transfer trail. Rejections for insufficient balance happen
+before the verifier runs and change nothing. The remainder is withdrawable at any time —
+including while the mechanism is disabled, so no funds can ever be stranded — and fee custody
+is never commingled with pool custody, keeping the pool's three-way solvency identity intact.
+The mechanism's edge battery (zero-rate, exact-boundary, interleaved-race, upgrade,
+crash-recovery, flag-off equivalence) is teeth-first: every check is first demonstrated RED
+against a planted-defect build.
 
 ## Where the keys live
 
@@ -197,7 +226,10 @@ mops install
 
 One command, offline, no canister installs. It re-verifies: SHA-256 integrity of every frozen
 fixture; byte-identity of the vendored circuit source; deterministic regeneration of every
-public test vector; randomized circuit-property batteries and the Groth16 mutation battery
+public test vector for BOTH transfer statements (legacy and hardened, each byte-compared
+against its frozen fixture set); the circuit semantic-completeness audit (twelve properties,
+adversarial-witness UNSAT + mutation-kill per row) and the statement shape pins and
+legacy/hardened verifying-key binding proofs; randomized circuit-property batteries and the Groth16 mutation battery
 (all eight public inputs and every one of the 192 compressed proof bytes); the blst
 second-oracle verdict agreement; the independent Motoko curve, pairing, and wire oracles;
 ICRC-3 official hash vectors and exact-block matching;

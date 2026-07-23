@@ -14,6 +14,7 @@ import Char "mo:core/Char";
 import Error "mo:core/Error";
 import Int "mo:core/Int";
 import List "mo:core/List";
+import Map "mo:core/Map";
 import Nat "mo:core/Nat";
 import Nat32 "mo:core/Nat32";
 import Nat64 "mo:core/Nat64";
@@ -205,6 +206,43 @@ persistent actor ZkLedger {
     attempts : Nat;
     ledger_tip_before : Nat;
   };
+  public type PrepaidDepositArgs = {
+    value : Nat64;
+    from_subaccount : ?Blob;
+    created_at_time : Nat64;
+    client_nonce : Blob;
+  };
+  /// One in-flight prepaid-fee token movement (deposit into, or payout from, the fee
+  /// subaccount). Stable, resumable through `resume_prepaid` with memo reconciliation from
+  /// `ledger_tip_before` — the same dedup-window-independent recovery the shield leg uses.
+  public type PendingPrepaid = {
+    intent_id : Blob;
+    caller : Principal;
+    op : {
+      // credit `value` to the caller's prepaid balance once the pull is observed
+      #deposit : { value : Nat64; transfer_args : ICRC2.TransferFromArgs };
+      // `reserved` was already debited from the source when the intent was created;
+      // a deterministic token failure refunds it, finalization keeps it debited
+      #withdraw : {
+        reserved : Nat;
+        source : { #balance; #revenue };
+        transfer_args : ICRC2.TransferArg;
+      };
+    };
+    ledger_tip_before : Nat;
+    attempts : Nat;
+  };
+  public type PrepaidFeeStatus = {
+    enabled : Bool;
+    rate : Nat;
+    total_prepaid : Nat;
+    revenue : Nat;
+    fee_account : ICRC2.Account;
+    holders : Nat;
+    pending : ?PendingPrepaid;
+    completed_intents : Nat;
+  };
+
   public type AtomicityStatus = {
     token_configured : Bool;
     token_ledger : ?Principal;
@@ -337,6 +375,36 @@ persistent actor ZkLedger {
   var epoch : Nat = 0;
   var pending_shield : ?PendingShield = null;
   var pending_unshield : ?PendingUnshield = null;
+  // ==== prepaid fee balance (single switch, default OFF) ====
+  // OFF: byte-identical legacy — no prepaid state is read on any path, deposits reject, and
+  // the transfer path carries zero fee logic. ON with rate 0: mechanism armed but free.
+  // ON with rate > 0: every accepted confidential_transfer debits `rate` from the caller's
+  // prepaid balance ATOMICALLY with acceptance — an internal state write with no token call
+  // and no public block, so shielded transfers leave no per-transfer fee trail on the token
+  // ledger (the deanonymization vector a visible per-transfer payment would create).
+  // Custody for these balances lives in the DEDICATED fee subaccount below, never in the
+  // pool account, so the pool solvency identity (custody == pool_value == Σ unspent notes)
+  // is untouched. Fee-side identity: fee-account custody == total_prepaid + revenue
+  // + (in-flight withdrawal reservation, while one is pending).
+  var prepaid_fee_enabled : Bool = false;
+  var prepaid_fee_rate : Nat = 0;
+  // Σ of all balances in prepaid_fee_balances — maintained by credit/debit/refund so status
+  // and solvency checks never walk the map.
+  var prepaid_fee_total : Nat = 0;
+  // debited fees, payable out by the administrator through prepaid_fee_collect
+  var prepaid_fee_revenue : Nat = 0;
+  let prepaid_fee_balances = Map.empty<Principal, Nat>();
+  // completed prepaid intents (deposit AND withdraw/collect) for idempotent replay answers
+  let completed_prepaid_intents = Map.empty<Blob, ()>();
+  var pending_prepaid : ?PendingPrepaid = null;
+  // Prepaid debit reserved by the CURRENT pending unshield (0 when none): the unshield fee is
+  // debited when the pending intent is created — at finalize time the payout has already
+  // happened and a failed debit could no longer reject the operation — and refunded iff the
+  // token leg fails with a deterministic no-effect error (the only path that cancels the
+  // intent). A separate stable var (not a PendingUnshield field) keeps the stable record
+  // type backward-compatible.
+  var pending_unshield_prepaid_debit : Nat = 0;
+
   // An upgraded v1 deployment remains locked until the administrator rotates the transfer VK.
   // A fresh configure() installs the recipient-bound v2 statement immediately.
   var transfer_statement_version : Nat = 1;
@@ -2586,6 +2654,11 @@ persistent actor ZkLedger {
     appendBlock(pending.output_1, nullifiers, pending.anchor_before, pending.root_after, #confidential_transfer);
     appendBlock(pending.output_2, nullifiers, pending.anchor_before, pending.root_after, #confidential_transfer);
     pool_value -= pending.pool_debit;
+    // The prepaid fee reserved at acceptance is earned now, atomically with the payout commit.
+    if (pending_unshield_prepaid_debit > 0) {
+      prepaid_fee_revenue += pending_unshield_prepaid_debit;
+      pending_unshield_prepaid_debit := 0;
+    };
     epoch += 1;
     switch (StableBlobSet.put(completed_unshield_intents, intentId)) {
       case (#ok(true)) {
@@ -2658,6 +2731,11 @@ persistent actor ZkLedger {
       case (#Err(#Duplicate({ duplicate_of }))) duplicate_of;
       case (#Err(error)) {
         if (directDeterministicNoEffectError(error) and pendingUnshieldById(intentId) != null) {
+          // The only path that cancels an unshield intent: refund its prepaid-fee reservation.
+          if (pending_unshield_prepaid_debit > 0) {
+            creditPrepaid(pending.caller, pending_unshield_prepaid_debit);
+            pending_unshield_prepaid_debit := 0;
+          };
           pending_unshield := null;
           return mutation("REJECT:unshield-token:" # directTokenErrorName(error), pending.verifier_outcome);
         };
@@ -2699,6 +2777,435 @@ persistent actor ZkLedger {
     };
     pending_unshield := ?{ pending with attempts = pending.attempts + 1 };
     await drivePendingUnshield(pending.intent_id, false, true)
+  };
+
+  // ==================== prepaid fee balance ====================
+  // Deposit transparent tokens once (public ICRC-2 pull into the dedicated fee subaccount),
+  // debit internally per accepted shielded transfer (no token call, no public block — no
+  // per-transfer fee trail), withdraw the remainder any time. See the type-level and
+  // state-level comments for the custody identities and the flag-off guarantee.
+
+  // Domain-separated fee custody subaccount: pool custody is NEVER commingled with fee custody.
+  let prepaid_fee_subaccount : Blob = Sha256.fromBlob(#sha256, Text.encodeUtf8("zk-ledger/prepaid-fee-account/v1"));
+
+  func prepaidFeeAccount() : ICRC2.Account {
+    { owner = selfPrincipal(); subaccount = ?prepaid_fee_subaccount }
+  };
+
+  func prepaidFeeBalance(holder : Principal) : Nat {
+    switch (Map.get(prepaid_fee_balances, Principal.compare, holder)) {
+      case (?value) value;
+      case null 0;
+    }
+  };
+
+  func setPrepaidFeeBalance(holder : Principal, value : Nat) {
+    if (value == 0) {
+      ignore Map.delete(prepaid_fee_balances, Principal.compare, holder);
+    } else {
+      Map.add(prepaid_fee_balances, Principal.compare, holder, value);
+    }
+  };
+
+  func creditPrepaid(holder : Principal, amount : Nat) {
+    setPrepaidFeeBalance(holder, prepaidFeeBalance(holder) + amount);
+    prepaid_fee_total += amount;
+  };
+
+  /// Debit `amount` from `holder`'s prepaid balance; false (and NO state change) if the
+  /// balance is insufficient.
+  func debitPrepaid(holder : Principal, amount : Nat) : Bool {
+    let balance = prepaidFeeBalance(holder);
+    if (balance < amount) return false;
+    setPrepaidFeeBalance(holder, balance - amount);
+    prepaid_fee_total -= amount;
+    true
+  };
+
+  /// The rate a transfer accepted NOW must pay. 0 while the mechanism is disabled — the
+  /// single expression that makes flag-off carry zero prepaid logic on the money path.
+  func activePrepaidRate() : Nat { if (prepaid_fee_enabled) prepaid_fee_rate else 0 };
+
+  func prepaidCompleted(intentId : Blob) : Bool {
+    Map.get(completed_prepaid_intents, Blob.compare, intentId) != null
+  };
+
+  func pendingPrepaidById(intentId : Blob) : ?PendingPrepaid {
+    switch (pending_prepaid) {
+      case (?pending) { if (Blob.equal(pending.intent_id, intentId)) ?pending else null };
+      case null null;
+    }
+  };
+
+  func prepaidDepositIntentId(caller : Principal, args : PrepaidDepositArgs) : Blob {
+    let entries = List.empty<(Text, ICRC3.Value)>();
+    List.add(entries, ("domain", #Text("zk-ledger/prepaid-fee-deposit/v1")));
+    List.add(entries, ("caller", #Blob(Principal.toBlob(caller))));
+    switch (args.from_subaccount) {
+      case (?value) List.add(entries, ("from_subaccount", #Blob(value)));
+      case null {};
+    };
+    List.add(entries, ("created_at_time", #Nat(Nat64.toNat(args.created_at_time))));
+    List.add(entries, ("client_nonce", #Blob(args.client_nonce)));
+    List.add(entries, ("value", #Nat(Nat64.toNat(args.value))));
+    switch (token_ledger_id) {
+      case (?id) List.add(entries, ("token_ledger", #Blob(Principal.toBlob(id))));
+      case null {};
+    };
+    List.add(entries, ("fee_owner", #Blob(Principal.toBlob(selfPrincipal()))));
+    List.add(entries, ("fee_subaccount", #Blob(prepaid_fee_subaccount)));
+    ICRC3.hashValue(#Map(List.toArray(entries)))
+  };
+
+  func prepaidWithdrawIntentId(
+    caller : Principal,
+    source : { #balance; #revenue },
+    to : ICRC2.Account,
+    amount : Nat64,
+    createdAt : Nat64,
+  ) : Blob {
+    let entries = List.empty<(Text, ICRC3.Value)>();
+    List.add(entries, ("domain", #Text("zk-ledger/prepaid-fee-withdraw/v1")));
+    List.add(entries, ("caller", #Blob(Principal.toBlob(caller))));
+    List.add(entries, ("source", #Text(switch (source) { case (#balance) "balance"; case (#revenue) "revenue" })));
+    List.add(entries, ("to_owner", #Blob(Principal.toBlob(to.owner))));
+    switch (to.subaccount) {
+      case (?value) List.add(entries, ("to_subaccount", #Blob(value)));
+      case null {};
+    };
+    List.add(entries, ("amount", #Nat(Nat64.toNat(amount))));
+    List.add(entries, ("created_at_time", #Nat(Nat64.toNat(createdAt))));
+    switch (token_ledger_id) {
+      case (?id) List.add(entries, ("token_ledger", #Blob(Principal.toBlob(id))));
+      case null {};
+    };
+    ICRC3.hashValue(#Map(List.toArray(entries)))
+  };
+
+  func prepaidFeeStatusValue() : PrepaidFeeStatus {
+    {
+      enabled = prepaid_fee_enabled;
+      rate = prepaid_fee_rate;
+      total_prepaid = prepaid_fee_total;
+      revenue = prepaid_fee_revenue;
+      fee_account = prepaidFeeAccount();
+      holders = Map.size(prepaid_fee_balances);
+      pending = pending_prepaid;
+      completed_intents = Map.size(completed_prepaid_intents);
+    }
+  };
+
+  public query func prepaid_fee_status() : async PrepaidFeeStatus { prepaidFeeStatusValue() };
+
+  /// The caller's own prepaid balance. Deliberately caller-scoped: a public per-account
+  /// balance query would broadcast debit timing (one decrement per accepted transfer).
+  public query ({ caller }) func prepaid_fee_balance() : async Nat { prepaidFeeBalance(caller) };
+
+  /// THE single mechanism flag (default OFF). Withdrawals stay available when disabled, so
+  /// turning the mechanism off can never strand deposited balances.
+  public shared ({ caller }) func set_prepaid_fee(enabled : Bool) : async Result<PrepaidFeeStatus> {
+    switch (guardRejection()) { case (?message) return #err(message); case null {} };
+    if (not isAdministrator(caller)) return #err("REJECT:not-administrator");
+    prepaid_fee_enabled := enabled;
+    #ok(prepaidFeeStatusValue())
+  };
+
+  public shared ({ caller }) func set_prepaid_fee_rate(rate : Nat64) : async Result<PrepaidFeeStatus> {
+    switch (guardRejection()) { case (?message) return #err(message); case null {} };
+    if (not isAdministrator(caller)) return #err("REJECT:not-administrator");
+    prepaid_fee_rate := Nat64.toNat(rate);
+    #ok(prepaidFeeStatusValue())
+  };
+
+  func reconcilePrepaidBlock(pending : PendingPrepaid) : async ReconcileResult {
+    let PAGE : Nat = 64;
+    var index = pending.ledger_tip_before;
+    loop {
+      let page = try {
+        await historyActor().icrc3_get_blocks([{ start = index; length = PAGE }])
+      } catch (error) {
+        return #error(Error.message(error));
+      };
+      if (page.blocks.size() == 0) return #absent;
+      for (b in page.blocks.vals()) {
+        let found = switch (pending.op) {
+          case (#deposit(op)) ICRC2Block.matchesTransferFrom(b.block, op.transfer_args, selfPrincipal());
+          case (#withdraw(op)) ICRC1Block.matchesTransfer(b.block, op.transfer_args, selfPrincipal());
+        };
+        if (found) return #found(b.id);
+      };
+      index += page.blocks.size();
+      if (index >= page.log_length) return #absent;
+    }
+  };
+
+  /// The endpoint answer for a prepaid op: the caller's balance after a deposit or a
+  /// balance-sourced withdrawal; the remaining revenue after an admin collect.
+  func prepaidAnswer(pending : PendingPrepaid) : Nat {
+    switch (pending.op) {
+      case (#deposit(_)) prepaidFeeBalance(pending.caller);
+      case (#withdraw(op)) {
+        switch (op.source) {
+          case (#balance) prepaidFeeBalance(pending.caller);
+          case (#revenue) prepaid_fee_revenue;
+        }
+      };
+    }
+  };
+
+  /// Return a withdrawal's up-front reservation to its source. Deposit intents reserve
+  /// nothing (the credit only happens at finalize).
+  func refundPrepaidReservation(pending : PendingPrepaid) {
+    switch (pending.op) {
+      case (#deposit(_)) {};
+      case (#withdraw(op)) {
+        switch (op.source) {
+          case (#balance) creditPrepaid(pending.caller, op.reserved);
+          case (#revenue) prepaid_fee_revenue += op.reserved;
+        }
+      };
+    }
+  };
+
+  /// Finalize a prepaid op whose token block has been observed. No awaits: the credit /
+  /// completion marker / pending clear commit together or the callback rolls back to the
+  /// recoverable pending intent.
+  func finalizePrepaid(pending : PendingPrepaid) : Result<Nat> {
+    switch (pending.op) {
+      case (#deposit(op)) creditPrepaid(pending.caller, Nat64.toNat(op.value));
+      case (#withdraw(_)) {}; // the reservation was debited when the intent was created
+    };
+    Map.add(completed_prepaid_intents, Blob.compare, pending.intent_id, ());
+    pending_prepaid := null;
+    #ok(prepaidAnswer(pending))
+  };
+
+  func drivePendingPrepaid(intentId : Blob, trapAfterToken : Bool, reconcileFirst : Bool) : async Result<Nat> {
+    let pending = switch (pendingPrepaidById(intentId)) {
+      case (?value) value;
+      case null return #err("REJECT:pending-prepaid-changed");
+    };
+    if (reconcileFirst) {
+      switch (await reconcilePrepaidBlock(pending)) {
+        case (#found(_)) {
+          switch (pendingPrepaidById(intentId)) {
+            case (?current) return finalizePrepaid(current);
+            case null {
+              if (prepaidCompleted(intentId)) return #ok(prepaidAnswer(pending));
+              return #err("REJECT:pending-prepaid-changed");
+            };
+          };
+        };
+        case (#error(message)) return #err("PENDING:prepaid-reconcile-scan:" # message);
+        case (#absent) {}; // token movement never landed — safe to (re)send below
+      };
+    };
+    let current = switch (pendingPrepaidById(intentId)) {
+      case (?value) value;
+      case null {
+        if (prepaidCompleted(intentId)) return #ok(prepaidAnswer(pending));
+        return #err("REJECT:pending-prepaid-changed");
+      };
+    };
+
+    let blockIndex = switch (current.op) {
+      case (#deposit(op)) {
+        let response = try {
+          await tokenActor().icrc2_transfer_from(op.transfer_args)
+        } catch (error) {
+          return #err("PENDING:prepaid-token-call:" # Error.message(error));
+        };
+        switch (response) {
+          case (#Ok(index)) index;
+          case (#Err(#Duplicate({ duplicate_of }))) duplicate_of;
+          case (#Err(error)) {
+            if (deterministicNoEffectError(error) and pendingPrepaidById(intentId) != null) {
+              pending_prepaid := null;
+              return #err("REJECT:prepaid-token:" # tokenErrorName(error));
+            };
+            return #err("PENDING:prepaid-token:" # tokenErrorName(error));
+          };
+        }
+      };
+      case (#withdraw(op)) {
+        let response = try {
+          await tokenActor().icrc1_transfer(op.transfer_args)
+        } catch (error) {
+          return #err("PENDING:prepaid-token-call:" # Error.message(error));
+        };
+        switch (response) {
+          case (#Ok(index)) index;
+          case (#Err(#Duplicate({ duplicate_of }))) duplicate_of;
+          case (#Err(error)) {
+            if (directDeterministicNoEffectError(error) and pendingPrepaidById(intentId) != null) {
+              refundPrepaidReservation(current);
+              pending_prepaid := null;
+              return #err("REJECT:prepaid-token:" # directTokenErrorName(error));
+            };
+            return #err("PENDING:prepaid-token:" # directTokenErrorName(error));
+          };
+        }
+      };
+    };
+
+    if (trapAfterToken) Runtime.trap("TEST_ONLY:fail-after-token-before-prepaid-finalize");
+    let observed = try {
+      await historyActor().icrc3_get_blocks([{ start = blockIndex; length = 1 }])
+    } catch (error) {
+      return #err("PENDING:prepaid-token-block-call:" # Error.message(error));
+    };
+    let final = switch (pendingPrepaidById(intentId)) {
+      case (?value) value;
+      case null {
+        if (prepaidCompleted(intentId)) return #ok(prepaidAnswer(pending));
+        return #err("REJECT:pending-prepaid-changed");
+      };
+    };
+    let matches = observed.blocks.size() == 1 and observed.blocks[0].id == blockIndex and (
+      switch (final.op) {
+        case (#deposit(op)) ICRC2Block.matchesTransferFrom(observed.blocks[0].block, op.transfer_args, selfPrincipal());
+        case (#withdraw(op)) ICRC1Block.matchesTransfer(observed.blocks[0].block, op.transfer_args, selfPrincipal());
+      }
+    );
+    if (not matches) return #err("PENDING:prepaid-token-block-mismatch");
+    finalizePrepaid(final)
+  };
+
+  /// Move transparent tokens into the caller's prepaid fee balance over the verified ICRC-2
+  /// rail: allowance pull with memo = intent id, exact-block observation, completed-intent
+  /// replay answers, and a stable pending intent recoverable past the dedup window.
+  public shared ({ caller }) func prepaid_fee_deposit(args : PrepaidDepositArgs) : async Result<Nat> {
+    switch (guardRejection()) { case (?message) return #err(message); case null {} };
+    if (not prepaid_fee_enabled) return #err("REJECT:prepaid-fee-disabled");
+    if (not tokenConfigured()) return #err("REJECT:token-unconfigured");
+    if (pending_prepaid != null) return #err("REJECT:pending-prepaid-mutation");
+    if (args.value == 0) return #err("REJECT:prepaid-zero-value");
+    if (args.client_nonce.size() != 32) return #err("REJECT:client-nonce-length");
+    switch (args.from_subaccount) {
+      case (?value) { if (value.size() != 32) return #err("REJECT:from-subaccount-length") };
+      case null {};
+    };
+    let intentId = prepaidDepositIntentId(caller, args);
+    if (prepaidCompleted(intentId)) return #ok(prepaidFeeBalance(caller));
+    let transferArgs : ICRC2.TransferFromArgs = {
+      spender_subaccount = null;
+      from = { owner = caller; subaccount = args.from_subaccount };
+      to = prepaidFeeAccount();
+      amount = Nat64.toNat(args.value);
+      fee = ?transparent_ledger_fee;
+      memo = ?intentId;
+      created_at_time = ?args.created_at_time;
+    };
+    // Reconcile low-water BEFORE the transfer, exactly as the shield leg records it.
+    let ledgerTip = try {
+      (await historyActor().icrc3_get_blocks([{ start = 0; length = 0 }])).log_length
+    } catch (error) {
+      return #err("REJECT:prepaid-ledger-tip-call:" # Error.message(error));
+    };
+    if (pending_prepaid != null) return #err("REJECT:pending-prepaid-mutation");
+    if (not prepaid_fee_enabled) return #err("REJECT:prepaid-fee-disabled");
+    if (prepaidCompleted(intentId)) return #ok(prepaidFeeBalance(caller));
+    pending_prepaid := ?{
+      intent_id = intentId;
+      caller;
+      op = #deposit({ value = args.value; transfer_args = transferArgs });
+      ledger_tip_before = ledgerTip;
+      attempts = 1;
+    };
+    let trapAfterToken = test_fail_after_token_once;
+    test_fail_after_token_once := false;
+    await drivePendingPrepaid(intentId, trapAfterToken, false)
+  };
+
+  /// Withdraw part of the caller's prepaid balance back to their default token account.
+  /// `amount + transparent_ledger_fee` is reserved (debited) up front; a deterministic token
+  /// failure refunds it. Available regardless of the enable flag — disabling the mechanism
+  /// must never strand deposited balances.
+  public shared ({ caller }) func prepaid_fee_withdraw(amount : Nat64, createdAt : Nat64) : async Result<Nat> {
+    switch (guardRejection()) { case (?message) return #err(message); case null {} };
+    if (not tokenConfigured()) return #err("REJECT:token-unconfigured");
+    if (pending_prepaid != null) return #err("REJECT:pending-prepaid-mutation");
+    if (amount == 0) return #err("REJECT:prepaid-zero-value");
+    await prepaidPayout(caller, #balance, { owner = caller; subaccount = null }, amount, createdAt)
+  };
+
+  /// Pay collected fee revenue out to an operator-chosen account. Administrator only; the
+  /// same payout rail as user withdrawals, so revenue is never trapped either.
+  public shared ({ caller }) func prepaid_fee_collect(amount : Nat64, to : ICRC2.Account, createdAt : Nat64) : async Result<Nat> {
+    switch (guardRejection()) { case (?message) return #err(message); case null {} };
+    if (not isAdministrator(caller)) return #err("REJECT:not-administrator");
+    if (not tokenConfigured()) return #err("REJECT:token-unconfigured");
+    if (pending_prepaid != null) return #err("REJECT:pending-prepaid-mutation");
+    if (amount == 0) return #err("REJECT:prepaid-zero-value");
+    switch (to.subaccount) {
+      case (?value) { if (value.size() != 32) return #err("REJECT:recipient-subaccount-length") };
+      case null {};
+    };
+    await prepaidPayout(caller, #revenue, to, amount, createdAt)
+  };
+
+  func prepaidPayout(
+    caller : Principal,
+    source : { #balance; #revenue },
+    to : ICRC2.Account,
+    amount : Nat64,
+    createdAt : Nat64,
+  ) : async Result<Nat> {
+    let reserved = Nat64.toNat(amount) + transparent_ledger_fee;
+    let intentId = prepaidWithdrawIntentId(caller, source, to, amount, createdAt);
+    let answer = func() : Nat {
+      switch (source) { case (#balance) prepaidFeeBalance(caller); case (#revenue) prepaid_fee_revenue }
+    };
+    if (prepaidCompleted(intentId)) return #ok(answer());
+    let transferArgs : ICRC2.TransferArg = {
+      from_subaccount = ?prepaid_fee_subaccount;
+      to;
+      amount = Nat64.toNat(amount);
+      fee = ?transparent_ledger_fee;
+      memo = ?intentId;
+      created_at_time = ?createdAt;
+    };
+    let ledgerTip = try {
+      (await historyActor().icrc3_get_blocks([{ start = 0; length = 0 }])).log_length
+    } catch (error) {
+      return #err("REJECT:prepaid-ledger-tip-call:" # Error.message(error));
+    };
+    if (pending_prepaid != null) return #err("REJECT:pending-prepaid-mutation");
+    if (prepaidCompleted(intentId)) return #ok(answer());
+    // Reservation: debit BEFORE the token call — no await between here and the pending
+    // record, so a concurrent debit can never leave an in-flight payout unfunded.
+    switch (source) {
+      case (#balance) {
+        if (not debitPrepaid(caller, reserved)) return #err("REJECT:prepaid-fee-insufficient");
+      };
+      case (#revenue) {
+        if (prepaid_fee_revenue < reserved) return #err("REJECT:prepaid-fee-insufficient");
+        prepaid_fee_revenue -= reserved;
+      };
+    };
+    pending_prepaid := ?{
+      intent_id = intentId;
+      caller;
+      op = #withdraw({ reserved; source; transfer_args = transferArgs });
+      ledger_tip_before = ledgerTip;
+      attempts = 1;
+    };
+    let trapAfterToken = test_fail_after_token_once;
+    test_fail_after_token_once := false;
+    await drivePendingPrepaid(intentId, trapAfterToken, false)
+  };
+
+  public shared ({ caller }) func resume_prepaid() : async Result<Nat> {
+    switch (guardRejection()) { case (?message) return #err(message); case null {} };
+    let pending = switch (pending_prepaid) {
+      case (?value) value;
+      case null return #err("REJECT:no-pending-prepaid");
+    };
+    if (not Principal.equal(caller, pending.caller) and not isAdministrator(caller)) {
+      return #err("REJECT:not-pending-owner");
+    };
+    pending_prepaid := ?{ pending with attempts = pending.attempts + 1 };
+    await drivePendingPrepaid(pending.intent_id, false, true)
   };
 
   public shared ({ caller }) func confidential_transfer(args : TransferArgs) : async MutationResult {
@@ -2767,6 +3274,14 @@ persistent actor ZkLedger {
     let poolDebit = if (isUnshield) Nat64.toNat(args.v_pub_out) + transparent_ledger_fee else 0;
     if (poolDebit > pool_value) {
       return mutation("REJECT:turnstile", "NOT_CALLED");
+    };
+    // Prepaid fee: the rate this transfer must pay, captured ONCE so a mid-flight admin
+    // rate change cannot split the check from the debit. 0 whenever the flag is off — the
+    // path below is then byte-equivalent to the pre-fee ledger. Cheap pre-verify guard;
+    // re-checked at the atomic commit point of each variant.
+    let prepaidRate = activePrepaidRate();
+    if (prepaidRate > 0 and prepaidFeeBalance(caller) < prepaidRate) {
+      return mutation("REJECT:prepaid-fee-insufficient", "NOT_CALLED");
     };
 
     let inputs = switch (serializePublicInputs([
@@ -2842,7 +3357,15 @@ persistent actor ZkLedger {
     };
 
     if (not isUnshield) {
-      // No await after this point: a private transfer commits all shielded state together.
+      // No await after this point: a private transfer commits all shielded state together —
+      // including the prepaid fee debit, which is re-checked HERE because the balance can
+      // have been drained by an interleaved transfer while the tree transition awaited.
+      if (prepaidRate > 0) {
+        if (not debitPrepaid(caller, prepaidRate)) {
+          return mutation("REJECT:prepaid-fee-insufficient", verdict);
+        };
+        prepaid_fee_revenue += prepaidRate;
+      };
       addNullifier(args.nullifier_1);
       addNullifier(args.nullifier_2);
       tree_state := ?next;
@@ -2870,6 +3393,16 @@ persistent actor ZkLedger {
     if (StableBlobSet.contains(spent_nullifiers, args.nullifier_1) or
         StableBlobSet.contains(spent_nullifiers, args.nullifier_2) or poolDebit > pool_value) {
       return mutation("REJECT:state-changed", verdict);
+    };
+    // Unshield prepaid debit: reserved NOW (same message segment as the pending intent —
+    // at finalize time the payout has already happened and a failed debit could no longer
+    // reject the operation). Held in pending_unshield_prepaid_debit, NOT in revenue:
+    // revenue is only earned at finalize, so an admin collect can never race the refund.
+    if (prepaidRate > 0) {
+      if (not debitPrepaid(caller, prepaidRate)) {
+        return mutation("REJECT:prepaid-fee-insufficient", verdict);
+      };
+      pending_unshield_prepaid_debit := prepaidRate;
     };
     let transferArgs : ICRC2.TransferArg = {
       from_subaccount = pool_subaccount;

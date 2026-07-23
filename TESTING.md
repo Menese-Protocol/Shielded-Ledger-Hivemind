@@ -310,6 +310,32 @@ tree oracle it replaces is demoted to a cross-check that the ledger itself polic
   probe_frontier_cost`: per-append instructions and response bytes for the allocation-flat
   `src/groth16/FrFlat.mo` backend, committed against the measured bound before integration.
 
+## 3d. The prepaid-fee battery: teeth-first edge battery on PocketIC
+
+The prepaid fee balance (deposit once publicly, debit internally per accepted shielded
+transfer, withdraw the remainder; default OFF behind `set_prepaid_fee`) is proven by
+`POCKET_IC_BIN=… cargo run --release --manifest-path soak/Cargo.toml --bin prepaid_fee_battery`:
+
+- **Teeth first**: four planted-defect ledger variants are compiled from a patched source copy
+  (debit skipped + pre-verify guard removed; enable-flag ignored with a rate floor; balances
+  made transient; resume without memo reconcile) and each of the ten checks listed in the
+  binary's header must go RED on its assigned variant before any green is trusted.
+- **Then green**: all ten checks against the shipped wasm with real Groth16 proofs — zero-rate
+  no-op, insufficient-balance REJECT with zero state mutation (verifier NOT_CALLED),
+  exact-balance boundary, over-withdraw/zero-value/dust edges, an interleaved
+  transfer×withdraw race for a balance that can fund only one (exactly one winner, balance 0,
+  solvency intact), upgrade persistence (`wasm_memory_persistence = keep`), withdraw-all with
+  the tokens block-verified on the caller's account, flag-off inertness (funded balances
+  neither debited nor blocking, deposits rejected, withdrawal still available), fee-custody
+  solvency (`fee-subaccount custody == Σ balances + revenue`), and trap-after-token crash
+  recovery resumed PAST the token dedup window via the memo reconcile.
+
+The statement-level batteries for the hardened transfer circuit live in the circuit crate and
+run inside the security gate: `semantic_audit` (twelve rows, UNSAT + mutation-kill, both
+statements), `statement_dims` (R1CS shape pins backing the wallet prover's key-statement
+inference), and `statement_binding` (fixture and matched-publics proofs cross-rejected under
+the swapped verifying keys).
+
 ## 4. Motoko unit tests
 
 - `tests/ICRC3HashTest.mo`, `tests/ICRC2BlockTest.mo`: hashing and exact block matching
