@@ -4,7 +4,7 @@
 // segments (no 4.8 GB on disk — generation stands in for the network download), VERIFY each chunk
 // against the trusted certified detect_stream root (chain recompute + Merkle boundary proofs), then
 // scan (native ECDH). Real owned notes planted at first/middle/last are recognized end-to-end; the
-// owned set must equal the planted set exactly (zero FN at scale). Peak RSS sampled cheaply at
+// owned set must equal the planted set exactly (zero FN for this run's corpus). Peak RSS sampled cheaply at
 // chunk-completion callbacks (never a tight timer, which would contend the dispatch thread).
 //
 // Usage: node scale-run.mjs <N> <W> [chunkSegments]
@@ -35,7 +35,7 @@ const plantedByRange = (from, to) => plantedNotes.filter((pn) => pn.position >= 
 const ab0 = process.hrtime.bigint();
 const anchor = buildAnchor(entryAt, N);                       // canister-side incremental chain (measured separately)
 const anchorBuildSec = Number(process.hrtime.bigint() - ab0) / 1e9;
-const trusted = { root: anchor.root, cTip: anchor.cTip, noteCount: N };
+const trusted = { root: anchor.root, cTip: anchor.cTip, noteCount: N, leaf: anchor.leaf };
 const mirror = makeMirror(entryAt, N, { anchor });
 
 const byPage = new Map();

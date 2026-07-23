@@ -6,7 +6,8 @@
 // (canonical position-sorted) to (1) the sequential reference `wallet.detectionScan` and (2) an
 // independent genesis-walk oracle; the NATIVE and REFERENCE kernels agree tag-for-tag; and resume
 // (two-halves via checkpoint) yields the identical set. RED teeth: a dropped-tail injection MUST
-// miss the last planted note (proves the census check catches a miss). Zero FN is absolute.
+// miss the last planted note (proves the census check catches a miss). Zero FN is asserted
+// absolutely across this battery's corpora and variants.
 import assert from "node:assert/strict";
 import "../readpath/setup-declarations.mjs";
 import naclPkg from "tweetnacl";
@@ -59,7 +60,7 @@ for (const seed of [1, 2]) {
   // trusted certified anchor + untrusted mirror over the true detection bytes
   const entryAt = (i) => { const e = new Uint8Array(48); e.set(posBE8(i), 0); const ct = ledger.records[i].ciphertext; for (let j = 0; j < 40; j++) e[8 + j] = ct[j] ?? 0; return e; };
   const anchor = buildAnchor(entryAt, TOTAL);
-  const trusted = { root: anchor.root, cTip: anchor.cTip, noteCount: TOTAL };
+  const trusted = { root: anchor.root, cTip: anchor.cTip, noteCount: TOTAL, leaf: anchor.leaf };
   const mirror = makeMirror(entryAt, TOTAL, { anchor });
 
   // recognition over matched pages (trusted canister retrieval + open + commitment proof)

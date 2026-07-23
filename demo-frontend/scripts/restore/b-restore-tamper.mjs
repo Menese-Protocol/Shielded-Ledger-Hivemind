@@ -60,7 +60,7 @@ for (const seed of [1, 2]) {
   const actors = { ledger: ledger.ledger, principal: null };
   const entryAt = (i) => { const e = new Uint8Array(ENTRY_LEN); e.set(posBE8(i), 0); const ct = ledger.records[i].ciphertext; for (let j = 0; j < 40; j++) e[8 + j] = ct[j] ?? 0; return e; };
   const anchor = buildAnchor(entryAt, TOTAL);
-  const trusted = { root: anchor.root, cTip: anchor.cTip, noteCount: TOTAL };
+  const trusted = { root: anchor.root, cTip: anchor.cTip, noteCount: TOTAL, leaf: anchor.leaf };
   const recognize = async (mp) => {
     const notes = [];
     for (const ps of mp) for (const rec of await wallet.retrieveMatchedPage(actors, ps, Math.min(ps + 512, TOTAL))) {

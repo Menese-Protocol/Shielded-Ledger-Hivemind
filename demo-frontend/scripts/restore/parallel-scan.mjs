@@ -10,18 +10,20 @@
 import { Worker } from "node:worker_threads";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
-import { DPAGE } from "./detect-chain.mjs";
+import { DPAGE, detectLeaf } from "./detect-chain.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const PAGE = 512;
 const ser = (path) => path.map((s) => ({ hash: Array.from(s.hash), right: s.right }));
 
 class Pool {
-  constructor(mode, encSk, size, root) {
+  constructor(mode, encSk, size, root, throttleDuty) {
     // Hard per-worker heap cap: a streaming worker holds ONE segment (192 KB) at a time, so 96 MB
     // is enormous headroom — but it structurally PROVES the design never buffers the stream (the
     // full 10^8 stream is 4.8 GB; a worker that tried to hold it would crash against this cap).
-    this.workers = Array.from({ length: size }, () => new Worker(resolve(here, "scan-worker.mjs"), { workerData: { mode, encSk: Array.from(encSk), root: Array.from(root) }, resourceLimits: { maxOldGenerationSizeMb: 96 } }));
+    // throttleDuty (bench-only, default undefined): CPU duty-cycle fraction the worker may use —
+    // models background-tab / battery-saver throttling for the device-envelope rows.
+    this.workers = Array.from({ length: size }, () => new Worker(resolve(here, "scan-worker.mjs"), { workerData: { mode, encSk: Array.from(encSk), root: Array.from(root), throttleDuty }, resourceLimits: { maxOldGenerationSizeMb: 96 } }));
     this.free = [...this.workers]; this.waiters = []; this.pending = new Map();
     for (const w of this.workers) w.on("message", (m) => this._onMsg(w, m));
   }
@@ -34,6 +36,21 @@ class Pool {
 //         recognize, checkpoint?, onCheckpoint?, chunkSegments?, injectDropTail?, skipVerify? }
 export async function parallelScan(opts) {
   const { mode, workers, mirror, trusted, encSk, from0, eff, total, seedText, plantedByRange, recognize } = opts;
+  // CERTIFICATE BINDING (before any mirror traffic): root, cTip, and noteCount MUST come
+  // from ONE certificate. The certified tuple leaf is SHA256(root ‖ cTip ‖ count LE8), so
+  // recomputing it over the caller's triple and comparing to the certificate's leaf
+  // rejects any cross-certificate mix (root from cert A + tip/count from cert B) —
+  // including a stale-prefix mix over the same honest stream, which every per-segment
+  // check would otherwise accept. `skipLeafBinding` exists ONLY for the battery's teeth.
+  if (!opts.skipLeafBinding) {
+    if (trusted.leaf == null) {
+      return { notes: [], matchedPages: [], rejected: [{ seg: -1, reason: "leaf-binding-missing" }], segments: 0, chunks: 0, workerNs: 0, maxWorkerNs: 0 };
+    }
+    const expected = detectLeaf(trusted.root, trusted.cTip, total);
+    if (!Buffer.from(expected).equals(Buffer.from(trusted.leaf))) {
+      return { notes: [], matchedPages: [], rejected: [{ seg: -1, reason: "leaf-binding" }], segments: 0, chunks: 0, workerNs: 0, maxWorkerNs: 0 };
+    }
+  }
   const startSeg = Math.floor(from0 / DPAGE);
   const lastComplete = Math.floor(total / DPAGE);
   const hasTip = total > lastComplete * DPAGE && !opts.injectDropTail;
@@ -51,8 +68,19 @@ export async function parallelScan(opts) {
   const matched = new Set((opts.checkpoint?.matchedPages) ?? []);
   const rejected = [];
   const timings = [];
-  const pool = new Pool(mode, encSk, workers, trusted.root);
+  const pool = new Pool(mode, encSk, workers, trusted.root, opts.workerThrottleDuty);
   let idc = 0;
+
+  // Bandwidth shaping (bench-only, opt-in): a token bucket over the bytes each chunk puts
+  // on the "wire" — dispatch of a chunk waits until the shaped link could have delivered
+  // its bytes. Synthetic (seedText) chunks are charged their wire-equivalent size.
+  const pace = opts.paceMbps ? { t0: Date.now(), consumed: 0, bytesPerMs: (opts.paceMbps * 1e6) / 8 / 1000 } : null;
+  const paceTake = async (bytes) => {
+    if (!pace) return;
+    pace.consumed += bytes;
+    const wait = pace.t0 + pace.consumed / pace.bytesPerMs - Date.now();
+    if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+  };
 
   const buildTask = (chunk) => {
     const startFrom = chunk[0].k * DPAGE;
@@ -71,16 +99,25 @@ export async function parallelScan(opts) {
     return { task, transfer };
   };
 
-  const inflight = chunks.map((chunk) => {
+  const dispatch = (chunk) => {
     const { task, transfer } = buildTask(chunk);
-    return pool.run(task, transfer).then((m) => {
+    const wireBytes = task.segBytes
+      ? task.segBytes.reduce((a, b) => a + b.byteLength, 0)
+      : chunk.reduce((a, c) => a + ((c.isTip ? total : (c.k + 1) * DPAGE) - c.k * DPAGE) * 48, 0);
+    const run = () => pool.run(task, transfer).then((m) => {
       timings.push(m.elapsedNs);
       for (const mp of m.matchedPages) matched.add(mp);       // (1) durable matched-set write ...
       if (m.rejected.length) { for (const r of m.rejected) rejected.push(r); return; } // rejected chunk: don't mark done
       for (const c of chunk) completed.add(c.k);              // (2) ... happens-before the checkpoint advance (P0-2/DELTA-C)
       if (opts.onCheckpoint) opts.onCheckpoint({ doneSegs: [...completed], matchedPages: [...matched] });
     });
-  });
+    return pace ? paceTake(wireBytes).then(run) : run();
+  };
+  const inflight = [];
+  for (const chunk of chunks) {
+    if (pace) await paceTake(0); // keep dispatch ordering stable under shaping
+    inflight.push(dispatch(chunk));
+  }
   await Promise.all(inflight);
   await pool.close();
 
