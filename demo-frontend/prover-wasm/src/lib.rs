@@ -133,7 +133,7 @@ pub fn assert_pk_matches_vk(pk_bytes: &[u8], ledger_vk_hex: &str) -> Result<bool
 
 /// Finalized witness count of the given transfer statement, synthesized once in setup mode —
 /// the exact mode Groth16 setup uses, so the count matches key generation.
-fn transfer_witness_count(cfg: &PoseidonCfg<F>, legacy_statement: bool) -> Result<usize, JsValue> {
+fn transfer_witness_count(cfg: &PoseidonCfg<F>, legacy_statement: bool) -> Result<usize, &'static str> {
     use ark_relations::r1cs::{ConstraintSystem, OptimizationGoal, SynthesisMode};
     let circuit = if legacy_statement {
         TransferCircuit::blank_legacy(cfg)
@@ -144,7 +144,7 @@ fn transfer_witness_count(cfg: &PoseidonCfg<F>, legacy_statement: bool) -> Resul
     cs.set_optimization_goal(OptimizationGoal::Constraints);
     cs.set_mode(SynthesisMode::Setup);
     ark_relations::r1cs::ConstraintSynthesizer::generate_constraints(circuit, cs.clone())
-        .map_err(|_| err("transfer statement synthesis failed"))?;
+        .map_err(|_| "transfer statement synthesis failed")?;
     cs.finalize();
     Ok(cs.num_witness_variables())
 }
@@ -154,10 +154,10 @@ fn transfer_witness_count(cfg: &PoseidonCfg<F>, legacy_statement: bool) -> Resul
 /// have distinct witness counts (pinned by the circuit crate's `statement_dims` test), so the
 /// length identifies the statement. Returns `legacy_statement` for `TransferCircuit`; errors
 /// if the key matches neither statement (wrong key entirely — refuse to prove).
-fn transfer_statement_of_pk(
+fn transfer_statement_of_pk_core(
     cfg: &PoseidonCfg<F>,
     pk: &ProvingKey<Bls12_381>,
-) -> Result<bool, JsValue> {
+) -> Result<bool, &'static str> {
     let l = pk.l_query.len();
     if l == transfer_witness_count(cfg, false)? {
         return Ok(false);
@@ -165,7 +165,44 @@ fn transfer_statement_of_pk(
     if l == transfer_witness_count(cfg, true)? {
         return Ok(true);
     }
-    Err(err("proving key matches neither the hardened nor the legacy transfer statement"))
+    Err("proving key matches neither the hardened nor the legacy transfer statement")
+}
+
+fn transfer_statement_of_pk(
+    cfg: &PoseidonCfg<F>,
+    pk: &ProvingKey<Bls12_381>,
+) -> Result<bool, JsValue> {
+    transfer_statement_of_pk_core(cfg, pk).map_err(err)
+}
+
+#[cfg(test)]
+mod statement_inference_tests {
+    use super::*;
+    use ark_snark::SNARK;
+    use ark_std::rand::rngs::StdRng;
+    use ark_std::rand::SeedableRng;
+
+    /// The wallet-side inference must identify a legacy and a hardened proving key correctly
+    /// and refuse a key that matches neither statement (here: the DEPOSIT circuit's key).
+    #[test]
+    fn infers_statement_from_proving_key() {
+        let cfg = poseidon_config();
+        let mut rng = StdRng::seed_from_u64(42);
+        let (legacy_pk, _) = Groth16::<Bls12_381>::circuit_specific_setup(
+            TransferCircuit::blank_legacy(&cfg),
+            &mut rng,
+        )
+        .unwrap();
+        let (hardened_pk, _) =
+            Groth16::<Bls12_381>::circuit_specific_setup(TransferCircuit::blank(&cfg), &mut rng)
+                .unwrap();
+        let (deposit_pk, _) =
+            Groth16::<Bls12_381>::circuit_specific_setup(DepositCircuit::blank(&cfg), &mut rng)
+                .unwrap();
+        assert_eq!(transfer_statement_of_pk_core(&cfg, &legacy_pk), Ok(true));
+        assert_eq!(transfer_statement_of_pk_core(&cfg, &hardened_pk), Ok(false));
+        assert!(transfer_statement_of_pk_core(&cfg, &deposit_pk).is_err());
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
