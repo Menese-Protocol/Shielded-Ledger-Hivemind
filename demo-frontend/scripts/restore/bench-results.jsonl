@@ -1,0 +1,6 @@
+{"row":"baseline","label":"baseline","N":1000000,"workers":4,"wallSec":7.266438508,"notesPerSec":137619,"wireMB":45.8,"zeroFN":true,"rejected":0}
+{"row":"shaped50","label":"shaped50","N":1000000,"workers":4,"wallSec":8.381779803,"notesPerSec":119306,"wireMB":45.8,"zeroFN":true,"rejected":0,"paceMbps":50,"floorSec":7.7}
+{"row":"shaped10","label":"shaped10","N":1000000,"workers":4,"wallSec":40.312581539,"notesPerSec":24806,"wireMB":45.8,"zeroFN":true,"rejected":0,"paceMbps":10,"floorSec":38.4}
+{"row":"throttle","label":"throttle","N":1000000,"workers":4,"wallSec":27.586148172,"notesPerSec":36250,"wireMB":45.8,"zeroFN":true,"rejected":0,"duty":0.25}
+{"row":"resume","N":1000000,"workers":4,"killedAfterSegs":96,"totalSegs":245,"resumeWallSec":5,"zeroFN":true,"rejected":0}
+{"row":"cores4","N":10000000,"workers":4,"cpuSet":"0-3","wallSec":84.081575046,"notesPerSec":118932,"zeroFN":true,"rejected":0}

@@ -18,3 +18,4 @@ node_modules/
 /soak/checkpoints/
 /src/MainTestHooks.generated.mo
 demo-frontend/scripts/restore/scale-results.jsonl
+demo-frontend/scripts/restore/bench-resume.ckpt.json
