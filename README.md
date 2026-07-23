@@ -114,6 +114,11 @@ assertions, and the stated boundaries are in [`docs/READ-PATH-SPEC.md`](docs/REA
 
 *Your wallet remembers where it was born; nobody else can read the certificate.*
 
+A wallet restored from seed phrase alone (no birthday metadata) uses the certified
+detection stream: a per-entry hash chain with Merkle anchors served by any untrusted
+mirror, scanned by a parallel verify-before-scan client (10^8 notes in minutes, zero
+false negatives proven at scale) — full-history restore without trusting a server.
+
 ## What the node provider sees
 
 Most ledgers answer this question with a privacy policy. This one answers it with a panel.
@@ -145,6 +150,12 @@ parameter table, the estimate, the cost model, and the stated scaling boundaries
 [`docs/PIR-SPEC.md`](docs/PIR-SPEC.md).
 
 *The ledger answers without knowing the question.*
+
+The PIR index is served through a decoupled derived index with a certified
+`pir2_boundary` anchor leaf: query cost is proven content-independent (exact
+instruction-count equality across all query targets), and the index can be repaired
+independently of the hot path. Flag-off, the certified tree and state hash are
+byte-identical to the pre-feature ledger.
 
 ## The verifier, and what it costs
 
@@ -194,9 +205,23 @@ the canister compile gates and the DEMO token API boundary; key provenance with 
 controls; and a production frontend build booted in a real browser. `--with-replica-e2e`
 additionally runs the stateful local-replica suite.
 
+## The verification fortress
+
+`scripts/fortress.sh` (add `--fast` for a smoke pass) runs a deterministic, offline,
+teeth-first gate over the hand-rolled cryptography: a 1,017-case three-verifier taxonomy
+(the production Motoko verifier, arkworks, and blst must agree on every verdict), per-op
+arithmetic differentials across the BLS12-381 field/curve/pairing tower, an independent
+stdlib-Python reference model that reproduces every Poseidon and circuit value from spec,
+under-constrained-circuit detection over all 20,213 witness variables, metamorphic proof
+transforms, coverage-guided fuzzing of every wire decoder, a 2,000,000-operation
+financial-invariant model with seam-fault injection plus live in-canister seam batteries,
+and a differential side-channel gate. Every detector ships with a teeth proof — a planted
+bug demonstrated to turn it RED — so no green is trusted untested. Full map:
+[`docs/VERIFICATION-FORTRESS.md`](docs/VERIFICATION-FORTRESS.md).
+
 ## Testing
 
-Five surfaces cover this system: the offline security gate above, the stateful replica suite
+Six surfaces cover this system: the verification fortress above, the offline security gate, the stateful replica suite
 (`e2e.py`), a randomized model-checked PocketIC soak (`soak/`) that drives tens of thousands of
 seeded random operations across thousands of accounts and verifies every account balance, block
 link, and solvency invariant with an independent replayer, the wallet read-path battery
