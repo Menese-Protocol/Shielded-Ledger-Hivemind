@@ -1,6 +1,6 @@
 /// Differential: DetectChain.mo (Motoko) must reproduce the JS reference construction
 /// (demo-frontend/scripts/restore/detect-chain.mjs) byte-for-byte. Vectors:
-/// for-team/detect-chain-vectors.json. Run: moc -r $(mops sources) tests/DetectChainVectors.mo
+/// tests/detect-chain-vectors.json. Run: moc -r $(mops sources) tests/DetectChainVectors.mo
 import DetectChain "../src/DetectChain";
 import Blob "mo:core/Blob";
 import Nat8 "mo:core/Nat8";

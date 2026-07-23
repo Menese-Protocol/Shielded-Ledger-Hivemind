@@ -10,7 +10,7 @@
 ///   detect leaf   = SHA256(R || c_tip || note_count LE8)  -> folded into certifiedTuple (flag on)
 ///
 /// Differential-checked against the JS reference by tests/DetectChainVectors.mo
-/// (vectors: for-team/detect-chain-vectors.json).
+/// (vectors: tests/detect-chain-vectors.json).
 import Sha256 "mo:sha2/Sha256";
 import Blob "mo:core/Blob";
 import Nat8 "mo:core/Nat8";
