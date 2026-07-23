@@ -45,6 +45,9 @@ trap - EXIT
 step "Randomized circuit properties and Groth16 mutation battery"
 cargo test --manifest-path "$CIRCUIT/Cargo.toml" -p common --features bls12-381 --test security_properties
 
+step "Circuit semantic-completeness audit (twelve-row UNSAT + mutation-kill battery)"
+cargo test --manifest-path "$CIRCUIT/Cargo.toml" -p common --features bls12-381 --test semantic_audit
+
 step "Browser prover compiles for wasm32 and uses the identical circuit"
 cargo check --manifest-path demo-frontend/prover-wasm/Cargo.toml --target wasm32-unknown-unknown
 if grep -rn 'Math\.random' demo-frontend/src demo-frontend/prover-wasm/src; then
