@@ -5,6 +5,7 @@
 /// canister message. Header fields are cross-checked after upgrade.
 
 import Blob "mo:core/Blob";
+import List "mo:core/List";
 import Nat "mo:core/Nat";
 import Nat32 "mo:core/Nat32";
 import Nat64 "mo:core/Nat64";
@@ -781,6 +782,46 @@ module {
       // on the ledger row -- that reproduces identically with this hunk reverted.
       slotOffsetLive(state, table_offset_captured, index, strideOf(state))
     }
+  };
+
+  /// The live keys of one window, for a caller that must INSPECT stored keys rather than count
+  /// them. `countTagsRange` loads a slot's tag and counts it; nothing in this module returned key
+  /// bytes, which is why a canonicality census over a set could not be written at all.
+  ///
+  /// Deliberately the same shape as its sibling above: bounded by the caller's `count`, clamped
+  /// to the CAPTURED capacity so a walk that starts under one capacity cannot finish under
+  /// another, and addressed through `walkOffset` so a walk during an open compaction window reads
+  /// the relocated slots. A reader that computed the raw `table_offset` address instead would
+  /// read clobbered bytes below the cursor — the defect already recorded against `slotAddress`,
+  /// and a new reader is exactly where it would come back.
+  ///
+  /// Tombstones are skipped. A migrated slot's key lives in the new table and is returned there,
+  /// so every live key is yielded exactly once across a full walk and a census cannot double
+  /// count. Reads only: no stable variable, no mutation.
+  ///
+  /// Cost is `count * KEY_SIZE` bytes and nothing else, so a caller can size a window to a
+  /// message budget without measuring.
+  public func keysRange(
+    state : State,
+    table_offset_captured : Nat64,
+    capacity_captured : Nat64,
+    from : Nat64,
+    count : Nat64,
+  ) : Result<[Blob]> {
+    let out = List.empty<Blob>();
+    var index = from;
+    let end = if (from + count > capacity_captured) capacity_captured else from + count;
+    while (index < end) {
+      let offset = walkOffset(state, table_offset_captured, index);
+      let tag = Region.loadNat8(state.region, offset);
+      if (tag == TAG_LIVE) {
+        List.add(out, Region.loadBlob(state.region, offset + 1, KEY_SIZE));
+      } else if (tag != TAG_EMPTY and tag != TAG_MIGRATED) {
+        return #err("stable-set:slot-tag");
+      };
+      index += 1;
+    };
+    #ok(List.toArray(out))
   };
 
   public func countTagsRange(

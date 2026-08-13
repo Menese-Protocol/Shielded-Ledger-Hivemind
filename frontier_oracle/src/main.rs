@@ -359,10 +359,71 @@ fn emit_summary(cfg: &PoseidonCfg<F>, seed: u64) {
     println!("compress(first_seeded_pair)={}", dec(&merkle_compress(cfg, a, b)));
 }
 
+/// Canonicality classification, arkworks as the source of truth.
+///
+/// `f_from_hex` is `Fr::deserialize_compressed`, which rejects any encoding at or above the
+/// modulus. It is the EXACT field the circuits and the verifier use, so this is a differential
+/// against the real thing rather than against a second reading of the spec.
+///
+/// Byte order is little-endian on both sides, and that is pinned here rather than assumed:
+/// arkworks serialises least-significant-first, and `PoseidonTree.hexToNat` multiplies the first
+/// byte read by `shift = 1`. `p_minus_one_le` and `p_be` are the asymmetric pair — the same
+/// number in the two orders, classified differently — so a flip on either side fails loudly.
+///
+/// `--red` disables the modulus check and accepts anything that is 32 well-formed bytes. The
+/// differential MUST fail under it; a red run that still agrees means the battery has no teeth.
+fn emit_canonical(red: bool) {
+    let modulus_le: Vec<u8> = F::MODULUS.to_bytes_le();
+    let hex_of = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+
+    let mut p_minus_1 = modulus_le.clone();
+    p_minus_1[0] -= 1; // the modulus ends in ...01, so this cannot borrow
+    let mut p_plus_1 = modulus_le.clone();
+    p_plus_1[0] += 1;
+    let mut p_be = modulus_le.clone();
+    p_be.reverse();
+
+    let mut one = [0u8; 32];
+    one[0] = 1;
+
+    let corpus: Vec<(&str, String)> = vec![
+        ("zero", hex_of(&[0u8; 32])),
+        ("one", hex_of(&one)),
+        ("p_minus_one_le", hex_of(&p_minus_1)),
+        ("p_le", hex_of(&modulus_le)),
+        ("p_plus_one_le", hex_of(&p_plus_1)),
+        ("all_ff", hex_of(&[0xffu8; 32])),
+        ("p_be", hex_of(&p_be)),
+        ("random_canonical", f_to_hex(&SplitMix(0xCA11).field())),
+        ("short", "00".to_string()),
+        ("odd_nibbles", "0".repeat(63)),
+    ];
+
+    println!("# canonicality corpus — arkworks ark_bls12_381::Fr, little-endian");
+    println!("# red={red}");
+    println!("modulus_dec={}", F::MODULUS);
+    let (mut acc, mut rej) = (0usize, 0usize);
+    for (name, hexval) in &corpus {
+        let canonical = if red {
+            // RED: shape only — 32 well-formed bytes, no modulus check at all.
+            hexval.len() == 64 && hexval.chars().all(|c| c.is_ascii_hexdigit())
+        } else {
+            common::f_from_hex(hexval).is_some()
+        };
+        if canonical { acc += 1 } else { rej += 1 }
+        println!("{name} {hexval} {}", if canonical { "CANONICAL" } else { "NON-CANONICAL" });
+    }
+    println!("census accepted={acc} rejected={rej}");
+    if acc == 0 || rej == 0 {
+        eprintln!("VACUOUS CORPUS: need at least one of each (accepted={acc} rejected={rej})");
+        std::process::exit(3);
+    }
+}
+
 fn main() {
     let cfg = poseidon_config();
     let args: Vec<String> = std::env::args().collect();
-    let usage = "usage: frontier-oracle <constants | vectors <seed> <name> | summary <seed>>";
+    let usage = "usage: frontier-oracle <constants | vectors <seed> <name> | summary <seed> | canonical [--red]>";
     match args.get(1).map(String::as_str) {
         Some("constants") => {
             self_check(&cfg, 0xE9);
@@ -375,6 +436,9 @@ fn main() {
             let name = args.get(3).expect(usage);
             self_check(&cfg, seed);
             emit_vectors(&cfg, seed, name);
+        }
+        Some("canonical") => {
+            emit_canonical(args.get(2).map(String::as_str) == Some("--red"));
         }
         Some("summary") => {
             let seed = u64::from_str_radix(

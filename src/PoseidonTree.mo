@@ -238,6 +238,22 @@ module {
     )
   };
 
+  /// The root of the tree this frontier already describes, with NO leaf appended.
+  ///
+  /// Every position at or beyond `nextIndex` is empty, so that root is exactly what appending the
+  /// EMPTY leaf at `nextIndex` produces: the same 32-compression walk, with the updated frontier
+  /// discarded. Reusing `append` rather than writing a second walk is deliberate — a second
+  /// implementation of the same walk is a second thing to drift, and this one would drift
+  /// silently because both would agree on the empty tree.
+  ///
+  /// The property that pins it: for any frontier `f` and leaf `L`, if `append(f, zeros, L)`
+  /// returns `(f', root)` then `frontierRootOf(f', zeros) == root`. That is checkable against
+  /// existing code with no oracle, and `tests/FrontierRootProperty.mo` checks it.
+  public func frontierRootOf(frontier : Frontier, zeros : [Nat]) : Nat {
+    let (_, root) = append(frontier, zeros, zeros[0]);
+    root
+  };
+
   // ---- wire codec: canonical field element ⇄ 32-byte little-endian hex ----
   // Matches the reference `f_to_hex`/`f_from_hex` (arkworks compressed Fr = 32 LE
   // bytes of the canonical integer; deserialization REJECTS values >= r).
