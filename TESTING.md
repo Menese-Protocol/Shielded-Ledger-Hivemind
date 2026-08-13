@@ -336,6 +336,59 @@ statements), `statement_dims` (R1CS shape pins backing the wallet prover's key-s
 inference), and `statement_binding` (fixture and matched-publics proofs cross-rejected under
 the swapped verifying keys).
 
+## 3e. The recovery harness: canonicality census, tree repair, intent release
+
+Every value the tree stores must be a canonical field element — below the BLS12-381 scalar
+modulus. A pool that somehow holds one that is not cannot rebuild its frontier, so its withdrawals
+cannot settle. These programs prove the intake check is the real predicate, that a corrupted pool
+has a way back, and that the way back does not create money.
+
+Each is a standalone WASI program: compile with `moc $(mops sources) -wasi-system-api -o <out>.wasm
+tests/<name>.mo` and run it under `wasmtime <out>.wasm`. They trap on failure, so a clean exit is
+the pass.
+
+- **Canonicality differential** — `tests/CanonicalityDifferential.mo`, against the committed
+  `tests/CanonicalityVectors.mo` fixture: the ledger's field-element parser is compared against
+  arkworks' own verdict on the boundary cases, including the modulus itself and the value one
+  below it. A parser that accepted the modulus would admit exactly the state the rest of this
+  section exists to recover from.
+- **Frontier root property** — `tests/FrontierRootProperty.mo`: pins that `frontierRootOf` agrees
+  with the append walk. The repair path derives its root through that function rather than
+  accepting one from the caller, so this property is what stops a caller asserting a root into
+  existence.
+- **Key walk** — `tests/KeyWalkNegativeControl.mo`, driving the real `StableBlobSet`: a census
+  cannot inspect keys the set will not expose, so the walk is checked for completeness (601 keys,
+  each committed key present exactly once) and for the window bound (an 8-slot window returns at
+  most 8). The negative leg plants a non-canonical key: the census over the full walk finds it,
+  and a census restricted to one slot misses it. A census that cannot miss proves nothing about a
+  census that can.
+- **Byte ceiling** — `tests/BoundedWalkNegativeControl.mo`, driving the real `StableLog`: a count
+  cap bounds how many notes a chunk touches, not how many bytes it moves, because notes are
+  variable-length. With the ceiling present a chunk stops at 8,388,608 B; with it removed the same
+  fixture moves 12,288,000 B, 146% of the ceiling. Ordinary traffic at the measured mean note size
+  sits at 19%, so the bound changes nothing for real work.
+- **Intent lifecycle model** — `tests/IntentLifecycleModel.mo`: an independent model of the
+  unshield intent state machine, enumerated to a fixpoint. It asks of every reachable state
+  whether the pool can return to healthy service — not whether one intent settles, which scores a
+  correct write-off as a failure. Of 30 reachable states, 20 could not before this work and 0
+  cannot after. The pre-fix count is asserted to be non-zero: a model that cannot find a known
+  trap must not be trusted to report its absence.
+- **Repair lane guard** — `tests/RepairGuardNegativeControl.mo`: the real guard rejects a
+  non-canonical lane, and a shape-only guard — 64 well-formed hex characters, no modulus check —
+  accepts it. So the modulus check, not the hex shape, is what stops a repair installing the value
+  it exists to remove.
+- **Release accounting** — `tests/ReleaseSolvencyNegativeControl.mo`: releasing a paid intent that
+  can never finalize burns its nullifiers and debits the pool. Both are load-bearing and for
+  different reasons, so each is knocked out separately. Without the burn the payout is kept and
+  the notes stay spendable — a double-spend. Without the debit the pool claims 1,000 while holding
+  750 — insolvency. Each knockout breaks its own invariant and only its own, which a single
+  combined assertion would have hidden.
+- **Witness uniqueness** — `cargo test --release --manifest-path circuit/Cargo.toml --test
+  witness_uniqueness`: propagates from the public inputs through the constraint matrices and
+  reports which variables are not pinned by them. Its negative leg starves the propagation of
+  every public input and requires that variables come back unpinned; an analysis that pins
+  everything unconditionally proves nothing.
+
 ## 4. Motoko unit tests
 
 - `tests/ICRC3HashTest.mo`, `tests/ICRC2BlockTest.mo`: hashing and exact block matching
