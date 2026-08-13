@@ -15,6 +15,7 @@
 import Principal "mo:core/Principal";
 import Blob "mo:core/Blob";
 import Time "mo:core/Time";
+import Prim "mo:⛔";
 import List "mo:core/List";
 import Array "mo:core/Array";
 import Nat "mo:core/Nat";
@@ -26,6 +27,8 @@ import Wire "Wire";
 import PokVerify "PokVerify";
 
 persistent actor CeremonyCoordinator {
+  // upload-cost telemetry
+
 
   // ------------------------------------------------------------------------------------------
   // Public types (Candid surface)
@@ -108,8 +111,16 @@ persistent actor CeremonyCoordinator {
   var genesis : Blob = "";
 
   // init-upload staging (before finishInit)
-  var initTransferChunks : List.List<Blob> = List.empty<Blob>();
-  var initDepositChunks : List.List<Blob> = List.empty<Blob>();
+  /// Bytes are accumulated AS CHUNKS ARRIVE, not concatenated in finish_init. concatBlobs
+  /// appends byte-by-byte across every chunk, and finish_init did it for BOTH sets in one message,
+  /// so the cost there was proportional to everything ever uploaded and unbounded in chunk count.
+  /// Spreading the same work across the upload messages leaves finish_init with one array
+  /// conversion per set. Nothing about what is stored or hashed changes.
+  /// Telemetry: instructions used by finish_init's concatenation step, so the cost that was
+  /// proportional to everything ever uploaded can be measured rather than argued.
+  var finishInitInstructions : Nat64 = 0;
+  var initTransferChunks : List.List<Nat8> = List.empty<Nat8>();
+  var initDepositChunks : List.List<Nat8> = List.empty<Nat8>();
 
   // transcript
   type ContributionRec = {
@@ -278,6 +289,8 @@ persistent actor CeremonyCoordinator {
     #ok("configured; authority = " # Principal.toText(caller));
   };
 
+  public query func finish_init_cost() : async Nat64 { finishInitInstructions };
+
   func onlyAuthority(caller : Principal) : ?Text {
     if (caller != authority) { ?"only the ceremony authority may call this" } else { null };
   };
@@ -287,8 +300,8 @@ persistent actor CeremonyCoordinator {
     if (not configured) { return #err("configure first") };
     if (initDone) { return #err("init already finished") };
     switch (circuit) {
-      case (#transfer) { List.add(initTransferChunks, chunk) };
-      case (#deposit) { List.add(initDepositChunks, chunk) };
+      case (#transfer) { for (x in chunk.vals()) { List.add(initTransferChunks, x) } };
+      case (#deposit) { for (x in chunk.vals()) { List.add(initDepositChunks, x) } };
     };
     #ok("chunk accepted");
   };
@@ -298,8 +311,10 @@ persistent actor CeremonyCoordinator {
     switch (onlyAuthority(caller)) { case (?e) { return #err(e) }; case (null) {} };
     if (not configured) { return #err("configure first") };
     if (initDone) { return #err("already initialized") };
-    let ti = concatBlobs(initTransferChunks);
-    let di = concatBlobs(initDepositChunks);
+    let c0 = Prim.performanceCounter(0);
+    let ti = Blob.fromArray(List.toArray(initTransferChunks));
+    let di = Blob.fromArray(List.toArray(initDepositChunks));
+    finishInitInstructions := Prim.performanceCounter(0) - c0;
     let tiA = Blob.toArray(ti);
     let diA = Blob.toArray(di);
     switch (parseLens(tiA), parseLens(diA)) {
@@ -330,8 +345,8 @@ persistent actor CeremonyCoordinator {
     ]);
     genesis := Blob.fromArray(Wire.sha256(pre));
     runningChallenge := genesis;
-    initTransferChunks := List.empty<Blob>();
-    initDepositChunks := List.empty<Blob>();
+    initTransferChunks := List.empty<Nat8>();
+    initDepositChunks := List.empty<Nat8>();
     initDone := true;
     #ok("initialized; genesis challenge set");
   };
