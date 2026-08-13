@@ -18,4 +18,9 @@ ark-groth16 = { workspace = true }
 ark-snark = { workspace = true }
 
 [features]
+# The five constraint-system test files carry a crate-level
+# `#![cfg(feature = "bls12-381")]`. Without this default they compile to nothing
+# and `cargo test` reports `ok. 0 passed` for each — a green suite running no
+# tests at all.
+default = ["bls12-381"]
 bls12-381 = ["dep:ark-bls12-381"]

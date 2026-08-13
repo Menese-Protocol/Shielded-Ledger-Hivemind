@@ -364,7 +364,21 @@ fn main() {
         let wout2 = Note { v: 0, nk: alice_nk, rho: wnf2, rcm: F::rand(&mut rng) };
         let wfee = 5u64;
         let w_v_pub_out = 90u64;
-        let w_recipient_binding = F::from(0xc0ffeeu64);
+        // The withdraw vector previously bound the constant 0xc0ffee, which no real account
+        // can produce -- the ledger derives this field from an ICRC3 hash over the pool, token and
+        // owner principals (Main.mo recipientBindingValue), so the shipped proof could never clear
+        // the pairing check on a live deployment. Accept the deployment's real binding when given.
+        let w_recipient_binding = match std::env::var("WITHDRAW_BINDING_HEX") {
+            Ok(h) => {
+                use ark_ff::PrimeField;
+                let h = h.trim().to_string();
+                let bytes: Vec<u8> = (0..h.len() / 2)
+                    .map(|i| u8::from_str_radix(&h[2 * i..2 * i + 2], 16).unwrap())
+                    .collect();
+                F::from_le_bytes_mod_order(&bytes)
+            }
+            Err(_) => F::from(0xc0ffeeu64),
+        };
         let wc = TransferCircuit {
             cfg: cfg.clone(),
             enforce_range: true,

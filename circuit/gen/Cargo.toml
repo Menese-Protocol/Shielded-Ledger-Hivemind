@@ -25,4 +25,10 @@ rand = { workspace = true }
 sha2 = { workspace = true }
 
 [features]
+# `common` was given `default = ["bls12-381"]` so its five constraint-system
+# test files stop compiling to nothing. That left THIS crate broken under default features:
+# `gen` keeps `ark-bls12-381` optional, so a plain `cargo build --release` mixed a BLS12-381
+# `common` with a BN254 `gen` and failed with 66 curve-mismatch errors -- including the vector
+# generator that the security gate's step-2 invocation depends on. Default to the same curve.
+default = ["bls12-381"]
 bls12-381 = ["common/bls12-381", "dep:ark-bls12-381"]

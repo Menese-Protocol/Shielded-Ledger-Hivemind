@@ -13,7 +13,7 @@
 
 use ark_bls12_381::Bls12_381;
 use ark_ff::{One, UniformRand, Zero};
-use ark_groth16::Groth16;
+use ark_groth16::{Groth16, ProvingKey, VerifyingKey};
 use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystem};
 use ark_snark::SNARK;
 use ark_std::rand::{rngs::StdRng, RngCore, SeedableRng};
@@ -241,17 +241,18 @@ fn violated_witness_fails_proof_generation_or_verification() {
     let nv = bad.out_v[0].unwrap() + F::one();
     bad.out_v[0] = Some(nv);
     bad.cm_out[0] = Some(recommit(&cfg, &bad, 0, nv));
-    // proving on an unsatisfied constraint system fails; if a proof were produced, verifying
-    // it against the (correct) public inputs must fail.
-    match Groth16::<Bls12_381>::prove(&pk, bad.clone(), &mut rng) {
-        Err(_) => { /* expected: cannot prove a broken statement */ }
-        Ok(proof) => {
-            assert!(
-                !Groth16::<Bls12_381>::verify(&vk, &bad.public_inputs(), &proof).unwrap(),
-                "a proof for a value-imbalanced witness verified"
-            );
-        }
-    }
+    // Assert the soundness-relevant statement as a VALUE, not via a panic. The previous
+    // form here asserted "Groth16 proving on an unsatisfied CS errors" -- false.
+    // ark-groth16-0.5.0/src/prover.rs:193 is a debug_assert!, so the prover PANICS under
+    // cargo test (debug-assertions on) and the assertion is compiled OUT under release. The
+    // panic unwound past the match, so neither arm was ever reached.
+    assert!(!satisfied(&bad), "{UNSAT_MSG}");
+
+    // The end-to-end leg, correct in BOTH profiles. Panic (debug), Err, or a proof that
+    // fails to verify (release) are all acceptable NEGATIVE outcomes. A proof that VERIFIES is
+    // the only failure.
+    let outcome = negative_prove_outcome(&pk, &vk, &bad, [0x5a; 32]);
+    assert!(!matches!(outcome, NegOutcome::Verified), "{VERIFIED_MSG}: {outcome:?}");
     println!("VIOLATION-PROOF GREEN: imbalanced witness cannot yield a verifying proof");
     let _ = F::zero;
 }
@@ -278,4 +279,77 @@ fn recipient_binding_is_bound_at_the_verifier() {
         "proof verified against a changed recipient binding"
     );
     println!("RECIPIENT-BINDING GREEN: proof rejected under a changed public recipient");
+}
+
+const UNSAT_MSG: &str = "a value-imbalanced witness satisfied the constraint system";
+const VERIFIED_MSG: &str = "a proof for a value-imbalanced witness verified";
+
+/// How the prover disposed of a witness that must not yield a verifying proof.
+#[derive(Debug)]
+enum NegOutcome {
+    /// `prover.rs:193`'s `debug_assert!` fired — the debug-profile path.
+    Panicked,
+    Errored,
+    /// A proof was produced but does not verify — the release-profile path.
+    ProvedButRejected,
+    /// The single failure.
+    Verified,
+}
+
+/// Drive prove+verify and classify the outcome without assuming HOW the library refuses.
+///
+/// The panic hook is deliberately NOT suppressed: `cargo test` runs tests in parallel, and a
+/// global hook installed here would mask a concurrent test's failure message. Noise on the
+/// expected debug-profile panic is the cheaper cost.
+fn negative_prove_outcome(
+    pk: &ProvingKey<Bls12_381>,
+    vk: &VerifyingKey<Bls12_381>,
+    c: &TransferCircuit,
+    seed: [u8; 32],
+) -> NegOutcome {
+    let (pk, vk, c) = (pk.clone(), vk.clone(), c.clone());
+    let run = move || {
+        let mut rng = StdRng::from_seed(seed);
+        match Groth16::<Bls12_381>::prove(&pk, c.clone(), &mut rng) {
+            Err(_) => NegOutcome::Errored,
+            Ok(proof) => {
+                match Groth16::<Bls12_381>::verify(&vk, &c.public_inputs(), &proof) {
+                    Ok(true) => NegOutcome::Verified,
+                    _ => NegOutcome::ProvedButRejected,
+                }
+            }
+        }
+    };
+    // `panic = "abort"` cannot unwind, which is exactly why the value-level assertion above does
+    // not depend on this leg.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)).unwrap_or(NegOutcome::Panicked)
+}
+
+/// Inverted control, leg 1: the unsatisfiability assertion above, applied to an HONEST witness,
+/// must FAIL. Wired permanently into the suite rather than run once by hand, so a harness that
+/// later becomes vacuous goes red here instead of passing silently.
+#[test]
+#[should_panic(expected = "a value-imbalanced witness satisfied the constraint system")]
+fn honest_witness_is_satisfied_so_the_unsat_assertion_must_fail() {
+    let cfg = poseidon_config();
+    let mut rng = StdRng::from_seed([0x5a; 32]);
+    let h = honest(&mut rng, &cfg);
+    assert!(!satisfied(&h), "{UNSAT_MSG}");
+}
+
+/// Inverted control, leg 2: the end-to-end negative assertion, applied to an HONEST witness,
+/// must FAIL — the honest proof verifies. Without this, `catch_unwind` returning `Panicked` for
+/// ANY reason would let the negative leg pass on a harness that never proved anything.
+#[test]
+#[should_panic(expected = "a proof for a value-imbalanced witness verified")]
+fn honest_proof_verifies_so_the_negative_assertion_must_fail() {
+    let cfg = poseidon_config();
+    let mut rng = StdRng::from_seed([0x5a; 32]);
+    let mut setup_rng = StdRng::from_seed([0xc3; 32]);
+    let (pk, vk) =
+        Groth16::<Bls12_381>::circuit_specific_setup(TransferCircuit::blank(&cfg), &mut setup_rng)
+            .unwrap();
+    let h = honest(&mut rng, &cfg);
+    let outcome = negative_prove_outcome(&pk, &vk, &h, [0x5a; 32]);
+    assert!(!matches!(outcome, NegOutcome::Verified), "{VERIFIED_MSG}: {outcome:?}");
 }
