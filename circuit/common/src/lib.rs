@@ -405,6 +405,21 @@ impl ConstraintSynthesizer<F> for TransferCircuit {
         let fee = FpVar::new_input(cs.clone(), || opt(self.fee).map(F::from))?;
         let v_pub_out = FpVar::new_input(cs.clone(), || opt(self.v_pub_out).map(F::from))?;
         let recipient_binding = FpVar::new_input(cs.clone(), || opt(self.recipient_binding))?;
+        // `recipient_binding` is a public input the statement does not otherwise reference. The
+        // witness below is allocated from the SAME value and then compared to it, so the equality
+        // holds for every assignment -- a prover controls both slots and would fill them alike.
+        //
+        // IT IS NOT WHAT BINDS THE RECIPIENT, and reading it as such is the error this comment
+        // exists to prevent. Groth16 binds every instance variable regardless of whether the
+        // circuit mentions it: ark-groth16's QAP reduction gives each one its own Lagrange
+        // coefficient at a domain position past the constraint count (`r1cs_to_qap.rs`, hence
+        // `domain_size = num_constraints + num_instance_variables`). Deleting these two lines
+        // leaves `recipient_binding_is_bound_at_the_verifier` passing -- measured, not assumed.
+        //
+        // What it DOES do is keep the input inside the developer constraint system, so the
+        // under-constrained coverage property holds. Deleting it costs one constraint and one
+        // witness and fails `transfer_circuit_is_fully_constrained` with "1 public inputs are not
+        // effectively constrained". That is the reason to keep it, and the only one.
         let recipient_binding_witness =
             FpVar::new_witness(cs.clone(), || opt(self.recipient_binding))?;
         recipient_binding_witness.enforce_equal(&recipient_binding)?;
