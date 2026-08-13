@@ -69,8 +69,13 @@ persistent actor ZkLedger {
     icrc1_fee : shared query () -> async Nat;
     icrc1_decimals : shared query () -> async Nat8;
   };
+  // The reply type MUST be the archive-aware one declared below. ICRC2.GetBlocksResult carries only
+  // { log_length; blocks } — no archived_blocks — and Candid silently drops record fields the
+  // receiver does not declare, so with that type the archived ranges never reach this canister at
+  // all. Reading `page.blocks` and concluding absence was not an oversight in the scan loop; the
+  // scan loop could not have seen an archive if it had tried.
   type HistoryAdapter = actor {
-    icrc3_get_blocks : shared query ([ICRC2.GetBlocksArgs]) -> async ICRC2.GetBlocksResult;
+    icrc3_get_blocks : GetBlocksCallback;
   };
 
   public type NoteOrigin = NoteCodec.NoteOrigin;
@@ -102,6 +107,8 @@ persistent actor ZkLedger {
     ephemeral_key : Blob;
     note_ciphertext : Blob;
   };
+  public type CompactTarget = { #roots; #nullifiers; #shields; #unshields };
+  var compact_instructions : Nat64 = 0;
   public type TransferArgs = {
     anchor : Blob;
     nullifier_1 : Blob;
@@ -130,6 +137,9 @@ persistent actor ZkLedger {
 
   public type LedgerStatus = {
     configured : Bool;
+    /// Who holds the administrator role. Exposed so that WHO owns a pool is observable rather than
+    /// inferable only by trying an admin-only call. How this value is set is documented at `configure`.
+    administrator : ?Principal;
     note_root : Blob;
     note_count : Nat;
     log_length : Nat;
@@ -144,6 +154,10 @@ persistent actor ZkLedger {
     layout_version : Nat;
     note_entries : Nat;
     note_bytes : Nat;
+    // Region CAPACITY, not bytes used. note_bytes is the data offset; this is what a grow moves,
+    // and it is what makes 'the log grew before the payout rather than inside the commit'
+    // observable from outside the canister.
+    note_log_region_bytes : Nat;
     note_digest : Blob;
     root_entries : Nat;
     root_capacity : Nat;
@@ -243,6 +257,23 @@ persistent actor ZkLedger {
     completed_intents : Nat;
   };
 
+  /// The publicly visible shape of an in-flight token intent.
+  ///
+  /// atomicity_status is an unauthenticated query, so it must not carry anything that links a
+  /// shielded note to a transparent identity. The full PendingShield/PendingUnshield records do:
+  /// `caller` is the spending principal, `transfer_args.to`/`.from` is the transparent account,
+  /// and the nullifiers name the exact notes being consumed. Published together they defeat the
+  /// unlinkability the pool exists to provide, to any anonymous caller, for the whole time an
+  /// operation is in flight. Only the operational fields an outside observer needs in order to
+  /// reason about atomicity are exposed here; the detail is admin-gated in pending_intent_detail.
+  public type AtomicityPending = {
+    intent_id : Blob;
+    base_epoch : Nat;
+    attempts : Nat;
+    verifier_outcome : Text;
+    ledger_tip_before : Nat;
+  };
+
   public type AtomicityStatus = {
     token_configured : Bool;
     token_ledger : ?Principal;
@@ -250,8 +281,8 @@ persistent actor ZkLedger {
     transparent_ledger_fee : Nat;
     transparent_ledger_decimals : Nat8;
     pool_account : ICRC2.Account;
-    pending : ?PendingShield;
-    pending_unshield : ?PendingUnshield;
+    pending : ?AtomicityPending;
+    pending_unshield : ?AtomicityPending;
     completed_intents : Nat;
     completed_intent_digest : Blob;
     completed_unshield_intents : Nat;
@@ -308,6 +339,9 @@ persistent actor ZkLedger {
   var deposit_vk_hex : Text = "";
   // Parsed + prepared ONCE at configure (subgroup-validated, fixed pairs precomputed) — the
   // per-proof path never re-validates the vk. Stable: survives upgrades with the hexes.
+  // Monotonic keyset epoch. Bumped by configure and by every rotate_verifying_keys_v2, and
+  // carried in the certified vk anchor so a client can detect a rotation it has not adopted.
+  var vk_epoch : Nat64 = 0;
   var transfer_vk_prepared : ?Groth16Multi.PreparedVk = null;
   var deposit_vk_prepared : ?Groth16Multi.PreparedVk = null;
   // Flat-limb projection of the prepared vks: rebuilding it inline cost a measured
@@ -324,7 +358,25 @@ persistent actor ZkLedger {
   // attached oracle is only a cross-check whose disagreement flips the sticky
   // fail-closed guard, and with the oracle detached (`set_tree_oracle(null)`) the
   // ledger stands alone. All-or-nothing: no per-path enable.
-  var tree_frontier_enabled : Bool = false;
+  /// DEFAULT ON. It shipped false, and the setter's own comment below says what that meant:
+  /// "byte-identical legacy: oracle root trusted". With it off the ledger computes no transition of
+  /// its own, frontierCrossCheck runs no check, and parseTransition validates only the SHAPE of the
+  /// oracle's reply — so an oracle that returns a well-formed root of its own choosing has that root
+  /// written into historical_roots and installed as note_root. The blast radius is counterfeit
+  /// notes and pool drain.
+  ///
+  /// Changing this initialiser fixes FRESH pools only, because this is a stable variable and a
+  /// deployed pool keeps its stored false. That is why the value path also refuses while it is off —
+  /// see shield and confidential_transfer. The two together are the fix; either alone is not.
+  var tree_frontier_enabled : Bool = true;
+
+  /// QUARANTINE ON UPGRADE. A pool upgraded to the intake fix may ALREADY hold
+  /// non-canonical values stored by a pre-fix build; Phase 1 closes the door, it does not clean the
+  /// room. These record that condition. NOTHING here traps: `postupgrade` already carries two
+  /// pre-existing traps, and a trap there ROLLS BACK THE UPGRADE, leaving the pool running the OLD
+  /// broken code — so the fix could never reach the pool that needs it most. Quarantine REPORTS.
+  var state_quarantine : Bool = false;
+  var state_quarantine_values : [Text] = [];
   // zeroHashes() is a pure function of the gate-validated constants (275M instr once);
   // TRANSIENT: wiped by upgrades, rebuilt lazily — the FlatVk pattern.
   transient var zero_hashes_cache : ?[Nat] = null;
@@ -360,6 +412,13 @@ persistent actor ZkLedger {
   let PIR2_CHAIN_REPLAY_PER_CHUNK : Nat = 256;
   let PIR2_ZERO_BYTES_PER_CHUNK : Nat64 = 8_388_608;
   var pir2_fold_retries : Nat = 0;
+  /// Consecutive DETERMINISTIC trap classifications. A trap recurs on every retry, so retrying
+  /// it is unbounded work that can never succeed; a transient failure deserves the existing
+  /// unbounded retry. The catch already distinguishes the two and then treated them identically.
+  var pir2_fold_trap_streak : Nat = 0;
+  /// Set when the streak hits PIR2_FOLD_FAILURE_LIMIT. Cleared by pir2_reindex, so stopping does
+  /// not become the permanent latch A5 was filed for.
+  var pir2_fold_terminal : Bool = false;
   var pir2_last_fold_error : ?Text = null;
   var pir2_fold_backoff_until : Nat64 = 0;
   var pir2_last_chunk_instructions : Nat64 = 0;
@@ -404,6 +463,27 @@ persistent actor ZkLedger {
   // intent). A separate stable var (not a PendingUnshield field) keeps the stable record
   // type backward-compatible.
   var pending_unshield_prepaid_debit : Nat = 0;
+
+  /// The unshield commit's PREPARE output. A NEW TOP-LEVEL STABLE VARIABLE rather than a field of
+  /// PendingUnshield, which would be an M0170 incompatible change and would make every deployed pool
+  /// unupgradeable — the lesson StableBlobSet.State already taught this tree. The pattern is
+  /// pending_unshield_prepaid_debit directly above: extra state for the pending unshield, carried
+  /// alongside it rather than inside it.
+  ///
+  /// It is a CACHE, NOT AUTHORITY. Every field is recomputable from the pending intent; it names the
+  /// intent it was built for; and a record that is absent or names a different intent is rebuilt
+  /// rather than treated as an error. That is what makes a pool holding a live pending intent at the
+  /// moment of upgrade a non-event: the intent's own shape is untouched, so there is nothing to
+  /// migrate, and the first resume fills this in.
+  public type PreparedUnshield = {
+    intent_id : Blob;
+    encoded_1 : Blob;
+    encoded_2 : Blob;
+    hash_1 : Blob;      // block 1's hash: becomes last_block_hash, and is block 2's phash
+    hash_2 : Blob;      // block 2's hash
+    position_1 : Nat;
+  };
+  var pending_unshield_prepared : ?PreparedUnshield = null;
 
   // An upgraded v1 deployment remains locked until the administrator rotates the transfer VK.
   // A fresh configure() installs the recipient-bound v2 statement immediately.
@@ -454,6 +534,12 @@ persistent actor ZkLedger {
   var audit_set_captured_capacity : Nat64 = 0;
   var audit_set_captured_count : Nat64 = 0;
   var audit_set_captured_puts : Nat = 0;
+  // The migration cursor at the start of a set's walk. A window spreads a set's entries across two
+  // tables, and carrying one entry from the old table to the new one moves it from an index the walk
+  // may already have passed to one it may already have passed — so a cursor that moves mid-walk can
+  // double-count or miss, exactly as a racing insert can. It is captured and re-checked for the same
+  // reason, and reuses the same restart machinery.
+  var audit_set_captured_cursor : Nat64 = 0;
   var audit_set_observed : Nat64 = 0;
   var audit_set_restarts : Nat = 0;
   var audit_epoch : Nat = 0;
@@ -464,6 +550,14 @@ persistent actor ZkLedger {
   // clear_audit_guard (admin) after a NEWER audit epoch has re-run green.
   var guard_code : ?Text = null;
   var guard_epoch : Nat = 0;
+  // NON-BLOCKING divergence signal for the finalize frontier cross-check. A finalize
+  // frontier mismatch is corruption-only (unreachable in the honest case under the
+  // `note_root == anchor_before` guard) and is deliberately NOT escalated to the sticky
+  // `guard_code` — doing so would block the resume that converges the money, turning a
+  // silent per-intent wedge into a funds-availability bug. Instead it is COUNTED here, so
+  // the operator has an observable without the ledger fail-closing. Observable-only; never gates.
+  var finalize_frontier_mismatch_count : Nat = 0;
+  var finalize_frontier_mismatch_last : ?Blob = null;
   // put counters: exact-count contention detection for the chunked set walks
   var roots_put_counter : Nat = 0;
   var nullifiers_put_counter : Nat = 0;
@@ -513,6 +607,10 @@ persistent actor ZkLedger {
   var unshields_fold_digest : Blob = Blob.fromArray(Array.repeat<Nat8>(0, 32));
   // postupgrade telemetry (T1: cost must stay ~flat vs note count)
   var postupgrade_instructions : Nat64 = 0;
+  /// Instructions consumed by `configure` up to its first await. Same shape as
+  /// `pir2_last_chunk_instructions` and `postupgrade_instructions`; the pre-await segment is the one
+  /// that was carrying both vk preparations and 51.1% of the 40e9 budget.
+  var configure_prepare_instructions : Nat64 = 0;
   var postupgrade_heap_before : Nat = 0;
   var postupgrade_heap_after : Nat = 0;
   transient let note_checker = NoteAudit.Checker();
@@ -524,10 +622,78 @@ persistent actor ZkLedger {
   // ≈ 2.8M entries — far beyond tier; it restarts then fails LOUD, never band-passes);
   // index walk 623 instr/entry → 1M entries ≈ 0.65B instr.
   let AUDIT_NOTES_PER_CHUNK : Nat = 4096;
+  // Companion BYTE budget for the note walk. AUDIT_NOTES_PER_CHUNK bounds how many notes a
+  // chunk visits; it does not bound the WORK, because the per-note cost is linear in the stored
+  // note size (NoteAudit.checkNote copies the whole frame byte-at-a-time and SHA-256s the
+  // payload) and note_ciphertext has no upper bound on ingress. The 4096 constant was sized
+  // from a measurement on ordinary notes (see the note above: 1.40M instr / 35.3KB alloc each);
+  // a window of inflated notes multiplies both figures without touching the count.
+  //
+  // 8 MiB is chosen so the count cap still binds first for ordinary traffic — measured mean
+  // encoded note size on a seeded fixture is 395 B, so 4096 ordinary notes are ~1.6 MB, five
+  // times under this ceiling and therefore byte-for-byte unchanged in behaviour — while an
+  // abnormal window stops early instead of running to the instruction or allocation limit.
+  let AUDIT_BYTES_PER_CHUNK : Nat = 8_388_608;
+  /// Resumable exit. The byte/count caps above bound WORK; this bounds COST, which is what the
+  /// 40e9 per-message limit actually charges. A chunk that reaches it exits with done=false and its
+  /// cursor, so the next message resumes rather than restarting -- which is only expressible because
+  /// the reply carries `resume_cursor`. Measured with Prim.performanceCounter(0), already used at
+  /// :1642 for pir2_last_chunk_instructions. COMPILE-TIME CONSTANT: there is no env override in this
+  /// canister (verified: zero Env/getenv references in this file), so raising the bound beyond reach
+  /// requires a BUILD VARIANT, exactly as the optional-cursor variant did. An earlier version of
+  /// this comment claimed env-overridable; that was false and is corrected here.
+  let AUDIT_INSTRUCTIONS_PER_CHUNK : Nat64 = 20_000_000_000;
   let AUDIT_SLOTS_PER_CHUNK : Nat64 = 4_194_304;
   let AUDIT_INDEX_PER_CHUNK : Nat64 = 1_048_576;
+
+  /// PRE-FLIGHT REFUSAL for `configure`. `configure` runs `Groth16Wire.parseAndPrepareVk` on each
+  /// key IN-PROCESS with no way to exit — the two preparations carried 20,428,523,632 instructions
+  /// = 51.1% of the 40e9 per-message limit. `MAX_VK_BYTES` (16_384) bounds decode-DoS but NOT
+  /// preparation cost, so a vk between ~2.3 KB and 16 KB passes the size check yet cannot be
+  /// prepared inside one message. There is no loop to exit, so a message must be able to REFUSE
+  /// TO START, before touching any state.
+  ///
+  /// THE COST MODEL, MEASURED (not quoted). `tests/ScaleFixture.measure_vk_prepare` wraps the exact
+  /// production `Groth16Wire.parseAndPrepareVk` behind `Prim.performanceCounter(0)`. Run 2026-08-10
+  /// on the two production keys:
+  ///   deposit  vk  976 hex chars ->  8_551_286_600 instr
+  ///   transfer vk 1552 hex chars -> 11_877_237_032 instr   (sum 20.4e9, the figure quoted above)
+  /// A line through those two points: cost(hexlen) ~= 2.916e9 + 5.774e6 * hexlen. The constants
+  /// below round the intercept and slope UP so the estimate never UNDER-predicts a real preparation
+  /// (an under-estimate would admit a budget-buster — the failure this guard exists to prevent).
+  /// Only two production vk sizes exist in-tree, so this is a two-point line, not a characterised
+  /// superlinear model; it is deliberately conservative rather than tight, exactly as `MAX_VK_BYTES`
+  /// is. New keys are re-measured, not assumed.
+  let VK_PREPARE_INSTR_INTERCEPT : Nat = 3_000_000_000;
+  let VK_PREPARE_INSTR_PER_HEX_CHAR : Nat = 5_800_000;
+  /// Refuse a preparation predicted to exceed this. 30e9 = 75% of the 40e9 message limit, reserving
+  /// headroom for the rest of the configure message (the controller/oracle/parse/commit work that
+  /// shares it). Both production keys (est. ~8.7e9 and ~12.0e9) clear it with wide margin; a vk above
+  /// ~4_650 hex chars (~2.3 KB) is refused before `parseAndPrepareVk` charges for it.
+  let VK_PREPARE_INSTR_CEILING : Nat = 30_000_000_000;
+  func estimatedVkPrepareInstructions(vkHex : Text) : Nat {
+    VK_PREPARE_INSTR_INTERCEPT + VK_PREPARE_INSTR_PER_HEX_CHAR * vkHex.size()
+  };
   let AUDIT_CHUNK_FAILURE_LIMIT : Nat = 3;
   let AUDIT_SET_RESTART_LIMIT : Nat = 3;
+
+  /// The audit driver re-arms immediately on every `done = false` return (`Timer.setTimer
+  /// (#seconds 0, auditTick)`), so a chunk that returns without advancing spins forever, burning
+  /// cycles and never completing. Enumerating the four return sites shows none does — but that
+  /// result rests on these two constants rather than on structure: at `AUDIT_SLOTS_PER_CHUNK = 0`
+  /// the set phase computes `end == from`, never advances the cursor, skips the completion branch
+  /// and LIVELOCKS; at `AUDIT_SET_RESTART_LIMIT = 0` the contended-walk branch can never fail closed.
+  /// Neither is caught by the type system and both are one edit away, so assert them where the
+  /// canister cannot serve without passing: the actor body on install, and postupgrade on upgrade.
+  func assertAuditProgressConstants() {
+    if (AUDIT_SLOTS_PER_CHUNK == 0) {
+      Runtime.trap("init:audit-slots-per-chunk-zero:set-phase-would-livelock");
+    };
+    if (AUDIT_SET_RESTART_LIMIT == 0) {
+      Runtime.trap("init:audit-set-restart-limit-zero:contended-walk-would-never-fail-closed");
+    };
+  };
+  assertAuditProgressConstants();
 
   StableBlobSet.ensureInit(historical_roots);
   StableBlobSet.ensureInit(spent_nullifiers);
@@ -622,6 +788,67 @@ persistent actor ZkLedger {
       i += 1;
     };
     #ok(Blob.fromArray(Array.fromVarArray(field)))
+  };
+
+  /// `intent_id` is derived deterministically from caller, recipient_binding and the
+  /// transfer fields, and `atomicity_status` published it unauthenticated. An observer who guesses a
+  /// recipient can recompute `recipient_binding` (public and unsalted) and hence the whole
+  /// intent_id, turning a status query into a confirm-the-recipient oracle.
+  ///
+  /// The internal intent_id is NOT changed: it is the ICRC-2 memo that reconciliation matches on
+  /// (`transfer.memo != ?pending.intent_id`). Only the PUBLISHED handle is salted, so correlation by
+  /// an outside guesser is broken while every internal identity is preserved.
+  var intent_publish_salt : Blob = "";
+
+  /// Seeded EXACTLY ONCE from the management canister's randomness, on an update path. Queries
+  /// cannot seed it, so a query before the first seeding withholds the handle (publishedIntentId
+  /// fails closed) -- which is why callers that create pendings seed it first (see the
+  /// shield/unshield entry points).
+  ///
+  /// "Exactly once" is made true by the RE-TEST AFTER THE AWAIT, not by the guard before it. The
+  /// first version tested `size() == 0` and then assigned across an await:
+  ///
+  ///     if (intent_publish_salt.size() == 0) { intent_publish_salt := await ic.raw_rand() };
+  ///
+  /// An await yields the message, so two concurrent shield / confidential_transfer calls could BOTH
+  /// pass the guard and BOTH assign -- last write wins. No value leaked (every seed is
+  /// unpredictable), but a re-seed silently changes EVERY published handle, so a reader who
+  /// recorded one could no longer match it. Classic double-checked locking (Schmidt & Harrison,
+  /// PLoP 1996), in the form the IC forces: state can change across an await, so post-await state
+  /// must be RE-VALIDATED rather than assumed -- the same principle behind `configure`'s await-free state
+  /// set and behind the finalize cross-check sitting above its commit boundary.
+  ///
+  /// NOT A SEEDING FLAG, deliberately. On the IC an await is a COMMIT POINT: state written before
+  /// it is committed, and a trap afterwards rolls back only post-await changes. A `seeding := true`
+  /// claimed before the await therefore LATCHES if the continuation traps, with no in-canister
+  /// reset -- a sibling project carries exactly that bug today, where a configuring flag set before
+  /// an await and cleared only in the continuations strands permanently and refuses every later
+  /// configure. The double-checked form has no flag, so there is nothing to strand; its only cost
+  /// is one discarded raw_rand in a genuine race, which is free.
+  ///
+  /// STRICTLY NARROWING: the re-test can only PREVENT a write, never cause one, so it introduces no
+  /// state the old code could not reach. That is what makes it safe on a money-in path.
+  func seedIntentPublishSalt() : async () {
+    if (intent_publish_salt.size() == 0) {
+      let ic : actor { raw_rand : () -> async Blob } = actor ("aaaaa-aa");
+      let seed = await ic.raw_rand();
+      // Re-test: first writer wins, a loser discards its seed.
+      if (intent_publish_salt.size() == 0) { intent_publish_salt := seed };
+    };
+  };
+
+  /// The handle as published. Unlinkable to the recipient without the salt.
+  func publishedIntentId(id : Blob) : Blob {
+    // Fail CLOSED. The first version returned `id` when the salt was empty, which published the raw
+    // deterministic handle and left the oracle open — the before/after showed the published bytes
+    // byte-identical to the unfixed build. A privacy control must never default to disclosure, so an
+    // unseeded salt withholds the handle instead of revealing it.
+    if (intent_publish_salt.size() == 0) return "";
+    let d = Sha256.Digest(#sha256);
+    d.writeBlob("zk-ledger/intent-id-publish/v1");
+    d.writeBlob(intent_publish_salt);
+    d.writeBlob(id);
+    d.sum()
   };
 
   func unshieldIntentId(caller : Principal, args : TransferArgs, binding : Blob) : Blob {
@@ -727,12 +954,35 @@ persistent actor ZkLedger {
       audit_digest = auditLeafDigest();
       pir2_boundary = pir2BoundaryLeaf();
       detect_stream = if (detect_chain_enabled) ?DetectChain.streamLeaf(detect_chain_state) else null;
+      vk_anchor = vkAnchorLeaf();
     }
   };
 
   /// Certified anchor for the pir2 record stream: digest(32) ‖ covered-count(8B BE), present
   /// only when pir2 is enabled and a DPAGE boundary exists — the flag-off certified tree is
   /// byte-identical to the pre-pir2 one (spec §V2.5).
+  /// sha256 over the domain tag and BOTH verifying keys, so a client binding to it cannot be
+  /// fooled by swapping one key: the digest covers the pair.
+  func vkDigest() : Blob {
+    let hash = Sha256.Digest(#sha256);
+    hash.writeBlob(Text.encodeUtf8("zk-ledger/vk-anchor/v1"));
+    hash.writeBlob(Text.encodeUtf8(transfer_vk_hex));
+    hash.writeBlob(Text.encodeUtf8(deposit_vk_hex));
+    hash.sum()
+  };
+
+  /// Certified verifying-key anchor: digest(32) ‖ vk_epoch(8B BE). Present once the pool holds
+  /// verifying keys; absent before that, so the unconfigured certified tree is unchanged.
+  func vkAnchorLeaf() : ?Blob {
+    if (transfer_vk_hex.size() == 0 or deposit_vk_hex.size() == 0) return null;
+    let digest = Blob.toArray(vkDigest());
+    let epoch64 = vk_epoch;
+    ?Blob.fromArray(Array.tabulate<Nat8>(40, func(i) {
+      if (i < 32) digest[i]
+      else Nat8.fromNat(Nat64.toNat((epoch64 >> (8 * (7 - Nat64.fromNat(i - 32)))) & 0xff))
+    }))
+  };
+
   func pir2BoundaryLeaf() : ?Blob {
     if (not pir2_state.enabled) return null;
     switch (Pir2.latestBoundary(pir2_state)) {
@@ -944,7 +1194,13 @@ persistent actor ZkLedger {
 
   func nowNat64() : Nat64 { Nat64.fromNat(Int.abs(Time.now())) };
 
-  func auditFail(code : Text, index : Nat) : Bool {
+  /// The reply must carry WHERE to resume, as a REQUIRED field. A bare Bool says only THAT
+  /// there is more to do, so a caller restarts the scan -- reintroducing both the unbounded per-note
+  /// cost and the re-walk under a live entry_count. `?Nat64` is forbidden: null would let a caller resume
+  /// from nothing and reproduce the defect while appearing repaired.
+  type AuditChunkResult = { done : Bool; resume_cursor : Nat };
+
+  func auditFail(code : Text, index : Nat) : AuditChunkResult {
     audit_state := #fail({ code; index });
     if (guard_code == null) {
       guard_code := ?code;
@@ -952,14 +1208,14 @@ persistent actor ZkLedger {
     };
     audit_last_completed_at := ?nowNat64();
     refreshCertification();
-    true
+    { done = true; resume_cursor = audit_cursor }
   };
 
-  func auditPass() : Bool {
+  func auditPass() : AuditChunkResult {
     audit_state := #pass;
     audit_last_completed_at := ?nowNat64();
     refreshCertification();
-    true
+    { done = true; resume_cursor = audit_cursor }
   };
 
   /// Restart the audit from phase 0 and arm the tick chain. Called from postupgrade
@@ -979,7 +1235,7 @@ persistent actor ZkLedger {
     refreshCertification();
   };
 
-  type AuditSelf = actor { __audit_chunk : shared () -> async Bool };
+  type AuditSelf = actor { __audit_chunk : shared () -> async AuditChunkResult };
 
   /// The tick: ONE awaited self-call per tick (trap isolation — a trap inside the chunk
   /// rolls the chunk back and rejects the call; the catch arm here commits). Nothing
@@ -992,7 +1248,7 @@ persistent actor ZkLedger {
     var done = false;
     try {
       let self : AuditSelf = actor (Principal.toText(selfPrincipal()));
-      done := await self.__audit_chunk();
+      done := (await self.__audit_chunk()).done;
       audit_chunk_retries := 0;
     } catch (e) {
       audit_chunk_retries += 1;
@@ -1001,7 +1257,7 @@ persistent actor ZkLedger {
           case (#canister_error) "stable-state:audit-chunk-trap:" # Error.message(e);
           case (_) "audit:chunk-transient-exhausted:" # Error.message(e);
         };
-        done := auditFail(code, audit_cursor);
+        done := auditFail(code, audit_cursor).done;
       };
     };
     if (not done) {
@@ -1038,9 +1294,10 @@ persistent actor ZkLedger {
   /// order — layout+log header+index walk, the four set walks (header + slot count),
   /// statement version, the per-note walk, then the tail phases — producing the OLD
   /// error strings.
-  public shared ({ caller }) func __audit_chunk() : async Bool {
+  public shared ({ caller }) func __audit_chunk() : async AuditChunkResult {
     if (not Principal.equal(caller, selfPrincipal())) Runtime.trap("audit-chunk:self-only");
-    if (audit_state != #running) return true;
+    if (audit_state != #running) return { done = true; resume_cursor = audit_cursor };
+    let chunk_c0 = Prim.performanceCounter(0);
     audit_last_chunk_at := ?nowNat64();
     switch (audit_phase) {
       case (#log_index) {
@@ -1057,14 +1314,16 @@ persistent actor ZkLedger {
           audit_log_expected_offset := StableLog.dataStartOffset();
         };
         let from = Nat64.fromNat(audit_cursor);
-        switch (StableLog.validateIndexRange(note_log, from, AUDIT_INDEX_PER_CHUNK, audit_log_expected_offset)) {
+        // The cost predicate is supplied HERE because Main.mo holds the chunk's start counter;
+        // StableLog stays free of Prim. See V2-DESIGN.md.
+        switch (StableLog.validateIndexRange(note_log, from, AUDIT_INDEX_PER_CHUNK, audit_log_expected_offset, audit_log_captured_entries, func() : Bool { Prim.performanceCounter(0) - chunk_c0 >= AUDIT_INSTRUCTIONS_PER_CHUNK })) {
           case (#err(message)) return auditFail(message, audit_cursor);
-          case (#ok(next_offset)) {
-            audit_log_expected_offset := next_offset;
-            let stepped = Nat64.toNat(
-              (if (from + AUDIT_INDEX_PER_CHUNK > audit_log_captured_entries) audit_log_captured_entries else from + AUDIT_INDEX_PER_CHUNK) - from
-            );
-            audit_cursor += stepped;
+          case (#ok(walked)) {
+            audit_log_expected_offset := walked.offset;
+            // Advance to where the walk ACTUALLY stopped, not to where the clamp says it should
+            // have. Under an early cost exit those differ, and recomputing would skip unwalked
+            // entries -- silently, and in the direction that loses coverage.
+            audit_cursor := Nat64.toNat(walked.stopped_at);
           };
         };
         if (Nat64.fromNat(audit_cursor) >= audit_log_captured_entries) {
@@ -1073,7 +1332,7 @@ persistent actor ZkLedger {
           };
           auditAdvancePhase();
         };
-        false
+        { done = false; resume_cursor = audit_cursor }
       };
       case (#set_roots or #set_nullifiers or #set_shields or #set_unshields) {
         let (set, prefix, puts_now) = switch (auditSetTarget(audit_phase)) {
@@ -1086,19 +1345,34 @@ persistent actor ZkLedger {
             case (#ok(_)) {};
           };
           audit_set_captured_table := set.table_offset;
-          audit_set_captured_capacity := set.capacity;
+          // walkWidth, not capacity: during a migration window a set's entries live in BOTH tables,
+          // and a walk of the old table alone counts entry_count minus everything carried across so
+          // far — which would fail the observed-count check and FAIL-CLOSE THE LEDGER on a perfectly
+          // healthy pool. countTagsRange spans both tables over this width.
+          audit_set_captured_capacity := StableBlobSet.walkWidth(set);
           audit_set_captured_count := set.entry_count;
           audit_set_captured_puts := puts_now;
+          audit_set_captured_cursor := StableBlobSet.migrationCursor(set);
           audit_set_observed := 0;
         };
         // a grow moved the table mid-walk: restart this set's walk (bounded, loud)
-        if (set.table_offset != audit_set_captured_table or set.capacity != audit_set_captured_capacity) {
+        if (set.table_offset != audit_set_captured_table or
+            StableBlobSet.walkWidth(set) != audit_set_captured_capacity or
+            StableBlobSet.migrationCursor(set) != audit_set_captured_cursor) {
           audit_set_restarts += 1;
           if (audit_set_restarts > AUDIT_SET_RESTART_LIMIT) {
             return auditFail("audit:set-walk-contended", audit_cursor);
           };
           audit_cursor := 0;
-          return false;
+          // REG-1. A cost predicate stood here whose two branches returned the SAME value, so it
+          // decided nothing while its comment claimed the arm was cost-bounded — a guard that reads
+          // as a bound and implements none (CWE-561, dead code). Removed rather than repaired,
+          // because there is nothing here for a predicate to bound: this arm restarts the walk and
+          // YIELDS UNCONDITIONALLY on the next line. The chunk ends either way. A predicate can only
+          // bite where a LOOP would otherwise keep running — the #notes arm's `while`, and the
+          // #log_index arm, which threads one into StableLog.validateIndexRange because the loop is
+          // in the callee (the caller-supplied-predicate pattern). Neither shape exists here.
+          return { done = false; resume_cursor = audit_cursor };
         };
         let from = Nat64.fromNat(audit_cursor);
         switch (StableBlobSet.countTagsRange(set, audit_set_captured_table, audit_set_captured_capacity, from, AUDIT_SLOTS_PER_CHUNK)) {
@@ -1125,7 +1399,7 @@ persistent actor ZkLedger {
             audit_cursor := 0;
           };
         };
-        false
+        { done = false; resume_cursor = audit_cursor }
       };
       case (#notes) {
         if (audit_cursor == 0) {
@@ -1138,6 +1412,7 @@ persistent actor ZkLedger {
           List.clear(audit_detect_frontier.stack);
         };
         var stepped : Nat = 0;
+        var steppedBytes : Nat = 0;
         while (stepped < AUDIT_NOTES_PER_CHUNK and audit_cursor < noteCount()) {
           let encoded = switch (StableLog.get(note_log, audit_cursor)) {
             case (?value) value;
@@ -1170,6 +1445,14 @@ persistent actor ZkLedger {
           };
           audit_cursor += 1;
           stepped += 1;
+          steppedBytes += encoded.size();
+          // Checked AFTER at least one note has been processed, so a single note larger than
+          // the whole budget still makes progress and the walk can never stall.
+          if (steppedBytes >= AUDIT_BYTES_PER_CHUNK) return { done = false; resume_cursor = audit_cursor };
+          // Bound COST as well as work. Exits with the cursor, so the next chunk resumes.
+          if (Prim.performanceCounter(0) - chunk_c0 >= AUDIT_INSTRUCTIONS_PER_CHUNK) {
+            return { done = false; resume_cursor = audit_cursor };
+          };
         };
         // the tail comparison must be atomic with walk completion: run it in the SAME
         // message the cursor catches the live noteCount() in
@@ -1188,13 +1471,17 @@ persistent actor ZkLedger {
           audit_phase := #tail;
           return auditPass();
         };
-        false
+        { done = false; resume_cursor = audit_cursor }
       };
       case (#tail) {
         // reachable only if a terminal transition was interrupted; re-run the tail
         if (audit_expected_parent != last_block_hash and audit_cursor < noteCount()) {
           audit_phase := #notes;
-          return false;
+          // REG-1, same dead-predicate shape as the set arm above and removed for the same reason:
+          // this arm hands control back to #notes and yields on the next line, so no predicate can
+          // bound anything here. The cost bound for the work this schedules lives where the loop
+          // is — inside the #notes `while`.
+          return { done = false; resume_cursor = audit_cursor };
         };
         switch (detectChainAuditTail()) {
           case (?code) return auditFail(code, audit_cursor);
@@ -1324,6 +1611,109 @@ persistent actor ZkLedger {
   /// Admin recovery: rebuild the ENTIRE detect-chain anchor from the note log. Run
   /// restart_audit afterwards — a green audit over the rebuilt anchor is the recovery
   /// proof (and the only path to clearing a tripped guard).
+  /// A5: resume a rebuild that gave up, WITHOUT discarding what it already did.
+  ///
+  /// `detectRebuildFail` clears `detect_rebuild_active`, so `detect_chain_rebuild` can already restart —
+  /// the stop was never permanent. What it cannot do is continue: it resets `detect_rebuild_cursor`
+  /// to 0 and clears the boundary and frontier lists, so every give-up throws away the whole run.
+  /// On a large note set a rebuild that keeps meeting transient failures then never finishes,
+  /// because each third consecutive failure returns it to the start.
+  ///
+  /// This is the same entry point minus those four resets: it clears the error and the consecutive
+  /// failure count, and re-arms the tick from wherever the cursor stands.
+  /// Drive the chunked relocation of the spent-nullifier table. Administrator-only
+  /// and never called from a product path — the automatic reclamation in `put` stays bounded to one
+  /// message, and this is the operator-driven route for a table too large for that.
+  ///
+  /// Refused while an audit is running: the audit captures `table_offset` at its start and walks
+  /// the set across messages, and its exactness depends on the set being quiescent for the length of
+  /// that walk. Moving slots under it would break that, so the guard preserves the invariant rather
+  /// than weakening it.
+  public shared ({ caller }) func compact_nullifier_set(budget : Nat64) : async Result<Bool> {
+    if (not isAdministrator(caller)) return #err("REJECT:not-administrator");
+    if (audit_state == #running) return #err("REJECT:audit-running");
+    #ok(StableBlobSet.compactStep(spent_nullifiers, budget))
+  };
+
+  /// Old tables were retained and nothing pruned, and the chunked reclamation
+  /// above reached exactly ONE of the four StableBlobSet instances. Since `312ada4` EVERY `put`
+  /// reclaims automatically, for every set size, by draining a bounded `compactStep` slice per call
+  /// (`compactIfBounded`, the old inline wholesale reclaim, was REMOVED — see `StableBlobSet.mo`).
+  /// So the value path keeps a set's own superseded tables reclaimed on its own; this ADMIN entry
+  /// exists to reclaim a set that is NOT being written to (a `historical_roots`,
+  /// `completed_shield_intents` or `completed_unshield_intents` that has gone quiet keeps its
+  /// superseded tables until something puts to it, and the operator may want them back sooner). Same
+  /// admin gate and same audit-running refusal as the nullifier entry point; `compact_nullifier_set`
+  /// is left in place.
+  public shared ({ caller }) func compact_set(target : CompactTarget, budget : Nat64) : async Result<Bool> {
+    if (not isAdministrator(caller)) return #err("REJECT:not-administrator");
+    if (audit_state == #running) return #err("REJECT:audit-running");
+    let set = switch (target) {
+      case (#roots) historical_roots;
+      case (#nullifiers) spent_nullifiers;
+      case (#shields) completed_shield_intents;
+      case (#unshields) completed_unshield_intents;
+    };
+    let before = Prim.performanceCounter(0);
+    let done = StableBlobSet.compactStep(set, budget);
+    compact_instructions := Prim.performanceCounter(0) - before;
+    #ok(done)
+  };
+
+  /// Instructions consumed by the last compact_set call. openWindow drains an entire live
+  /// compaction in ONE message, so the headroom between this number and the 40e9 update budget is
+  /// what decides whether a growth-triggering put can trap while a compaction is open.
+  /// Admin-gated on the same precedent as `is_nullifier_spent`, which traps for anonymous callers.
+  /// Added ungated, this telemetry would itself have enumerated unauthenticated public entries --
+  /// exactly the class the admin gate exists to police.
+  // ADMIN-GATED QUERY — READ THIS BEFORE ADDING A FOURTH ONE.
+  //
+  // Three queries in this actor gate on isAdministrator: this one, `finalize_divergence` and
+  // `pending_intent_detail`. A QUERY IS ANSWERED BY A SINGLE REPLICA WITHOUT CONSENSUS. The caller
+  // identity itself is sound -- the ingress message is signed, so `caller` cannot be forged -- but
+  // nothing forces a replica to RUN this check. A compromised replica can decline to enforce it and
+  // serve the administrator answer to anyone, and no other replica ever sees the request.
+  //
+  // For `pending_intent_detail` and `finalize_divergence` that specifically restores the
+  // note-to-account linkability the salted-handle work closed: those two are the only places the
+  // RAW intent handle is reachable.
+  //
+  // WHY IT IS ACCEPTABLE HERE, and it is only acceptable while this stays written down: these are
+  // CONFIDENTIALITY gates, not authorisation on a state change. No money moves through a query, and
+  // no query mutates state, so the worst case is disclosure to someone who reached a dishonest
+  // replica -- not theft and not corruption. A gate that must resist a malicious replica belongs on
+  // an UPDATE call, which goes through consensus, or the answer must be certified.
+  //
+  // So: if you add a fourth admin-gated query, decide which kind it is. Confidentiality-only can
+  // live here. Anything an attacker could act on must not.
+  public query ({ caller }) func compact_cost() : async Nat64 {
+    if (not isAdministrator(caller)) Runtime.trap("REJECT:not-administrator");
+    compact_instructions
+  };
+
+  public shared ({ caller }) func detect_chain_rebuild_resume() : async Result<()> {
+    // NOT guardRejection()-gated, and its sibling `detect_chain_rebuild` is not either. A give-up
+    // is frequently CAUSED by state the audit guard objects to, so guarding the resume made it
+    // unreachable in precisely the situation it exists for: the operator was left with only the
+    // entry point that discards progress. Measured — after a give-up at cursor 8000 the resume
+    // returned `GUARDED:stable-state-audit-failed:note-codec:magic` while the restart ran.
+    if (not isAdministrator(caller)) return #err("REJECT:not-administrator");
+    if (not detect_chain_enabled) return #err("REJECT:detect-chain-not-enabled");
+    // Two stalls, one entry point. (a) the retry limit gave up: active is false, error is set.
+    // (b) an upgrade landed mid-rebuild: Motoko timers do not survive an upgrade, so the tick chain
+    // is gone while `detect_rebuild_active` is still true and the cursor is frozen — nothing will
+    // ever re-arm it. Gating on "must have failed" would leave (b) stuck forever, which is the
+    // worse of the two because it presents as still running.
+    if (detect_rebuild_cursor == 0 and detect_rebuild_error == null) {
+      return #err("REJECT:detect-rebuild-nothing-to-resume");
+    };
+    detect_rebuild_active := true;
+    detect_rebuild_error := null;
+    detect_rebuild_retries := 0;
+    ignore Timer.setTimer<system>(#seconds 0, detectRebuildTick);
+    #ok(())
+  };
+
   public shared ({ caller }) func detect_chain_rebuild() : async Result<()> {
     if (not isAdministrator(caller)) return #err("REJECT:not-administrator");
     if (not detect_chain_enabled) return #err("REJECT:detect-chain-not-enabled");
@@ -1380,7 +1770,7 @@ persistent actor ZkLedger {
     record_count : Nat;
     note_count : Nat;
     // derived-index surface (all additive): the freshness watermark and the health of the
-    // background fold driver — the ops dashboard for reviewer point #5's containment story
+    // background fold driver — the ops dashboard for the derived-index containment story
     indexed_upto : Nat;
     lag : Nat;
     index_status : Pir2IndexStatus;
@@ -1392,7 +1782,10 @@ persistent actor ZkLedger {
     repair : ?Pir2RepairStatus;
   };
   public type Pir2Params = {
-    lwe_dimension : Nat;
+    /// Renamed from `lwe_dimension`: this field carries `Pir2.LWE_N`, the HINT
+    /// dimension, not `LWE_DIMENSION`. The old name invited sizing a buffer from the wrong
+    /// constant. The check stays: sizing from the other constant must STILL trap.
+    hint_lwe_n : Nat;
     record_bytes : Nat;
     shard_size : Nat;
     records_per_column : Nat;
@@ -1475,6 +1868,9 @@ persistent actor ZkLedger {
   /// the failure record and the backoff. The idle path is O(1) and self-call-free. While the
   /// sticky audit guard is set the driver pauses: fail-closed extends to derived state (D17).
   func pir2DriverTick() : async () {
+    // A deterministic trap will recur, so stop re-arming instead of burning a chunk every 64s
+    // forever. pir2_reindex clears this, which is the operator's way back.
+    if (pir2_fold_terminal) return;
     if (not pir2_state.enabled) return;
     if (pir2_fold_inflight) return;
     if (guard_code != null) return;
@@ -1490,14 +1886,17 @@ persistent actor ZkLedger {
       let self : Pir2FoldSelf = actor (Principal.toText(selfPrincipal()));
       progressed := await self.__pir2_fold_chunk(trapNow);
       pir2_fold_retries := 0;
+      pir2_fold_trap_streak := 0;
       pir2_last_fold_error := null;
       pir2_fold_backoff_until := 0;
     } catch (e) {
       pir2_fold_retries += 1;
-      let prefix = switch (Error.code(e)) {
-        case (#canister_error) "pir2-fold-trap:";
-        case (_) "pir2-fold-transient:";
-      };
+      let isTrap = switch (Error.code(e)) { case (#canister_error) true; case (_) false };
+      if (isTrap) {
+        pir2_fold_trap_streak += 1;
+        if (pir2_fold_trap_streak >= PIR2_FOLD_FAILURE_LIMIT) pir2_fold_terminal := true;
+      } else { pir2_fold_trap_streak := 0 };
+      let prefix = if (isTrap) "pir2-fold-trap:" else "pir2-fold-transient:";
       pir2_last_fold_error := ?(prefix # Error.message(e));
       // exponential backoff, capped at 64s; the recurring watchdog retries after it expires
       let shift = Nat.min(pir2_fold_retries, 6);
@@ -1587,6 +1986,8 @@ persistent actor ZkLedger {
   /// nearest DPAGE checkpoint, then hands the chunked replay/zero/refold to the fold driver.
   /// Transfers are unaffected throughout by construction.
   public shared ({ caller }) func pir2_reindex(fromShard : Nat) : async Result<Pir2Status> {
+    pir2_fold_terminal := false;
+    pir2_fold_trap_streak := 0;
     if (not isAdministrator(caller)) return #err("REJECT:not-administrator");
     switch (guardRejection()) { case (?message) return #err(message); case null {} };
     if (not pir2_state.enabled) return #err("REJECT:pir2-not-enabled");
@@ -1614,7 +2015,7 @@ persistent actor ZkLedger {
     if (not pir2_state.enabled) return #err("REJECT:pir2-not-enabled");
     let g = Pir2.geometry(pir2_state.shard_size);
     #ok({
-      lwe_dimension = Pir2.LWE_N;
+      hint_lwe_n = Pir2.LWE_N;
       record_bytes = Pir2.RECORD_BYTES;
       shard_size = pir2_state.shard_size;
       records_per_column = g.records_per_column;
@@ -1704,8 +2105,65 @@ persistent actor ZkLedger {
   };
 
   system func postupgrade() {
+    // Re-assert on every upgrade — a constant can change between builds.
+    assertAuditProgressConstants();
+    // Seed the publish salt on every upgrade. Seeding only inside shield/confidential_transfer
+    // left it empty whenever neither had been accepted, so a pending could be published before any
+    // salt existed. Same #seconds 0 timer pattern the audit driver uses.
+    ignore Timer.setTimer<system>(#seconds 0, seedIntentPublishSalt);
     let heap_before = Prim.rts_heap_size();
     configuring := false;
+    // Cleared HERE for the same reason `configuring` is, and the reason is the IC's await
+    // semantics rather than tidiness: an await is a COMMIT POINT. `configure_token_ledger` sets
+    // `token_configuring := true` and then awaits the token ledger's `icrc1_fee`/`icrc1_decimals`;
+    // that `true` is committed at the await, while every line that clears it lives in a
+    // CONTINUATION. An upgrade landing mid-await discards the continuation, so without this line
+    // the flag survives as `true` with nothing left to clear it, and the in-progress guard refuses
+    // EVERY later configuration permanently -- an unrecoverable pool, fixable only by shipping new
+    // code. postupgrade is the only place guaranteed to run after the continuation is lost, which
+    // is what makes it the correct home rather than a timeout or a lease.
+    //
+    // Clearing is safe because there is nothing to resume: an interrupted token configuration wrote
+    // no state (the writes all sit after the awaits), so the next attempt starts from the same
+    // place the interrupted one did. That is the difference from `detect_rebuild_active`, which is
+    // deliberately NOT cleared below but RE-DRIVEN, because its work IS resumable.
+    token_configuring := false;
+    // Bounded scan: the live tree_state root + its 32 lanes, plus each pending's
+    // commitments — ~33 values plus O(pendings), NOT a walk of the note set.
+    let offenders = List.empty<Text>();
+    switch (tree_state) {
+      case (?state) {
+        switch (PoseidonTree.parseFieldElement(state.root)) {
+          case (?_) {}; case null List.add(offenders, "root:" # state.root);
+        };
+        for (lane in state.filled.vals()) {
+          switch (PoseidonTree.parseFieldElement(lane)) {
+            case (?_) {}; case null List.add(offenders, "lane:" # lane);
+          };
+        };
+      };
+      case null {};
+    };
+    switch (pending_shield) {
+      case (?p) {
+        switch (PoseidonTree.parseFieldElement(blobToHex(p.output.commitment))) {
+          case (?_) {}; case null List.add(offenders, "shield-commitment:" # blobToHex(p.output.commitment));
+        };
+      };
+      case null {};
+    };
+    switch (pending_unshield) {
+      case (?p) {
+        for (o in [p.output_1, p.output_2].vals()) {
+          switch (PoseidonTree.parseFieldElement(blobToHex(o.commitment))) {
+            case (?_) {}; case null List.add(offenders, "unshield-commitment:" # blobToHex(o.commitment));
+          };
+        };
+      };
+      case null {};
+    };
+    state_quarantine_values := List.toArray(offenders);
+    state_quarantine := state_quarantine_values.size() > 0;
     switch (validateStableStateBounded()) {
       case (#ok(_)) {};
       case (#err(message)) Runtime.trap("postupgrade:" # message);
@@ -1780,9 +2238,17 @@ persistent actor ZkLedger {
   };
 
   func hexToBlob(value : Text) : ?Blob {
+    // Bound the decode IN THE LOOP. Every caller decodes a tree ROOT — a 32-byte field
+    // element = 64 hex chars — and rejects any non-32-byte result (`root.size() != 32`), so an
+    // over-long input was already refused; this only stops the unbounded work/allocation the loop
+    // did on a misbehaving-oracle string. Bailing at the 65th char via the LAZY char iterator is
+    // O(1) (a `value.size() > 64` pre-check would instead be O(len) — `Text.size` walks the rope).
     let output = List.empty<Nat8>();
     var high : ?Nat8 = null;
+    var seen : Nat = 0;
     for (c in value.chars()) {
+      seen += 1;
+      if (seen > 64) return null;
       let nibble = switch (hexNibble(c)) { case (?n) n; case null return null };
       switch (high) {
         case null { high := ?nibble };
@@ -1837,6 +2303,23 @@ persistent actor ZkLedger {
         switch (hexToBlob(state.root)) {
           case (?root) { if (root.size() != 32) return #err("REJECT:tree-root-length") };
           case null return #err("REJECT:tree-root-hex");
+        };
+        // INTAKE now admits exactly what the read path admits. Both the root and ALL
+        // THIRTY-TWO lanes go through the one smart constructor; the lanes were previously
+        // COUNT-CHECKED ONLY, so a stored TreeState could carry 32 well-formed but non-canonical
+        // lanes that `frontierAppend` would later refuse at `REJECT:frontier-field` — stranding the
+        // intent after the money moved. A root-only remedy relocates the strand to that exit.
+        // REJECTED, NOT REDUCED: reduction mod Fr.P gives one value two encodings, and roots are
+        // compared AS HEX TEXT here, so a reduced value would no longer equal the text it came from.
+        switch (PoseidonTree.parseFieldElement(state.root)) {
+          case (?_) {};
+          case null return #err("REJECT:tree-root-noncanonical");
+        };
+        for (lane in state.filled.vals()) {
+          switch (PoseidonTree.parseFieldElement(lane)) {
+            case (?_) {};
+            case null return #err("REJECT:tree-lane-noncanonical");
+          };
         };
         #ok(state)
       };
@@ -1991,17 +2474,25 @@ persistent actor ZkLedger {
     }
   };
 
-  func appendBlock(
+  /// The block a note append WOULD write, as a pure function of its arguments and the tail it is
+  /// given. Split out of appendBlock so a PREPARE phase can build and encode a block BEFORE any
+  /// money moves, leaving the commit with nothing to do but write bytes it already holds.
+  ///
+  /// `position` and `phash` are parameters rather than reads of `noteCount()` and `last_block_hash`
+  /// because PREPARE has to build two blocks at once: the second one's phash is the hash of the
+  /// first, so neither can be derived from live state at the time the second is built.
+  func buildNoteBlock(
     output : OutputRecord,
     nullifiers : [Blob],
     anchor : Blob,
     rootAfter : Blob,
     origin : NoteOrigin,
-  ) {
-    let position = noteCount();
-    let block : ShieldedNoteBlock = {
+    position : Nat,
+    phash : ?Blob,
+  ) : ShieldedNoteBlock {
+    {
       btype = "zknote1";
-      phash = last_block_hash;
+      phash;
       encoding_version = ENCODING_VERSION;
       note_position = position;
       commitment = output.commitment;
@@ -2012,11 +2503,35 @@ persistent actor ZkLedger {
       note_root_after = rootAfter;
       timestamp = Nat64.fromNat(Int.abs(Time.now()));
       origin;
-    };
+    }
+  };
+
+  func appendBlock(
+    output : OutputRecord,
+    nullifiers : [Blob],
+    anchor : Blob,
+    rootAfter : Blob,
+    origin : NoteOrigin,
+  ) {
+    let position = noteCount();
+    let block = buildNoteBlock(output, nullifiers, anchor, rootAfter, origin, position, last_block_hash);
     let encoded = switch (NoteCodec.encode(block)) {
       case (#ok(value)) value;
       case (#err(message)) Runtime.trap(message);
     };
+    commitNoteBytes(encoded, position, ICRC3.hashValue(NoteAudit.blockValue(block)), output.note_ciphertext);
+  };
+
+  /// Write bytes that are already in hand. Everything fallible about a note append has happened
+  /// before this is called — the encoding, and the region headroom that makes StableLog.append
+  /// unable to reach its `out of stable memory` trap.
+  ///
+  /// The one remaining unbounded operation is DetectChain.append, which every DPAGE-th note pushes
+  /// onto a doubling heap List and recomputes a Merkle root. It cannot be hoisted and it cannot be
+  /// pre-reserved, so the totality of this function is CONDITIONAL on
+  /// detect_chain_enabled being false, which is its default. That condition is asserted where
+  /// totality is measured rather than assumed here.
+  func commitNoteBytes(encoded : Blob, position : Nat, blockHash : Blob, ciphertext : Blob) {
     switch (StableLog.append(note_log, encoded)) {
       case (#ok(index)) { if (index != position) Runtime.trap("stable-state:note-position") };
       case (#err(message)) Runtime.trap(message);
@@ -2028,11 +2543,11 @@ persistent actor ZkLedger {
     note_log_chain_digest := chain.sum();
     // certified detection-stream anchor: fold this note's 48-B detection entry
     // (pos BE8 ‖ note_ciphertext[0..40]); a DPAGE boundary + Merkle root update happen inside.
-    if (detect_chain_enabled) DetectChain.append(detect_chain_state, detect_chain_frontier, position, Blob.toArray(output.note_ciphertext));
-    last_block_hash := ?ICRC3.hashValue(NoteAudit.blockValue(block));
+    if (detect_chain_enabled) DetectChain.append(detect_chain_state, detect_chain_frontier, position, Blob.toArray(ciphertext));
+    last_block_hash := ?blockHash;
     // NO PIR code here — the append is authoritative and complete without the derived
-    // index; the background fold driver trails it (derived-index decoupling, reviewer
-    // point #5). A PIR fault can degrade queries, never this message.
+    // index; the background fold driver trails it (derived-index decoupling).
+    // A PIR fault can degrade queries, never this message.
   };
 
   func validateOutput(output : OutputRecord) : ?Text {
@@ -2049,8 +2564,29 @@ persistent actor ZkLedger {
     depositVkHex : Text,
   ) : async Result<LedgerStatus> {
     switch (guardRejection()) { case (?message) return #err(message); case null {} };
+    // This operation CREATES the administrator role — it ends with
+    // `administrator := ?caller` — and it used to check nothing, so the first principal to call it
+    // on a freshly installed canister owned the pool: the proving system, the root source, the
+    // frontier gate, the guard-clearing path, and the unredacted in-flight intents. Every consumer
+    // of the role was gated with isAdministrator; the operation that mints it was not.
+    //
+    // A controller is the only principal the platform already knows is entitled to this canister —
+    // it installed the wasm — so that is the binding, and it cannot be raced because the controller
+    // set is platform state rather than ledger state.
+    if (not Principal.isController(caller)) return #err("REJECT:not-controller");
     if (configured() or configuring) return #err("REJECT:already-configured");
     if (transferVkHex.size() == 0 or depositVkHex.size() == 0) return #err("REJECT:empty-vk");
+    // Pre-flight refusal. Estimate each preparation's cost from the vk length BEFORE running it,
+    // and refuse the whole call if either would exceed the message ceiling — while NOTHING has been
+    // touched (`configuring` is still false, no field assigned), so a refusal here leaves a pool a
+    // caller can immediately retry with smaller keys. This is checked for BOTH keys together even
+    // though the fix split their preparations across the await: each still runs in-process in its own
+    // message, so each must be admissible on its own, and reporting the failure up front beats
+    // discovering it 8-12e9 instructions into the transfer key with the deposit key still ahead.
+    if (estimatedVkPrepareInstructions(transferVkHex) > VK_PREPARE_INSTR_CEILING or
+        estimatedVkPrepareInstructions(depositVkHex) > VK_PREPARE_INSTR_CEILING) {
+      return #err("REJECT:vk-prepare-budget");
+    };
     // Parse + validate + prepare both verifying keys NOW (in-process, no await, no state
     // change on failure): every vk point is subgroup-checked and the three fixed G2 pairs are
     // precomputed once, so no per-proof message ever re-validates the vk.
@@ -2058,10 +2594,7 @@ persistent actor ZkLedger {
       case (?vk) vk;
       case null return #err("REJECT:vk-deserialize:transfer");
     };
-    let depositPrepared = switch (Groth16Wire.parseAndPrepareVk(depositVkHex)) {
-      case (?vk) vk;
-      case null return #err("REJECT:vk-deserialize:deposit");
-    };
+    configure_prepare_instructions := Prim.performanceCounter(0);
     configuring := true;
     let oracle : TreeOracle = actor (Principal.toText(treeOracleId));
     let response = try { await oracle.empty() } catch (error) {
@@ -2072,11 +2605,23 @@ persistent actor ZkLedger {
       case (#ok(state)) state;
       case (#err(message)) { configuring := false; return #err(message) };
     };
+    // The DEPOSIT vk is prepared here, after the await, not alongside the transfer vk above.
+    // Preparing both before the await put 20,428,523,632 instructions — 51.1% of the 40e9 budget —
+    // into ONE message, superlinear in vk size, so a pool with modestly larger keys could not be
+    // configured at all. An await starts a fresh message with a fresh budget, so splitting the two
+    // preparations across it roughly halves the peak without changing what is prepared or when it
+    // becomes visible: both land in the same commit below, and a failure here still clears
+    // `configuring` and leaves no partial state, exactly as the pre-await parse did.
+    let depositPrepared = switch (Groth16Wire.parseAndPrepareVk(depositVkHex)) {
+      case (?vk) vk;
+      case null { configuring := false; return #err("REJECT:vk-deserialize:deposit") };
+    };
     if (configured()) { configuring := false; return #err("REJECT:configuration-race") };
     verifier_id := ?verifierId;
     tree_oracle_id := ?treeOracleId;
     transfer_vk_hex := transferVkHex;
     deposit_vk_hex := depositVkHex;
+    vk_epoch += 1;
     transfer_vk_prepared := ?transferPrepared;
     deposit_vk_prepared := ?depositPrepared;
     transfer_vk_flat := ?Groth16Multi.prepareFlatVk(transferPrepared);
@@ -2116,6 +2661,7 @@ persistent actor ZkLedger {
     };
     transfer_vk_hex := newTransferVkHex;
     deposit_vk_hex := newDepositVkHex;
+    vk_epoch += 1;
     transfer_vk_prepared := ?transferPrepared;
     deposit_vk_prepared := ?depositPrepared;
     transfer_vk_flat := ?Groth16Multi.prepareFlatVk(transferPrepared);
@@ -2134,9 +2680,17 @@ persistent actor ZkLedger {
     switch (guardRejection()) { case (?message) return #err(message); case null {} };
     if (not isAdministrator(caller)) return #err("REJECT:not-administrator");
     if (not configured()) return #err("REJECT:unconfigured");
-    if (pending_shield != null or pending_unshield != null) {
-      return #err("REJECT:pending-token-mutation");
-    };
+    // The pending check guards the DISABLE direction ONLY. It used to sit here,
+    // above the branch, freezing the flag in BOTH directions while an intent was in flight —
+    // which made recovery by a single admin call impossible and turned the finalize refusal into a PERMANENT
+    // funds-availability deadlock: money already moved, intent unable to finalize, flag unable
+    // to be enabled to let it finalize, and no release path applicable because the transfer landed.
+    //
+    // ENABLING while pending is safe because it can only ADD a check. It cannot invalidate a
+    // captured `root_after` — the pending already carries that value, and the finalize cross-check
+    // merely recomputes locally and compares. Disagreement is exactly the detection this exists
+    // for; agreement finalizes as before. DISABLING while pending is the genuinely unsafe
+    // direction — that is what strands a settled intent — and it stays blocked.
     if (enabled) {
       let state = currentTree();
       if (state.filled.size() != PoseidonTree.DEPTH) return #err("REJECT:frontier-length");
@@ -2145,8 +2699,11 @@ persistent actor ZkLedger {
       };
       if (PoseidonTree.hexToNat(state.root) == null) return #err("REJECT:root-field");
       ignore frontierZeros();
-    } else if (tree_oracle_id == null) {
-      return #err("REJECT:no-tree-oracle");
+    } else {
+      if (pending_shield != null or pending_unshield != null) {
+        return #err("REJECT:pending-token-mutation");
+      };
+      if (tree_oracle_id == null) return #err("REJECT:no-tree-oracle");
     };
     tree_frontier_enabled := enabled;
     #ok(statusValue())
@@ -2169,6 +2726,9 @@ persistent actor ZkLedger {
     tree_oracle_id := oracle;
     #ok(statusValue())
   };
+
+  /// Telemetry: instructions used by `configure` before its first await.
+  public query func configure_cost() : async Nat64 { configure_prepare_instructions };
 
   public query func tree_frontier_status() : async { enabled : Bool; tree_oracle : ?Principal } {
     { enabled = tree_frontier_enabled; tree_oracle = tree_oracle_id }
@@ -2220,6 +2780,7 @@ persistent actor ZkLedger {
   func statusValue() : LedgerStatus {
     {
       configured = configured();
+      administrator;
       note_root;
       note_count = noteCount();
       log_length = noteCount();
@@ -2233,6 +2794,12 @@ persistent actor ZkLedger {
   };
 
   public query func status() : async LedgerStatus { statusValue() };
+
+  /// Names the values that put this pool in quarantine, so the operator can see
+  /// WHAT is wrong rather than only THAT something is. Empty when the pool is clean.
+  public query func quarantine_status() : async (Bool, [Text]) {
+    (state_quarantine, state_quarantine_values)
+  };
 
   public query func recipient_binding(recipient : ICRC2.Account) : async Result<Blob> {
     recipientBindingValue(recipient)
@@ -2249,6 +2816,7 @@ persistent actor ZkLedger {
       layout_version = stable_layout_version;
       note_entries = noteCount();
       note_bytes = StableLog.dataSize(note_log);
+      note_log_region_bytes = (StableLog.regionBytes(note_log)).0;
       note_digest = note_log_chain_digest;
       root_entries = rootCount();
       root_capacity = Nat64.toNat(historical_roots.capacity);
@@ -2269,6 +2837,32 @@ persistent actor ZkLedger {
     }
   };
 
+  func redactPendingShield(pending : ?PendingShield) : ?AtomicityPending {
+    switch (pending) {
+      case null null;
+      case (?p) ?{
+        intent_id = publishedIntentId(p.intent_id);
+        base_epoch = p.base_epoch;
+        attempts = p.attempts;
+        verifier_outcome = p.verifier_outcome;
+        ledger_tip_before = p.ledger_tip_before;
+      };
+    }
+  };
+
+  func redactPendingUnshield(pending : ?PendingUnshield) : ?AtomicityPending {
+    switch (pending) {
+      case null null;
+      case (?p) ?{
+        intent_id = publishedIntentId(p.intent_id);
+        base_epoch = p.base_epoch;
+        attempts = p.attempts;
+        verifier_outcome = p.verifier_outcome;
+        ledger_tip_before = p.ledger_tip_before;
+      };
+    }
+  };
+
   func atomicityStatusValue() : AtomicityStatus {
     {
       token_configured = tokenConfigured();
@@ -2277,8 +2871,8 @@ persistent actor ZkLedger {
       transparent_ledger_fee;
       transparent_ledger_decimals;
       pool_account = poolAccount();
-      pending = pending_shield;
-      pending_unshield;
+      pending = redactPendingShield(pending_shield);
+      pending_unshield = redactPendingUnshield(pending_unshield);
       completed_intents = completedShieldCount();
       completed_intent_digest = shields_fold_digest;
       completed_unshield_intents = completedUnshieldCount();
@@ -2288,6 +2882,60 @@ persistent actor ZkLedger {
   };
 
   public query func atomicity_status() : async AtomicityStatus { atomicityStatusValue() };
+
+  // The finalize-frontier divergence observable. Corruption-only and non-blocking (it never
+  // trips the sticky guard, so the resume still converges the money). It lets the operator watch
+  // `count` for a finalize-time frontier/oracle divergence that leaves an intent pending.
+  //
+  // `last_intent` USED TO BE THE RAW `intentId` assigned at the two finalize mismatch sites, on an
+  // unauthenticated query — the same handle `redactPendingShield`/`redactPendingUnshield` salt
+  // before publishing, so this method re-opened by the back door the linkability those two sites
+  // close. The remedy is BOTH available controls, not a choice between them, because they fail
+  // independently:
+  //
+  //   * SALTED for everyone else, via the same `publishedIntentId` the other two publish sites use.
+  //     One handle derivation for every published exposure means a reader correlating this method
+  //     with `atomicity_status()` still sees the SAME handle for the SAME intent — the observable
+  //     stays useful — while nobody outside learns the raw one. `publishedIntentId` fails CLOSED on
+  //     an unseeded salt (returns ""), and a query cannot seed it, so the withheld case is the
+  //     empty handle and never the raw bytes.
+  //   * ADMINISTRATOR sees the raw handle, matching `pending_intent_detail` directly below: the
+  //     unredacted record is an administrator affordance, not a public one.
+  //
+  // `count` stays open to every caller deliberately. It is an aggregate with no note-to-account
+  // linkage, and it exists so the operator — not only the administrator — can watch it; gating the
+  // count would defeat the observable to buy no privacy. This is the RFC 6973 §6.1 data-minimisation
+  // reading: publish the aggregate, withhold the identifier. Defence in depth over a single control
+  // is Saltzer & Schroeder's fail-safe defaults + least privilege (Proc. IEEE 63(9), 1975).
+  //
+  // NON-BLOCKING PRESERVED STRUCTURALLY: a `query` mutates nothing, so this cannot reach
+  // `flipFrontierGuard` (:2050) and cannot affect the resume. No state, no guard, no money.
+  // Single-replica answer, no consensus: see the note on `compact_cost`. This is the second of the
+  // two sites where the RAW handle is reachable, so the administrator branch below is only as
+  // strong as the replica answering it. Confidentiality only; no state changes here.
+  public query ({ caller }) func finalize_divergence() : async { count : Nat; last_intent : ?Blob } {
+    let handle = switch (finalize_frontier_mismatch_last) {
+      case null null;
+      case (?id) { if (isAdministrator(caller)) ?id else ?publishedIntentId(id) };
+    };
+    { count = finalize_frontier_mismatch_count; last_intent = handle }
+  };
+
+  /// The unredacted in-flight intents, for the administrator only. Same record shapes the
+  /// public status used to carry, so an operational consumer moves by changing the call target
+  /// and nothing else. Caller-bound deliberately: these records link a shielded note to a
+  /// transparent account, which is exactly what the pool must not publish.
+  public query ({ caller }) func pending_intent_detail() : async Result<{
+    shield : ?PendingShield;
+    unshield : ?PendingUnshield;
+  }> {
+    // Single-replica answer, no consensus: see the note on `compact_cost` above. This is one of
+    // the two sites where the RAW intent handle is reachable, so a replica that declines to
+    // enforce this gate restores exactly the linkability the salted handle closed. Acceptable
+    // because it is confidentiality only -- no state changes and no money moves through a query.
+    if (not isAdministrator(caller)) return #err("REJECT:not-administrator");
+    #ok({ shield = pending_shield; unshield = pending_unshield })
+  };
 
   public shared ({ caller }) func test_arm_fail_after_token_once() : async Result<()> {
     switch (guardRejection()) { case (?message) return #err(message); case null {} };
@@ -2367,6 +3015,31 @@ persistent actor ZkLedger {
     }
   };
 
+  /// The on-chain verifying-key anchor a client pins its local proving keys to.
+  ///
+  /// `digest` and `epoch` are exactly the two halves of the certified `vk` leaf, so a client
+  /// that wants subnet-verifiable truth reads `icrc3_get_tip_certificate`, verifies the
+  /// certificate against the IC root key, and finds this same 40-byte value at label "vk"
+  /// inside the hash tree — this query is the convenience form of that leaf, not a second
+  /// source. `transfer_vk_hex`/`deposit_vk_hex` are returned so a client can recompute the
+  /// digest itself rather than trusting this reply's `digest` field.
+  public query func verifying_key_anchor() : async {
+    transfer_vk_hex : Text;
+    deposit_vk_hex : Text;
+    digest : Blob;
+    epoch : Nat64;
+    certified : Bool;
+  } {
+    {
+      transfer_vk_hex;
+      deposit_vk_hex;
+      digest = vkDigest();
+      epoch = vk_epoch;
+      // false only while unconfigured, i.e. exactly when the certified tree carries no vk leaf
+      certified = vkAnchorLeaf() != null;
+    }
+  };
+
   public query func icrc3_get_tip_certificate() : async ?DataCertificate {
     if (noteCount() == 0) return null;
     switch (CertifiedData.getCertificate()) {
@@ -2377,11 +3050,28 @@ persistent actor ZkLedger {
     }
   };
 
-  public query func is_nullifier_spent(nullifier : Blob) : async Bool {
+  /// An unauthenticated membership oracle. Witnessed: the SAME anonymous caller, on the
+  /// SAME nullifier bytes, gets `(false)` before the unshield and `(true)` after — so `2vxsx-fae`
+  /// can watch a specific note be consumed on a pool it has no relationship with.
+  ///
+  /// Gated rather than dropped, and gated rather than left, on this test: gating is theatre
+  /// when the answer is recomputable off-chain, which is why `recipient_binding` was deliberately
+  /// left open. Nullifier membership is NOT recomputable by an outsider — it exists only in
+  /// `spent_nullifiers` — so refusing it removes information rather than pretending to.
+  public query ({ caller }) func is_nullifier_spent(nullifier : Blob) : async Bool {
+    if (Principal.isAnonymous(caller)) Runtime.trap("REJECT:anonymous-membership-query");
     StableBlobSet.contains(spent_nullifiers, nullifier)
   };
 
-  public query func is_known_root(root : Blob) : async Bool {
+  /// The second half of the same class. This was once closed on the ground that it "adds nothing
+  /// over `status()` for a
+  /// current root". `status()` carries ONE root; `historical_roots` accumulates one per state
+  /// transition, so that argument covers a single element of an unbounded set and says nothing
+  /// about the rest. For every root the pool has held and no longer holds, this answered a question
+  /// `status()` cannot -- unauthenticated, while its sibling `is_nullifier_spent` was gated for
+  /// exactly this class. Gated identically: membership is for authenticated callers, not the world.
+  public query ({ caller }) func is_known_root(root : Blob) : async Bool {
+    if (Principal.isAnonymous(caller)) Runtime.trap("REJECT:anonymous-membership-query");
     StableBlobSet.contains(historical_roots, root)
   };
 
@@ -2447,10 +3137,28 @@ persistent actor ZkLedger {
   // Enable is GENESIS-ONLY: the chain must cover the full history for a birthday-less restore to
   // verify every page, and there is no backfill path — so it arms only on an empty log. Additive:
   // flag off leaves append, certification, and every existing endpoint byte-identical to 44692fc.
-  public shared func detect_chain_enable() : async Result<()> {
+  // Administrator-only: enabling puts DetectChain.append's unbounded-in-N work back inside the
+  // post-payout commit, which is the precondition the payout-path instruction bound relies on. The
+  // authorisation check runs FIRST so a caller who is not the administrator learns nothing about
+  // the pool's state from the answer.
+  public shared ({ caller }) func detect_chain_enable() : async Result<()> {
+    if (not isAdministrator(caller)) return #err("REJECT:not-administrator");
     if (detect_chain_enabled) return #err("REJECT:detect-chain-already-enabled");
     if (noteCount() != 0) return #err("REJECT:detect-chain-nonempty-log");
     detect_chain_enabled := true;
+    refreshCertification();
+    #ok(())
+  };
+
+  // Symmetric with enable, and permitted in exactly the same window: only on an empty log. Once a
+  // note exists the chain covers history a client may already have bound to, and turning it off
+  // then on again would leave the chain behind the log — the count-mismatch that fails the audit's
+  // exact-equality cross-check closed. Reversible while it is harmless; frozen once it is not.
+  public shared ({ caller }) func detect_chain_disable() : async Result<()> {
+    if (not isAdministrator(caller)) return #err("REJECT:not-administrator");
+    if (not detect_chain_enabled) return #err("REJECT:detect-chain-not-enabled");
+    if (noteCount() != 0) return #err("REJECT:detect-chain-nonempty-log");
+    detect_chain_enabled := false;
     refreshCertification();
     #ok(())
   };
@@ -2504,6 +3212,26 @@ persistent actor ZkLedger {
     }
   };
 
+  /// Errors whose EFFECT cannot be inferred from the error alone, so the intent must be settled
+  /// against the token log instead of latched or blindly cancelled.
+  ///
+  /// The default is deliberately inverted: anything not provably no-effect and not provably
+  /// transient lands here, INCLUDING variants this canister does not know about. Enumerating the
+  /// resolvable errors and latching the rest is what left a pending intent permanently stuck —
+  /// closing #TooOld alone would close one entrance of nine and leave #GenericError, which no
+  /// specification makes transient, reproducing the same freeze.
+  ///
+  /// #TemporarilyUnavailable is the one genuine exception: it is transient by definition, a retry
+  /// may succeed, and staying pending is correct. #Duplicate never reaches here — it is consumed
+  /// as a block index by the preceding match arm.
+  func requiresLogSettlement(error : ICRC2.TransferFromError) : Bool {
+    switch (error) {
+      case (#TemporarilyUnavailable) false;
+      case (#Duplicate(_)) false;
+      case _ not deterministicNoEffectError(error);
+    }
+  };
+
   func finalizeShield(intentId : Blob) : MutationResult {
     if (StableBlobSet.contains(completed_shield_intents, intentId)) {
       return mutation("ACCEPT:already-finalized", "ACCEPT");
@@ -2518,6 +3246,32 @@ persistent actor ZkLedger {
 
     // No await after this point: the exact token block is already observed. If any stable write
     // traps, this callback rolls back to the pre-callback pending intent and remains recoverable.
+    // Cross-check the transition at FINALIZE, not only at creation.
+    // NON-CIRCULAR by construction: the left side is recomputed IN-CANISTER from the local tree
+    // (`currentTree()`, still pre-transition here because `tree_state` is not reassigned until
+    // below) and the commitments stored on the pending; the right side is the ORACLE's value
+    // captured at creation. Comparing `pending.next_tree` to `pending.root_after` would instead
+    // compare a value with itself -- both derive from the same `parseTransition` -- and pass
+    // unconditionally. `currentTree()` is provably the state this intent was created against:
+    // the guard above refuses unless `note_root == pending.anchor_before`.
+    // ON MISMATCH WE RETURN, WHICH LEAVES THE INTENT PENDING. It is NOT cancelled -- cancelling
+    // would convert a receipt defect into a funds-availability defect, and the money converges
+    // only because the resume can still finalize.
+    if (not tree_frontier_enabled) {
+      return mutation("REJECT:finalize-frontier-disabled", pending.verifier_outcome);
+    };
+    switch (frontierAppend(currentTree(), [blobToHex(pending.output.commitment)])) {
+      case (#err(message)) return mutation(message, pending.verifier_outcome);
+      case (#ok(local)) {
+        if (local.root != blobToHex(pending.root_after)) {
+          // Raise the NON-BLOCKING divergence signal, then return unchanged (still leaves the
+          // intent PENDING; no sticky-guard trip, so the resume can still converge).
+          finalize_frontier_mismatch_count += 1;
+          finalize_frontier_mismatch_last := ?intentId;
+          return mutation("REJECT:finalize-frontier-mismatch", pending.verifier_outcome);
+        };
+      };
+    };
     tree_state := ?pending.next_tree;
     note_root := pending.root_after;
     addRoot(pending.root_after);
@@ -2541,25 +3295,197 @@ persistent actor ZkLedger {
   // unique 2xfer carrying memo == intent_id. Independent of the ICRC-2 dedup window, so it recovers
   // a trapped-after-transfer shield no matter how long the outage lasted. Bounded per message by
   // PAGE; the await loop paginates the instruction budget across messages.
+  // ==================== retry budget for a pending intent ====================
+  //
+  // `attempts` was written by all three resume entries and read by nothing: no cap, no expiry, no
+  // escalation. A caller stuck on a dependency that is down could drive the token ledger and the
+  // archives without bound, one inter-canister call chain per resume, and nothing about the intent
+  // ever changed to say so. A1 made the counter visible in atomicity_status; this makes it mean
+  // something.
+  //
+  // The limit deliberately does NOT cancel, expire or otherwise resolve the intent. A pending
+  // intent may have a payout already on the token ledger, and releasing one on a retry count rather
+  // than on evidence is exactly the failure A6 is about. It refuses the RETRY, names itself in the
+  // outcome so a latch is legible, and leaves the intent exactly where it was.
+  //
+  // The administrator is exempt, and that is load-bearing rather than a convenience: a cap with no
+  // exemption would itself become the permanent latch it exists to make visible. Recovery stays
+  // possible at any attempt count, through the same evidence-based path as every other resume.
+  let INTENT_ATTEMPT_LIMIT : Nat = 32;
+
+  /// How long a pending intent may sit before it is refused as expired. 24h in nanoseconds.
+  let INTENT_TIMEOUT_NS : Nat64 = 86_400_000_000_000;
+
+  func attemptLimitReached(attempts : Nat, caller : Principal) : Bool {
+    attempts >= INTENT_ATTEMPT_LIMIT and not isAdministrator(caller)
+  };
+
   type ReconcileResult = { #found : Nat; #absent; #error : Text };
-  func reconcileShieldBlock(pending : PendingShield) : async ReconcileResult {
-    let PAGE : Nat = 64;
-    var index = pending.ledger_tip_before;
+
+  // ==================== archive-aware token-log scan ====================
+  //
+  // icrc3_get_blocks answers a range in two parts: the blocks the ledger still holds INLINE, and
+  // `archived_blocks` — ranges it has handed to an archive canister, each with a callback that
+  // serves them. A scan that reads only `blocks` sees an EMPTY reply for a range that has moved to
+  // an archive, and cannot tell "these blocks do not exist" from "I did not look where they are".
+  //
+  // THE INVARIANT: #absent is returned only when absence was PROVEN — every index from the
+  // starting tip to the log's end was actually observed and none matched. A failure to look must
+  // never become a conclusion that nothing is there. So a callback that traps or rejects, a reply
+  // that makes no progress, a block carrying an id outside the requested span, a malformed
+  // archived range, or any bound being reached all produce #error, which leaves the intent pending
+  // for another attempt. #error costs a retry; a false #absent cancels an intent whose payout has
+  // already landed.
+  //
+  // GetBlocksCallback is self-recursive by specification — an archive's reply is itself a
+  // GetBlocksResult and may defer again — so the walk is an explicit bounded worklist rather than
+  // recursion, and the bound is a number in the code instead of a property of the call graph.
+
+  let SCAN_PAGE : Nat = 64;
+  let SCAN_PAGE_LIMIT : Nat = 256;
+  let SCAN_DEPTH_LIMIT : Nat = 4;
+  let SCAN_VISIT_LIMIT : Nat = 64;
+
+  type ScanTask = { source : GetBlocksCallback; start : Nat; length : Nat; depth : Nat };
+  type SpanOutcome = { #found : Nat; #observed : Nat; #error : Text };
+
+  /// Length of the contiguous run of observed indices starting at the beginning of the span.
+  /// A gap stops the count: the scan may only advance over indices it actually saw.
+  func observedPrefix(mask : Nat64, length : Nat) : Nat {
+    var count : Nat = 0;
+    while (count < length and (mask & (1 << Nat64.fromNat(count))) != 0) { count += 1 };
+    count
+  };
+
+  /// Observe [start, start+length) beginning from a reply already in hand, following every range
+  /// that reply — or an archive's reply — defers. Returns #found on the first match, otherwise the
+  /// length of the contiguous prefix of the span that was ACTUALLY observed.
+  ///
+  /// Coverage is tracked as a bitmask over the span rather than by counting blocks, so a reply that
+  /// repeats an index cannot inflate the count and hide a gap. The span is capped at 64 indices,
+  /// which is what makes one Nat64 sufficient.
+  func scanSpan(
+    first : GetBlocksResult,
+    start : Nat,
+    length : Nat,
+    matches : ICRC3.Value -> Bool,
+  ) : async SpanOutcome {
+    if (length == 0 or length > 64) return #error("token-log-scan:span-width");
+    let queue = List.empty<ScanTask>();
+    var mask : Nat64 = 0;
+    var reply = first;
+    var depth : Nat = 0;
+    var cursor : Nat = 0;
     loop {
-      let page = try {
-        await historyActor().icrc3_get_blocks([{ start = index; length = PAGE }])
-      } catch (error) {
-        return #error(Error.message(error));
+      for (entry in reply.blocks.vals()) {
+        // A block whose id falls outside the requested span cannot be attributed to it, and
+        // counting it would let a reply shrink the span the caller believes it observed.
+        if (entry.id < start or entry.id >= start + length) {
+          return #error("token-log-scan:block-id-outside-span");
+        };
+        if (matches(entry.block)) return #found(entry.id);
+        mask := mask | (1 << Nat64.fromNat(entry.id - start));
       };
-      if (page.blocks.size() == 0) return #absent;
-      for (b in page.blocks.vals()) {
-        if (ICRC2Block.matchesTransferFrom(b.block, pending.transfer_args, selfPrincipal())) {
-          return #found(b.id);
+      for (archived in reply.archived_blocks.vals()) {
+        for (range in archived.args.vals()) {
+          if (range.length == 0) return #error("token-log-scan:archive-empty-range");
+          if (range.start < start or range.start + range.length > start + length) {
+            return #error("token-log-scan:archive-range-outside-span");
+          };
+          if (depth + 1 > SCAN_DEPTH_LIMIT) return #error("token-log-scan:archive-depth-limit");
+          if (List.size(queue) >= SCAN_VISIT_LIMIT) return #error("token-log-scan:archive-visit-limit");
+          List.add(queue, {
+            source = archived.callback;
+            start = range.start;
+            length = range.length;
+            depth = depth + 1;
+          });
         };
       };
-      index += page.blocks.size();
+      if (cursor >= List.size(queue)) return #observed(observedPrefix(mask, length));
+      let task = switch (List.get(queue, cursor)) {
+        case (?value) value;
+        case null return #error("token-log-scan:worklist");
+      };
+      cursor += 1;
+      depth := task.depth;
+      reply := try {
+        await task.source([{ start = task.start; length = task.length }])
+      } catch (error) {
+        // A callback that traps or rejects is a failure to LOOK, and stays one.
+        return #error("token-log-scan:archive-call:" # Error.message(error));
+      };
+    }
+  };
+
+  /// Scan the token log from `tip` for a block satisfying `matches`.
+  func reconcileTokenBlock(tip : Nat, matches : ICRC3.Value -> Bool) : async ReconcileResult {
+    let history = historyActor();
+    var index = tip;
+    var pages : Nat = 0;
+    loop {
+      if (pages >= SCAN_PAGE_LIMIT) return #error("token-log-scan:page-limit");
+      pages += 1;
+      let page = try {
+        await history.icrc3_get_blocks([{ start = index; length = SCAN_PAGE }])
+      } catch (error) {
+        return #error("token-log-scan:" # Error.message(error));
+      };
+      // The only proof of absence: the scan has reached the end of the log having observed every
+      // index behind it.
       if (index >= page.log_length) return #absent;
+      let want = if (index + SCAN_PAGE > page.log_length) page.log_length - index else SCAN_PAGE;
+      switch (await scanSpan(page, index, want, matches)) {
+        case (#found(id)) return #found(id);
+        case (#error(message)) return #error(message);
+        case (#observed(covered)) {
+          // No progress means the log will not serve `index` — the empty inline reply that the
+          // previous scan read as absence. The difference between those two readings is an intent
+          // cancelled after its payout landed.
+          if (covered == 0) return #error("token-log-scan:no-progress-at-" # Nat.toText(index));
+          index += covered;
+        };
+      };
+    }
+  };
+
+  /// Read exactly the block at `id`, following archives.
+  ///
+  /// The confirmation read after a token call used to be a bare icrc3_get_blocks for one index,
+  /// judged by `blocks.size() != 1`. That is the same defect in a narrower shape: a block written a
+  /// moment ago can already have been archived by the time it is read back, and an archived index
+  /// answers with an empty inline reply. It latches the intent rather than cancelling it, so it
+  /// costs liveness rather than funds — but it is reachable, and it is the same root cause.
+  func fetchTokenBlock(id : Nat) : async { #found : ICRC3.Value; #absent; #error : Text } {
+    let history = historyActor();
+    let page = try {
+      await history.icrc3_get_blocks([{ start = id; length = 1 }])
+    } catch (error) {
+      return #error("token-log-fetch:" # Error.message(error));
     };
+    if (id >= page.log_length) return #absent;
+    // The matcher accepts the single index in the span and captures it on the way past; scanSpan
+    // reports which id matched, and the caller here needs the value as well.
+    var captured : ?ICRC3.Value = null;
+    switch (await scanSpan(page, id, 1, func(block : ICRC3.Value) : Bool { captured := ?block; true })) {
+      case (#found(_)) {
+        switch (captured) {
+          case (?value) #found(value);
+          case null #error("token-log-fetch:capture");
+        };
+      };
+      case (#observed(_)) #error("token-log-fetch:not-observed-at-" # Nat.toText(id));
+      case (#error(message)) #error(message);
+    }
+  };
+
+  func reconcileShieldBlock(pending : PendingShield) : async ReconcileResult {
+    await reconcileTokenBlock(
+      pending.ledger_tip_before,
+      func(block : ICRC3.Value) : Bool {
+        ICRC2Block.matchesTransferFrom(block, pending.transfer_args, selfPrincipal())
+      },
+    )
   };
 
   func drivePendingShield(intentId : Blob, trapAfterToken : Bool, reconcileFirst : Bool) : async MutationResult {
@@ -2603,17 +3529,50 @@ persistent actor ZkLedger {
       case (#Err(error)) {
         if (deterministicNoEffectError(error) and pendingById(intentId) != null) {
           pending_shield := null;
-          return mutation("REJECT:token:" # tokenErrorName(error), pending.verifier_outcome);
+          return mutation("REJECT:token:" # tokenErrorName(error) # ":no-effect", pending.verifier_outcome);
+        };
+        // Anything whose effect is not inferable settles against the token log rather than
+        // latching: the args are frozen, so an unresolvable error repeats identically and the
+        // intent would block every shielded mutation permanently.
+        if (requiresLogSettlement(error) and pendingById(intentId) != null) {
+          switch (await reconcileShieldBlock(pending)) {
+            case (#found(_)) {
+              switch (pendingById(intentId)) {
+                case (?current) {
+                  if (epoch != current.base_epoch or note_root != current.anchor_before) {
+                    return mutation("REJECT:pending-shield-epoch", current.verifier_outcome);
+                  };
+                  return finalizeShield(intentId);
+                };
+                case null {
+                  if (StableBlobSet.contains(completed_shield_intents, intentId)) {
+                    return mutation("ACCEPT:already-finalized", "ACCEPT");
+                  };
+                  return mutation("REJECT:pending-shield-changed", pending.verifier_outcome);
+                };
+              };
+            };
+            case (#error(msg)) return mutation("PENDING:reconcile-scan:" # msg, pending.verifier_outcome);
+            case (#absent) {
+              // Absence proven after the failing send: the transfer never landed, so the intent
+              // is dead and its slot must be released.
+              if (pendingById(intentId) == null) {
+                return mutation("REJECT:pending-shield-changed", pending.verifier_outcome);
+              };
+              pending_shield := null;
+              return mutation("REJECT:token:" # tokenErrorName(error) # ":absent", pending.verifier_outcome);
+            };
+          };
         };
         return mutation("PENDING:token:" # tokenErrorName(error), pending.verifier_outcome);
       };
     };
 
     if (trapAfterToken) Runtime.trap("TEST_ONLY:fail-after-token-before-finalize");
-    let observed = try {
-      await historyActor().icrc3_get_blocks([{ start = blockIndex; length = 1 }])
-    } catch (error) {
-      return mutation("PENDING:token-block-call:" # Error.message(error), pending.verifier_outcome);
+    let observed = switch (await fetchTokenBlock(blockIndex)) {
+      case (#found(value)) value;
+      case (#absent) return mutation("PENDING:token-block-absent", pending.verifier_outcome);
+      case (#error(message)) return mutation("PENDING:token-block-call:" # message, pending.verifier_outcome);
     };
     let current = switch (pendingById(intentId)) {
       case (?value) value;
@@ -2624,20 +3583,38 @@ persistent actor ZkLedger {
         return mutation("REJECT:pending-shield-changed", pending.verifier_outcome);
       };
     };
-    if (epoch != current.base_epoch or observed.blocks.size() != 1 or
-        observed.blocks[0].id != blockIndex or
-        not ICRC2Block.matchesTransferFrom(observed.blocks[0].block, current.transfer_args, selfPrincipal())) {
+    // The id is no longer re-checked here: scanSpan rejects any block carrying an id outside the
+    // requested span, so what fetchTokenBlock returns is the block at blockIndex or nothing.
+    if (epoch != current.base_epoch or
+        not ICRC2Block.matchesTransferFrom(observed, current.transfer_args, selfPrincipal())) {
       return mutation("PENDING:token-block-mismatch", current.verifier_outcome);
     };
     finalizeShield(intentId)
   };
 
   public shared ({ caller }) func shield(args : DepositArgs) : async MutationResult {
+    // Seed the publish salt on an update path — queries cannot seed one, so it has to happen
+    // here. REG-4: this comment used to end "an unseeded salt makes publishedIntentId fall through
+    // to the raw handle, leaving the oracle open". That stopped being true at a3b82b3, which made
+    // publishedIntentId fail CLOSED — an unseeded salt now returns "" and WITHHOLDS the handle.
+    // The seeding therefore buys the OBSERVABLE, not the safety: without it a published handle is
+    // empty and the operator loses the correlation, but nothing raw is ever disclosed. Corrected
+    // because the stale wording is not inert — it was read as current behaviour during review and
+    // produced the confident, wrong conclusion that salting a query path is a no-op.
+    await seedIntentPublishSalt();
     // guard FIRST: even the already-finalized replay answer reads the completed set —
     // exactly the state a failed audit distrusts (and contains() can trap on a corrupt
     // slot); a guarded ledger answers with a clean reject, never a membership claim
     switch (guardRejection()) { case (?message) return mutation(message, "NOT_CALLED"); case null {} };
     if (not configured()) return mutation("REJECT:unconfigured", "NOT_CALLED");
+    // FAIL CLOSED. Without the in-canister frontier nothing cross-checks the oracle's root, so the
+    // value path refuses rather than trusting it. A pool that upgraded with the flag stored false is
+    // told, not silently switched: one gated admin call, set_tree_frontier(true), restores service.
+    // Refuse NEW intents while quarantined. Finalize paths are deliberately
+    // untouched: an existing pending must still be able to complete, or quarantine would strand
+    // the very intents it exists to protect — a funds-availability failure.
+    if (state_quarantine) return mutation("REJECT:state-quarantined", "NOT_CALLED");
+    if (not tree_frontier_enabled) return mutation("REJECT:frontier-disabled", "NOT_CALLED");
     if (not tokenConfigured()) return mutation("REJECT:token-unconfigured", "NOT_CALLED");
     if (pending_shield != null or pending_unshield != null) {
       return mutation("REJECT:pending-token-mutation", "NOT_CALLED");
@@ -2667,7 +3644,16 @@ persistent actor ZkLedger {
     if (verdict != "ACCEPT") return mutation(verdict, verdict);
 
     let treeBefore = currentTree();
+    // COMMITMENT INGRESS — the third stored value. Leaves never pass through
+    // parseTransition, so a transition-only remedy leaves `REJECT:leaf-field` reachable at finalize
+    // and the strand simply relocates. Same constructor, refused not reduced.
     let shieldLeaves = [blobToHex(args.commitment)];
+    for (leaf in shieldLeaves.vals()) {
+      switch (PoseidonTree.parseFieldElement(leaf)) {
+        case (?_) {};
+        case null return mutation("REJECT:commitment-noncanonical", "NOT_CALLED");
+      };
+    };
     // With the frontier flag ON the transition is computed in-canister BEFORE the
     // await (no state window); flag OFF leaves this null and the legacy path unchanged.
     let localNext = switch (frontierLocalNext(treeBefore, shieldLeaves)) {
@@ -2765,8 +3751,16 @@ persistent actor ZkLedger {
     if (not Principal.equal(caller, pending.caller) and not isAdministrator(caller)) {
       return mutation("REJECT:not-pending-owner", "NOT_CALLED");
     };
+    if (attemptLimitReached(pending.attempts, caller)) {
+      return mutation("PENDING:shield-attempt-limit", pending.verifier_outcome);
+    };
     pending_shield := ?{ pending with attempts = pending.attempts + 1 };
-    await drivePendingShield(pending.intent_id, false, true)
+    // Same admin-gated fault hook the non-recovery entries consume. The recovery paths used to
+    // hard-code false, which meant the code that exists specifically to survive a crash was the
+    // only code that could not be crash-tested.
+    let trapAfterToken = test_fail_after_token_once;
+    test_fail_after_token_once := false;
+    await drivePendingShield(pending.intent_id, trapAfterToken, true)
   };
 
   func pendingUnshieldById(intentId : Blob) : ?PendingUnshield {
@@ -2799,6 +3793,95 @@ persistent actor ZkLedger {
     }
   };
 
+  /// ICRC-1 twin of requiresLogSettlement; same inverted default, same settle-by-scan obligation.
+  func directRequiresLogSettlement(error : ICRC2.TransferError) : Bool {
+    switch (error) {
+      case (#TemporarilyUnavailable) false;
+      case (#Duplicate(_)) false;
+      case _ not directDeterministicNoEffectError(error);
+    }
+  };
+
+  /// PREPARE for the unshield commit: every fallible operation, before any money moves.
+  ///
+  /// A failure here is a clean reject with an honest receipt, because nothing has happened yet — and
+  /// that includes a trap, which is why the headroom calls are allowed to trap rather than being
+  /// wrapped. What must never happen is a failure AFTER the payout.
+  ///
+  /// Called before the RECONCILE, not merely before the payout: finalizeUnshield is reachable via
+  /// reconcileFirst -> #found with no payout in that message at all, and on the resume path that is
+  /// the common case. Placing this before the payout alone would leave the exact scenario the
+  /// resume batteries reproduce uncovered while looking fixed.
+  ///
+  /// Idempotent. The headroom calls are predicates rather than reservations, so repeating this
+  /// grows nothing — which matters because resume_unshield concurrency is unbounded.
+  func prepareUnshieldCommit(pending : PendingUnshield) : Result<()> {
+    // ---- the checks the commit would otherwise trap on ----
+    if (StableBlobSet.contains(completed_unshield_intents, pending.intent_id)) {
+      return #err("REJECT:prepare-already-completed");
+    };
+    // A DIFFERENT check from the one above: addNullifier traps on #ok(false), and the original
+    // hoist table mapped the duplicate case only to completed_unshield_intents.
+    if (StableBlobSet.contains(spent_nullifiers, pending.nullifier_1) or
+        StableBlobSet.contains(spent_nullifiers, pending.nullifier_2)) {
+      return #err("REJECT:prepare-nullifier-spent");
+    };
+    if (pending.pool_debit > pool_value) return #err("REJECT:prepare-pool-debit");
+
+    // ---- the encodings, so NoteCodec.encode cannot trap inside the commit ----
+    // Both blocks are built here because block 2's phash is block 1's hash: neither can be derived
+    // from live state at the moment block 2 is built.
+    let nullifiers = [pending.nullifier_1, pending.nullifier_2];
+    let position1 = noteCount();
+    let block1 = buildNoteBlock(pending.output_1, nullifiers, pending.anchor_before,
+      pending.root_after, #confidential_transfer, position1, last_block_hash);
+    let encoded1 = switch (NoteCodec.encode(block1)) {
+      case (#ok(value)) value;
+      case (#err(message)) return #err("REJECT:prepare-encode:" # message);
+    };
+    let hash1 = ICRC3.hashValue(NoteAudit.blockValue(block1));
+    let block2 = buildNoteBlock(pending.output_2, nullifiers, pending.anchor_before,
+      pending.root_after, #confidential_transfer, position1 + 1, ?hash1);
+    let encoded2 = switch (NoteCodec.encode(block2)) {
+      case (#ok(value)) value;
+      case (#err(message)) return #err("REJECT:prepare-encode:" # message);
+    };
+    let hash2 = ICRC3.hashValue(NoteAudit.blockValue(block2));
+
+    // ---- the headroom, so nothing in the commit can grow a region ----
+    switch (StableBlobSet.ensureHeadroom(spent_nullifiers, 2)) {
+      case (#err(message)) return #err("REJECT:prepare-headroom:" # message); case (_) {};
+    };
+    switch (StableBlobSet.ensureHeadroom(historical_roots, 1)) {
+      case (#err(message)) return #err("REJECT:prepare-headroom:" # message); case (_) {};
+    };
+    switch (StableBlobSet.ensureHeadroom(completed_unshield_intents, 1)) {
+      case (#err(message)) return #err("REJECT:prepare-headroom:" # message); case (_) {};
+    };
+    switch (StableLog.ensureHeadroom(note_log,
+      Nat64.fromNat(encoded1.size() + encoded2.size()), 2)) {
+      case (#err(message)) return #err("REJECT:prepare-headroom:" # message); case (_) {};
+    };
+
+    pending_unshield_prepared := ?{
+      intent_id = pending.intent_id;
+      encoded_1 = encoded1;
+      encoded_2 = encoded2;
+      hash_1 = hash1;
+      hash_2 = hash2;
+      position_1 = position1;
+    };
+    #ok(())
+  };
+
+  /// The prepared record for this intent, or null when it is absent or names a different one.
+  func preparedFor(intentId : Blob) : ?PreparedUnshield {
+    switch (pending_unshield_prepared) {
+      case (?record) { if (record.intent_id == intentId) ?record else null };
+      case null null;
+    }
+  };
+
   func finalizeUnshield(intentId : Blob) : MutationResult {
     if (StableBlobSet.contains(completed_unshield_intents, intentId)) {
       return mutation("ACCEPT:already-finalized", "ACCEPT");
@@ -2812,17 +3895,62 @@ persistent actor ZkLedger {
       return mutation("REJECT:pending-unshield-epoch", pending.verifier_outcome);
     };
 
-    // No await after this point. The exact ICRC-1 payout block has already been observed; the
-    // nullifiers, two change records, tree root, physical pool balance, and completion marker
-    // therefore commit atomically or the callback rolls back to this recoverable pending intent.
+    // Cross-check the transition at FINALIZE, not only at creation.
+    // NON-CIRCULAR by construction: the left side is recomputed IN-CANISTER from the local tree
+    // (`currentTree()`, still pre-transition here because `tree_state` is not reassigned until
+    // below) and the commitments stored on the pending; the right side is the ORACLE's value
+    // captured at creation. Comparing `pending.next_tree` to `pending.root_after` would instead
+    // compare a value with itself -- both derive from the same `parseTransition` -- and pass
+    // unconditionally. `currentTree()` is provably the state this intent was created against:
+    // the guard above refuses unless `note_root == pending.anchor_before`.
+    // ON MISMATCH WE RETURN, WHICH LEAVES THE INTENT PENDING. It is NOT cancelled -- cancelling
+    // would convert a receipt defect into a funds-availability defect, and the money converges
+    // only because the resume can still finalize.
+    if (not tree_frontier_enabled) {
+      return mutation("REJECT:finalize-frontier-disabled", pending.verifier_outcome);
+    };
+    switch (frontierAppend(currentTree(), [blobToHex(pending.output_1.commitment), blobToHex(pending.output_2.commitment)])) {
+      case (#err(message)) return mutation(message, pending.verifier_outcome);
+      case (#ok(local)) {
+        if (local.root != blobToHex(pending.root_after)) {
+          // Raise the NON-BLOCKING divergence signal, then return unchanged (still leaves the
+          // intent PENDING; no sticky-guard trip, so the resume can still converge).
+          finalize_frontier_mismatch_count += 1;
+          finalize_frontier_mismatch_last := ?intentId;
+          return mutation("REJECT:finalize-frontier-mismatch", pending.verifier_outcome);
+        };
+      };
+    };
+
+    // The PREPARE output. It is normally already here — drivePendingUnshield prepares before the
+    // reconcile — and rebuilt on the defensive path where it is not, which is a pool that upgraded
+    // holding this intent. A rebuild that fails here is no worse than the behaviour this fix
+    // replaces; a rebuild that succeeds means the commit below cannot fail.
+    let prepared = switch (preparedFor(intentId)) {
+      case (?record) record;
+      case null {
+        switch (prepareUnshieldCommit(pending)) {
+          case (#err(message)) return mutation("REJECT:unshield-prepare:" # message, pending.verifier_outcome);
+          case (#ok(_)) {};
+        };
+        switch (preparedFor(intentId)) {
+          case (?record) record;
+          case null return mutation("REJECT:unshield-prepare-missing", pending.verifier_outcome);
+        };
+      };
+    };
+
+    // No await after this point, and now nothing fallible either: the encodings are already built,
+    // the four sets and both note-log regions have guaranteed headroom, and the duplicate and
+    // pool-debit checks were re-run before any money moved. The nullifiers, two change records, tree
+    // root, physical pool balance, and completion marker commit together.
     addNullifier(pending.nullifier_1);
     addNullifier(pending.nullifier_2);
     tree_state := ?pending.next_tree;
     note_root := pending.root_after;
     addRoot(pending.root_after);
-    let nullifiers = [pending.nullifier_1, pending.nullifier_2];
-    appendBlock(pending.output_1, nullifiers, pending.anchor_before, pending.root_after, #confidential_transfer);
-    appendBlock(pending.output_2, nullifiers, pending.anchor_before, pending.root_after, #confidential_transfer);
+    commitNoteBytes(prepared.encoded_1, prepared.position_1, prepared.hash_1, pending.output_1.note_ciphertext);
+    commitNoteBytes(prepared.encoded_2, prepared.position_1 + 1, prepared.hash_2, pending.output_2.note_ciphertext);
     pool_value -= pending.pool_debit;
     // The prepaid fee reserved at acceptance is earned now, atomically with the payout commit.
     if (pending_unshield_prepaid_debit > 0) {
@@ -2839,28 +3967,18 @@ persistent actor ZkLedger {
       case (#err(message)) Runtime.trap(message);
     };
     pending_unshield := null;
+    pending_unshield_prepared := null;
     refreshCertification();
     mutation("ACCEPT", pending.verifier_outcome)
   };
 
   func reconcileUnshieldBlock(pending : PendingUnshield) : async ReconcileResult {
-    let PAGE : Nat = 64;
-    var index = pending.ledger_tip_before;
-    loop {
-      let page = try {
-        await historyActor().icrc3_get_blocks([{ start = index; length = PAGE }])
-      } catch (error) {
-        return #error(Error.message(error));
-      };
-      if (page.blocks.size() == 0) return #absent;
-      for (block in page.blocks.vals()) {
-        if (ICRC1Block.matchesTransfer(block.block, pending.transfer_args, selfPrincipal())) {
-          return #found(block.id);
-        };
-      };
-      index += page.blocks.size();
-      if (index >= page.log_length) return #absent;
-    }
+    await reconcileTokenBlock(
+      pending.ledger_tip_before,
+      func(block : ICRC3.Value) : Bool {
+        ICRC1Block.matchesTransfer(block, pending.transfer_args, selfPrincipal())
+      },
+    )
   };
 
   func drivePendingUnshield(intentId : Blob, trapAfterToken : Bool, reconcileFirst : Bool) : async MutationResult {
@@ -2868,6 +3986,14 @@ persistent actor ZkLedger {
       case (?value) value;
       case null return mutation("REJECT:pending-unshield-changed", "NOT_CALLED");
     };
+    // PREPARE. Before the reconcile, not merely before the payout: finalizeUnshield is reachable
+    // from the #found branch below with no payout in this message at all, and on the resume path
+    // that is the common case. A failure here is a clean reject and nothing has happened.
+    switch (prepareUnshieldCommit(pending)) {
+      case (#err(message)) return mutation("REJECT:unshield-prepare:" # message, pending.verifier_outcome);
+      case (#ok(_)) {};
+    };
+
     if (reconcileFirst) {
       switch (await reconcileUnshieldBlock(pending)) {
         case (#found(_)) {
@@ -2907,17 +4033,53 @@ persistent actor ZkLedger {
             pending_unshield_prepaid_debit := 0;
           };
           pending_unshield := null;
+          pending_unshield_prepared := null;
           return mutation("REJECT:unshield-token:" # directTokenErrorName(error), pending.verifier_outcome);
+        };
+        // Effect not inferable: settle against the token log instead of latching forever.
+        if (directRequiresLogSettlement(error) and pendingUnshieldById(intentId) != null) {
+          switch (await reconcileUnshieldBlock(pending)) {
+            case (#found(_)) {
+              switch (pendingUnshieldById(intentId)) {
+                case (?current) {
+                  if (epoch != current.base_epoch or note_root != current.anchor_before) {
+                    return mutation("REJECT:pending-unshield-epoch", current.verifier_outcome);
+                  };
+                  return finalizeUnshield(intentId);
+                };
+                case null {
+                  if (StableBlobSet.contains(completed_unshield_intents, intentId)) {
+                    return mutation("ACCEPT:already-finalized", "ACCEPT");
+                  };
+                  return mutation("REJECT:pending-unshield-changed", pending.verifier_outcome);
+                };
+              };
+            };
+            case (#error(msg)) return mutation("PENDING:unshield-reconcile-scan:" # msg, pending.verifier_outcome);
+            case (#absent) {
+              if (pendingUnshieldById(intentId) == null) {
+                return mutation("REJECT:pending-unshield-changed", pending.verifier_outcome);
+              };
+              // Same refund obligation as the deterministic-no-effect cancel above.
+              if (pending_unshield_prepaid_debit > 0) {
+                creditPrepaid(pending.caller, pending_unshield_prepaid_debit);
+                pending_unshield_prepaid_debit := 0;
+              };
+              pending_unshield := null;
+              pending_unshield_prepared := null;
+              return mutation("REJECT:unshield-token:" # directTokenErrorName(error), pending.verifier_outcome);
+            };
+          };
         };
         return mutation("PENDING:unshield-token:" # directTokenErrorName(error), pending.verifier_outcome);
       };
     };
 
     if (trapAfterToken) Runtime.trap("TEST_ONLY:fail-after-token-before-unshield-finalize");
-    let observed = try {
-      await historyActor().icrc3_get_blocks([{ start = blockIndex; length = 1 }])
-    } catch (error) {
-      return mutation("PENDING:unshield-token-block-call:" # Error.message(error), pending.verifier_outcome);
+    let observed = switch (await fetchTokenBlock(blockIndex)) {
+      case (#found(value)) value;
+      case (#absent) return mutation("PENDING:unshield-token-block-absent", pending.verifier_outcome);
+      case (#error(message)) return mutation("PENDING:unshield-token-block-call:" # message, pending.verifier_outcome);
     };
     let current = switch (pendingUnshieldById(intentId)) {
       case (?value) value;
@@ -2928,9 +4090,8 @@ persistent actor ZkLedger {
         return mutation("REJECT:pending-unshield-changed", pending.verifier_outcome);
       };
     };
-    if (epoch != current.base_epoch or observed.blocks.size() != 1 or
-        observed.blocks[0].id != blockIndex or
-        not ICRC1Block.matchesTransfer(observed.blocks[0].block, current.transfer_args, selfPrincipal())) {
+    if (epoch != current.base_epoch or
+        not ICRC1Block.matchesTransfer(observed, current.transfer_args, selfPrincipal())) {
       return mutation("PENDING:unshield-token-block-mismatch", current.verifier_outcome);
     };
     finalizeUnshield(intentId)
@@ -2945,8 +4106,29 @@ persistent actor ZkLedger {
     if (not Principal.equal(caller, pending.caller) and not isAdministrator(caller)) {
       return mutation("REJECT:not-pending-owner", "NOT_CALLED");
     };
+    // A TIME bound, not only a count bound. attemptLimitReached gives up after
+    // INTENT_ATTEMPT_LIMIT *attempts*, so a pending nobody retries is never given up on and sits
+    // forever, blocking new intents. The timestamp needed for an expiry is already on the pending —
+    // transfer_args.created_at_time, which reconciliation at :931 already requires non-null — so no
+    // new stable field and no migration is involved.
+    switch (pending.transfer_args.created_at_time) {
+      case (?created) {
+        if (not isAdministrator(caller) and nowNat64() > created + INTENT_TIMEOUT_NS) {
+          return mutation("PENDING:unshield-expired", pending.verifier_outcome);
+        };
+      };
+      case null {};
+    };
+    if (attemptLimitReached(pending.attempts, caller)) {
+      return mutation("PENDING:unshield-attempt-limit", pending.verifier_outcome);
+    };
     pending_unshield := ?{ pending with attempts = pending.attempts + 1 };
-    await drivePendingUnshield(pending.intent_id, false, true)
+    // Same admin-gated fault hook the non-recovery entries consume. The recovery paths used to
+    // hard-code false, which meant the code that exists specifically to survive a crash was the
+    // only code that could not be crash-tested.
+    let trapAfterToken = test_fail_after_token_once;
+    test_fail_after_token_once := false;
+    await drivePendingUnshield(pending.intent_id, trapAfterToken, true)
   };
 
   // ==================== prepaid fee balance ====================
@@ -3088,25 +4270,15 @@ persistent actor ZkLedger {
   };
 
   func reconcilePrepaidBlock(pending : PendingPrepaid) : async ReconcileResult {
-    let PAGE : Nat = 64;
-    var index = pending.ledger_tip_before;
-    loop {
-      let page = try {
-        await historyActor().icrc3_get_blocks([{ start = index; length = PAGE }])
-      } catch (error) {
-        return #error(Error.message(error));
-      };
-      if (page.blocks.size() == 0) return #absent;
-      for (b in page.blocks.vals()) {
-        let found = switch (pending.op) {
-          case (#deposit(op)) ICRC2Block.matchesTransferFrom(b.block, op.transfer_args, selfPrincipal());
-          case (#withdraw(op)) ICRC1Block.matchesTransfer(b.block, op.transfer_args, selfPrincipal());
-        };
-        if (found) return #found(b.id);
-      };
-      index += page.blocks.size();
-      if (index >= page.log_length) return #absent;
-    }
+    await reconcileTokenBlock(
+      pending.ledger_tip_before,
+      func(block : ICRC3.Value) : Bool {
+        switch (pending.op) {
+          case (#deposit(op)) ICRC2Block.matchesTransferFrom(block, op.transfer_args, selfPrincipal());
+          case (#withdraw(op)) ICRC1Block.matchesTransfer(block, op.transfer_args, selfPrincipal());
+        }
+      },
+    )
   };
 
   /// The endpoint answer for a prepaid op: the caller's balance after a deposit or a
@@ -3193,6 +4365,28 @@ persistent actor ZkLedger {
               pending_prepaid := null;
               return #err("REJECT:prepaid-token:" # tokenErrorName(error));
             };
+            // Effect not inferable: settle against the token log rather than latching.
+            if (requiresLogSettlement(error) and pendingPrepaidById(intentId) != null) {
+              switch (await reconcilePrepaidBlock(current)) {
+                case (#found(_)) {
+                  switch (pendingPrepaidById(intentId)) {
+                    case (?settled) return finalizePrepaid(settled);
+                    case null {
+                      if (prepaidCompleted(intentId)) return #ok(prepaidAnswer(current));
+                      return #err("REJECT:pending-prepaid-changed");
+                    };
+                  };
+                };
+                case (#error(message)) return #err("PENDING:prepaid-reconcile-scan:" # message);
+                case (#absent) {
+                  if (pendingPrepaidById(intentId) == null) {
+                    return #err("REJECT:pending-prepaid-changed");
+                  };
+                  pending_prepaid := null;
+                  return #err("REJECT:prepaid-token:" # tokenErrorName(error));
+                };
+              };
+            };
             return #err("PENDING:prepaid-token:" # tokenErrorName(error));
           };
         }
@@ -3212,6 +4406,29 @@ persistent actor ZkLedger {
               pending_prepaid := null;
               return #err("REJECT:prepaid-token:" # directTokenErrorName(error));
             };
+            // Effect not inferable: settle against the token log rather than latching.
+            if (directRequiresLogSettlement(error) and pendingPrepaidById(intentId) != null) {
+              switch (await reconcilePrepaidBlock(current)) {
+                case (#found(_)) {
+                  switch (pendingPrepaidById(intentId)) {
+                    case (?settled) return finalizePrepaid(settled);
+                    case null {
+                      if (prepaidCompleted(intentId)) return #ok(prepaidAnswer(current));
+                      return #err("REJECT:pending-prepaid-changed");
+                    };
+                  };
+                };
+                case (#error(message)) return #err("PENDING:prepaid-reconcile-scan:" # message);
+                case (#absent) {
+                  if (pendingPrepaidById(intentId) == null) {
+                    return #err("REJECT:pending-prepaid-changed");
+                  };
+                  refundPrepaidReservation(current);
+                  pending_prepaid := null;
+                  return #err("REJECT:prepaid-token:" # directTokenErrorName(error));
+                };
+              };
+            };
             return #err("PENDING:prepaid-token:" # directTokenErrorName(error));
           };
         }
@@ -3219,10 +4436,10 @@ persistent actor ZkLedger {
     };
 
     if (trapAfterToken) Runtime.trap("TEST_ONLY:fail-after-token-before-prepaid-finalize");
-    let observed = try {
-      await historyActor().icrc3_get_blocks([{ start = blockIndex; length = 1 }])
-    } catch (error) {
-      return #err("PENDING:prepaid-token-block-call:" # Error.message(error));
+    let observed = switch (await fetchTokenBlock(blockIndex)) {
+      case (#found(value)) value;
+      case (#absent) return #err("PENDING:prepaid-token-block-absent");
+      case (#error(message)) return #err("PENDING:prepaid-token-block-call:" # message);
     };
     let final = switch (pendingPrepaidById(intentId)) {
       case (?value) value;
@@ -3231,12 +4448,10 @@ persistent actor ZkLedger {
         return #err("REJECT:pending-prepaid-changed");
       };
     };
-    let matches = observed.blocks.size() == 1 and observed.blocks[0].id == blockIndex and (
-      switch (final.op) {
-        case (#deposit(op)) ICRC2Block.matchesTransferFrom(observed.blocks[0].block, op.transfer_args, selfPrincipal());
-        case (#withdraw(op)) ICRC1Block.matchesTransfer(observed.blocks[0].block, op.transfer_args, selfPrincipal());
-      }
-    );
+    let matches = switch (final.op) {
+      case (#deposit(op)) ICRC2Block.matchesTransferFrom(observed, op.transfer_args, selfPrincipal());
+      case (#withdraw(op)) ICRC1Block.matchesTransfer(observed, op.transfer_args, selfPrincipal());
+    };
     if (not matches) return #err("PENDING:prepaid-token-block-mismatch");
     finalizePrepaid(final)
   };
@@ -3299,7 +4514,7 @@ persistent actor ZkLedger {
     await prepaidPayout(caller, #balance, { owner = caller; subaccount = null }, amount, createdAt)
   };
 
-  /// Pay collected fee revenue out to an operator-chosen account. Administrator only; the
+  /// Pay collected fee revenue out to an account chosen by the operator. Administrator only; the
   /// same payout rail as user withdrawals, so revenue is never trapped either.
   public shared ({ caller }) func prepaid_fee_collect(amount : Nat64, to : ICRC2.Account, createdAt : Nat64) : async Result<Nat> {
     switch (guardRejection()) { case (?message) return #err(message); case null {} };
@@ -3374,13 +4589,36 @@ persistent actor ZkLedger {
     if (not Principal.equal(caller, pending.caller) and not isAdministrator(caller)) {
       return #err("REJECT:not-pending-owner");
     };
+    if (attemptLimitReached(pending.attempts, caller)) {
+      return #err("PENDING:prepaid-attempt-limit");
+    };
     pending_prepaid := ?{ pending with attempts = pending.attempts + 1 };
-    await drivePendingPrepaid(pending.intent_id, false, true)
+    // Same admin-gated fault hook the non-recovery entries consume. The recovery paths used to
+    // hard-code false, which meant the code that exists specifically to survive a crash was the
+    // only code that could not be crash-tested.
+    let trapAfterToken = test_fail_after_token_once;
+    test_fail_after_token_once := false;
+    await drivePendingPrepaid(pending.intent_id, trapAfterToken, true)
   };
 
   public shared ({ caller }) func confidential_transfer(args : TransferArgs) : async MutationResult {
+    // Seed the publish salt on an update path — queries cannot seed one, so it has to happen
+    // here. REG-4: this comment used to end "an unseeded salt makes publishedIntentId fall through
+    // to the raw handle, leaving the oracle open". That stopped being true at a3b82b3, which made
+    // publishedIntentId fail CLOSED — an unseeded salt now returns "" and WITHHOLDS the handle.
+    // The seeding therefore buys the OBSERVABLE, not the safety: without it a published handle is
+    // empty and the operator loses the correlation, but nothing raw is ever disclosed. Corrected
+    // because the stale wording is not inert — it was read as current behaviour during review and
+    // produced the confident, wrong conclusion that salting a query path is a no-op.
+    await seedIntentPublishSalt();
     switch (guardRejection()) { case (?message) return mutation(message, "NOT_CALLED"); case null {} };
     if (not configured()) return mutation("REJECT:unconfigured", "NOT_CALLED");
+    // Same fail-closed gate as shield: no in-canister frontier, no value path.
+    // Refuse NEW intents while quarantined. Finalize paths are deliberately
+    // untouched: an existing pending must still be able to complete, or quarantine would strand
+    // the very intents it exists to protect — a funds-availability failure.
+    if (state_quarantine) return mutation("REJECT:state-quarantined", "NOT_CALLED");
+    if (not tree_frontier_enabled) return mutation("REJECT:frontier-disabled", "NOT_CALLED");
     if (transfer_statement_version != 2) {
       return mutation("REJECT:transfer-statement-version", "NOT_CALLED");
     };
@@ -3479,6 +4717,12 @@ persistent actor ZkLedger {
       blobToHex(args.output_1.commitment),
       blobToHex(args.output_2.commitment),
     ];
+    for (leaf in transferLeaves.vals()) {
+      switch (PoseidonTree.parseFieldElement(leaf)) {
+        case (?_) {};
+        case null return mutation("REJECT:commitment-noncanonical", "NOT_CALLED");
+      };
+    };
     // In-canister transition first (flag ON), oracle demoted to cross-check.
     let localNext = switch (frontierLocalNext(treeBefore, transferLeaves)) {
       case (#ok(value)) value;
@@ -3613,8 +4857,22 @@ persistent actor ZkLedger {
   };
 
   /// Fixed-shape private retrieval of a known note position. The API has no target index.
+  /// The LWE query is linear in the note log at ~25.6M instructions per note (225,188,359 at 8
+  /// notes, 820,557,992 at 32), so the 5e9 query ceiling is reached at ~195 notes. Independently the
+  /// caller must supply one 630-Nat64 selector PER NOTE, which reaches the ~2 MB ingress limit at
+  /// ~200. Both walls converge and neither is the caller's to fix.
+  ///
+  /// Checked BEFORE the selector count so the caller learns the real reason. Without it a large log
+  /// yields "selector count must equal the full note log length", and a caller who then complies is
+  /// rejected at ingress or burns to the instruction ceiling — three different opaque failures for
+  /// one cause. The bound leaves ~4.1e9 of the 5e9 ceiling as margin.
+  let PIR_LWE_MAX_NOTES : Nat = 160;
+
   public query func pir_query_lwe(args : LwePirArgs) : async LwePirResponse {
     let c0 = Prim.performanceCounter(0);
+    if (noteCount() > PIR_LWE_MAX_NOTES) {
+      Runtime.trap("pir-lwe:note-log-too-large:" # Nat.toText(noteCount()) # ">" # Nat.toText(PIR_LWE_MAX_NOTES));
+    };
     if (args.selectors.size() != noteCount()) {
       Runtime.trap("selector count must equal the full note log length");
     };

@@ -27,6 +27,12 @@ module {
     // None ⇒ the label is ABSENT from the hash tree ⇒ digest byte-identical to the pre-feature
     // tuple — the mechanism that makes the flag-off state hash identical to 44692fc.
     detect_stream : ?Blob;
+    // certified verifying-key anchor: sha256(domain ‖ transfer_vk_hex ‖ deposit_vk_hex)(32)
+    // ‖ keyset epoch(8B BE). Present whenever the pool is configured, so a client can bind the
+    // proving keys it holds to the vk this canister will actually verify against, and can see a
+    // rotation as an epoch change. None while unconfigured ⇒ the label is ABSENT and the tree
+    // (and its digest) stays byte-identical to the pre-feature one.
+    vk_anchor : ?Blob;
   };
 
   public type HashTree = {
@@ -43,14 +49,17 @@ module {
 
   func zkTree(tuple : Tuple) : HashTree {
     // labels stay alphabetical: archive_manifest < audit < detect_stream < encoding_version <
-    // note_count < note_root < pir2_boundary. Each optional leaf folds in ONLY when Some, so
+    // note_count < note_root < pir2_boundary < vk. Each optional leaf folds in ONLY when Some, so
     // the all-None (flag-off) tree is byte-identical to the pre-feature five-leaf tree.
-    let tail : HashTree = switch (tuple.pir2_boundary) {
-      case (?boundary) #fork(
-        labeledLeaf("note_root", tuple.note_root),
-        labeledLeaf("pir2_boundary", boundary),
+    let noteRootLeaf = labeledLeaf("note_root", tuple.note_root);
+    let tail : HashTree = switch (tuple.pir2_boundary, tuple.vk_anchor) {
+      case (null, null) noteRootLeaf;
+      case (?boundary, null) #fork(noteRootLeaf, labeledLeaf("pir2_boundary", boundary));
+      case (null, ?anchor) #fork(noteRootLeaf, labeledLeaf("vk", anchor));
+      case (?boundary, ?anchor) #fork(
+        noteRootLeaf,
+        #fork(labeledLeaf("pir2_boundary", boundary), labeledLeaf("vk", anchor)),
       );
-      case null labeledLeaf("note_root", tuple.note_root);
     };
     let auditNode : HashTree = switch (tuple.detect_stream) {
       case null labeledLeaf("audit", tuple.audit_digest);
