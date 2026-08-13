@@ -4,7 +4,7 @@
 /// `Fr.mo` (literal Nat) stays untouched as the L1 correctness anchor; this module exists
 /// because the frontier cost probe measured the Nat path at 32.07M instructions and
 /// 1.38 MB of garbage PER POSEIDON PERMUTATION (44 MB per tree append) — the same
-/// immutable-bignum churn class the churnfix eliminated.
+/// immutable-bignum churn class the flat-representation rewrite eliminated.
 ///
 /// Two probe-driven design points (measured, not assumed):
 ///   1. element = 8 little-endian 32-bit limbs in a caller-owned `[var Nat32]` arena

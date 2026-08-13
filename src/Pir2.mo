@@ -324,7 +324,7 @@ module {
 
   // Wire conversions run in PURE word-width ops (Nat32 lanes, byte-sized compact Nats
   // only): unbounded-Nat intermediates box value-dependently above the compact bound, which
-  // made the executed instruction count a function of wire CONTENT — caught by the S-1
+  // made the executed instruction count a function of wire CONTENT — caught by the
   // instruction-equality gate (the count depended only on public bytes, so nothing secret
   // leaked, but the constant-instruction serving invariant must hold literally).
   func wireToU32(blob : Blob) : [Nat32] {

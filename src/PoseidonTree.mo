@@ -15,7 +15,7 @@
 /// (the flat, allocation-disciplined style). The first port ran
 /// on plain-Nat `Fr.mo` and was proven byte-identical to arkworks (18,360-comparison
 /// differential, 2 passes, 4 seeds); the cost probe then measured it at 32.07M
-/// instructions + 1.38 MB garbage per permutation (44 MB per append) — churnfix-class
+/// instructions + 1.38 MB garbage per permutation (44 MB per append) — allocation-churn-class
 /// allocation — so the internals moved to FrFlat and the ENTIRE differential gate is
 /// re-run on this backend. Round constants are converted to Montgomery form once at
 /// module init; the permutation itself allocates nothing.
@@ -289,6 +289,21 @@ module {
   /// Parse 64 hex chars as a little-endian 32-byte field element; null on bad
   /// length, bad digit, or a non-canonical (>= r) value — the same rejections
   /// `f_from_hex` performs.
+  /// THE ONLY WAY A FIELD ELEMENT ENTERS STORED STATE. "Parse, don't validate": a value that has
+  /// passed through here is a canonical field element by construction, so every downstream reader
+  /// may rely on it without re-checking. The canonicality asymmetry this closes existed precisely
+  /// BECAUSE two sites each decided for themselves what a valid field element was; adding a third
+  /// check at a third site would repeat the mistake.
+  ///
+  /// REJECTS, NEVER REDUCES. Reducing mod Fr.P would give one value two encodings — the RFC 8032 /
+  /// BIP-146 malleability class — and roots here are compared AS HEX TEXT, so a reduced value would
+  /// no longer compare equal to the text it came from. Refusal is the only correct outcome.
+  ///
+  /// Returns the input UNCHANGED on success, so callers store exactly the bytes they were given.
+  public func parseFieldElement(value : Text) : ?Text {
+    switch (hexToNat(value)) { case (?_) ?value; case null null }
+  };
+
   public func hexToNat(value : Text) : ?Nat {
     var result : Nat = 0;
     var shift : Nat = 1;

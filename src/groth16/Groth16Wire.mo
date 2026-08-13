@@ -32,8 +32,23 @@ import GM "Groth16Multi";
 
 module {
   // ---------------- hex ----------------
-  public func hexToBytes(t : Text) : ?[Nat8] {
+  // Bound the input BEFORE decoding. Previously only parity was checked, so the whole
+  // caller-supplied Text was walked -- measured at ~860 instructions/char -- and only `parseProof`
+  // afterwards could reject it on size.
+  //
+  // The bounds are GENEROUS, not tight, and deliberately so: a bound that cannot reject a valid
+  // artifact still converts unbounded work into bounded work, and a tight bound derived from
+  // today's artifact sizes would break the first legitimate vk with more public inputs. Real sizes
+  // for reference: proof 384 hex chars, deposit_vk 976, transfer_vk 1552.
+  public let MAX_PROOF_BYTES : Nat = 1_024;    // proofs are 192 B; 5x headroom
+  public let MAX_VK_BYTES : Nat = 16_384;      // largest vk here is 776 B; 21x headroom
+  public let MAX_INPUTS_BYTES : Nat = 8_192;   // 32 B per public input; 256 inputs
+
+  public func hexToBytes(t : Text) : ?[Nat8] { hexToBytesBounded(t, MAX_VK_BYTES) };
+
+  public func hexToBytesBounded(t : Text, maxBytes : Nat) : ?[Nat8] {
     let n = t.size();
+    if (n > maxBytes * 2) { return null };
     if (n % 2 != 0) { return null };
     let out = List.empty<Nat8>();
     var hi : ?Nat = null;
@@ -173,11 +188,11 @@ module {
 
   /// Same wire semantics, fixed vk pairs already flat (the ledger's per-proof path).
   public func verifyPreparedCached(vk : GM.PreparedVk, flat : GM.FlatVk, proofHex : Text, inputsHex : Text) : Text {
-    let proofBytes = switch (hexToBytes(proofHex)) {
+    let proofBytes = switch (hexToBytesBounded(proofHex, MAX_PROOF_BYTES)) {
       case (null) { return "REJECT:hex" };
       case (?b) { b };
     };
-    let inputBytes = switch (hexToBytes(inputsHex)) {
+    let inputBytes = switch (hexToBytesBounded(inputsHex, MAX_INPUTS_BYTES)) {
       case (null) { return "REJECT:hex" };
       case (?b) { b };
     };
