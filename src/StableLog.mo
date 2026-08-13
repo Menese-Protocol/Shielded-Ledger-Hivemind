@@ -88,6 +88,29 @@ module {
     #ok(Nat64.toNat(index))
   };
 
+  /// Guarantee that the next `entries` appends totalling `bytes` will not grow either region, and
+  /// therefore cannot trap with `StableLog: out of stable memory`.
+  ///
+  /// Headroom here is denominated in BYTES for the data region and in ENTRIES for the index region,
+  /// because that is how this structure actually grows — a note is variable-length, so a slot count
+  /// is not the unit. That is the half of the PREPARE hoist list that the original design
+  /// missed entirely: appendBlock calls ensureCapacity on TWO regions, and both end in a trap.
+  ///
+  /// A PREDICATE, NOT A RESERVATION, exactly as StableBlobSet.ensureHeadroom is. Aborting does not
+  /// move `data_offset` or `entry_count`, so a repeated PREPARE asks for the same `needed` and
+  /// ensureCapacity's own `if (needed <= current) return` makes the second call free.
+  public func ensureHeadroom(state : State, bytes : Nat64, entries : Nat64) : Result<()> {
+    ensureInit(state);
+    ensureCapacity(state.data_region, state.data_offset + bytes);
+    ensureCapacity(state.index_region, HEADER_SIZE + (state.entry_count + entries) * INDEX_ENTRY_SIZE);
+    #ok(())
+  };
+
+  /// Region bytes currently held, so a test can assert that a repeated PREPARE grew nothing.
+  public func regionBytes(state : State) : (Nat, Nat) {
+    (Nat64.toNat(capacity(state.data_region)), Nat64.toNat(capacity(state.index_region)))
+  };
+
   public func get(state : State, index : Nat) : ?Blob {
     if (not state.initialized) return null;
     let i = Nat64.fromNat(index);
@@ -159,11 +182,26 @@ module {
     from : Nat64,
     count : Nat64,
     expected_offset_in : Nat64,
-  ) : Result<Nat64> {
+    // The clamp used to read state.entry_count LIVE, so a walk that started under one
+    // entry_count could finish under another -- while the sibling StableBlobSet.countTagsRange has
+    // always taken a CAPTURED count. Two validators of the same shape disagreed on which bound is
+    // authoritative. The caller now captures the bound and passes it, so the walk is clamped to the
+    // state it began with.
+    bound : Nat64,
+    // The cost bound is a CALLER-SUPPLIED PREDICATE, not an instruction budget read here:
+    // StableLog is a storage module and must not acquire a scheduling dependency on Prim. Main.mo
+    // already holds the chunk's start counter, so the cost decision lives where the cost signal is.
+    // A slot budget was rejected -- that bounds WORK, which AUDIT_INDEX_PER_CHUNK already does,
+    // while the resumable exit exists because the per-message limit charges COST.
+    shouldStop : () -> Bool,
+  ) : Result<{ offset : Nat64; stopped_at : Nat64 }> {
     var expected_offset = expected_offset_in;
     var index = from;
-    let end = if (from + count > state.entry_count) state.entry_count else from + count;
+    let end = if (from + count > bound) bound else from + count;
     while (index < end) {
+      // Checked BEFORE the slot's work, so the returned index is one the caller has NOT consumed --
+      // resuming at it repeats nothing and skips nothing.
+      if (shouldStop()) return #ok({ offset = expected_offset; stopped_at = index });
       let index_offset = HEADER_SIZE + index * INDEX_ENTRY_SIZE;
       let data_offset = Region.loadNat64(state.index_region, index_offset);
       let data_length = Nat64.fromNat(
@@ -174,7 +212,7 @@ module {
       expected_offset += data_length;
       index += 1;
     };
-    #ok(expected_offset)
+    #ok({ offset = expected_offset; stopped_at = end })
   };
 
   /// First data offset (the walk's expected_offset seed) — the fixed data header size.
@@ -185,9 +223,9 @@ module {
       case (#err(message)) return #err(message);
       case (#ok(_)) {};
     };
-    let expected_offset = switch (validateIndexRange(state, 0, state.entry_count, DATA_HEADER_SIZE)) {
+    let expected_offset = switch (validateIndexRange(state, 0, state.entry_count, DATA_HEADER_SIZE, state.entry_count, func() : Bool { false })) {
       case (#err(message)) return #err(message);
-      case (#ok(value)) value;
+      case (#ok(value)) value.offset;
     };
     if (expected_offset != state.data_offset) return #err("stable-log:tail-offset");
     #ok(())
