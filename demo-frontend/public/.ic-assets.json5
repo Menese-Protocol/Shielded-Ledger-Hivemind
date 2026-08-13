@@ -1,0 +1,51 @@
+// Asset-canister response headers for the demo frontend — adversarial finding A4.
+//
+// Before this file existed, `find . -name ".ic-assets.json5"` returned 0 and the asset canister
+// served no Content-Security-Policy at all. That matters more here than on a typical dapp: this
+// frontend holds note secrets in the browser and runs the Groth16 prover there, so a single
+// injected script reads spending material directly rather than having to attack the canister.
+//
+// It lives in `public/`, not in `dist/`. `dist` is build output and dfx.json points the asset
+// canister at it, so a file placed there is destroyed by the next `vite build`; Vite copies
+// everything under `public/` into `dist/` on every build, dotfiles included.
+//
+// Every origin below is one this app actually contacts, and nothing else:
+//   https://icp-api.io                     src/config.js — the IC HTTP gateway the agent talks to
+//   https://id.ai                          src/auth.js  — Internet Identity
+//   https://identity.internetcomputer.org  the legacy Internet Identity origin, still reachable
+//     from the bundled @dfinity/auth-client
+// 'wasm-unsafe-eval' is required and is not a loophole: it permits WebAssembly compilation and
+// nothing else — it does NOT re-enable eval() or new Function() for JavaScript. The prover
+// (src/prover-pkg, wasm-bindgen) cannot start without it.
+[
+  {
+    "match": "**/*",
+    "headers": {
+      "Content-Security-Policy":
+        "default-src 'self';" +
+        "script-src 'self' 'wasm-unsafe-eval';" +
+        "style-src 'self' 'unsafe-inline';" +
+        "font-src 'self';" +
+        "img-src 'self' data: blob:;" +
+        "connect-src 'self' https://icp-api.io https://id.ai https://identity.internetcomputer.org;" +
+        "frame-src https://id.ai https://identity.internetcomputer.org;" +
+        "worker-src 'self' blob:;" +
+        "object-src 'none';" +
+        "base-uri 'self';" +
+        "form-action 'self';" +
+        "frame-ancestors 'none';" +
+        "upgrade-insecure-requests;",
+      // frame-ancestors is the directive that actually stops framing on modern browsers;
+      // X-Frame-Options is kept for older ones. Clickjacking a wallet is a real path.
+      "X-Frame-Options": "DENY",
+      "X-Content-Type-Options": "nosniff",
+      // Referrers must never carry this origin to Internet Identity or the gateway: the path can
+      // encode which pool and which account a user is operating on.
+      "Referrer-Policy": "same-origin",
+      "Permissions-Policy":
+        "accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=()," +
+        "microphone=(), payment=(), usb=()",
+      "Cross-Origin-Resource-Policy": "same-origin",
+    },
+  },
+]

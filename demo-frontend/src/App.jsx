@@ -9,6 +9,7 @@ import React, { useEffect, useMemo, useRef, useState, useCallback } from "react"
 import { Principal } from "@dfinity/principal";
 import { actorsFor, bytesToHex, hexToBytes } from "./ic.js";
 import { loadProver, loadProvingKeys } from "./prover.js";
+import { anonymousLedger } from "./ic.js";
 import { CANISTERS, BASE, BIRTHDAY_RECOVERY_ENABLED } from "./config.js";
 import { parseDemoAmount } from "./amounts.js";
 import * as W from "./wallet.js";
@@ -83,6 +84,7 @@ export default function App() {
 
   const [status, setStatus] = useState("booting");
   const [lineage, setLineage] = useState(null);
+  const [keysetEpoch, setKeysetEpoch] = useState(null);
   const [setupMode, setSetupMode] = useState(null);
   const [session, setSession] = useState(null); // { actors, principalText, mode, account, registered }
   const [act, setAct] = useState(0);
@@ -122,14 +124,22 @@ export default function App() {
       try {
         const wasm = await loadProver();
         wasmRef.current = wasm;
+        // The on-chain anchor is read FIRST: without it the served keyset could only be
+        // checked against a manifest from its own origin, which proves nothing about which
+        // verifying key this ledger will actually verify against.
+        setStatus("reading on-chain verifying-key anchor");
+        const anchor = await (await anonymousLedger()).verifying_key_anchor();
         setStatus("loading proving keys");
-        keysRef.current = await loadProvingKeys();
+        keysRef.current = await loadProvingKeys(anchor);
+        // keysRef.current.transferVk/depositVk are the ON-CHAIN key texts, so this lineage
+        // check binds the proving key to the ledger's vk rather than to the served file.
         const okT = wasm.assert_pk_matches_vk(keysRef.current.transfer, keysRef.current.transferVk);
         const okD = wasm.assert_pk_matches_vk(keysRef.current.deposit, keysRef.current.depositVk);
         setLineage(okT && okD);
+        setKeysetEpoch(keysRef.current.keysetEpoch);
         setSetupMode(keysRef.current.manifest.setup_mode);
         setStatus("ready");
-        addLog("system", `prover loaded; manifest hashes and embedded proving-key lineage ${okT && okD ? "verified" : "MISMATCH"}; setup=${keysRef.current.manifest.setup_mode}`, okT && okD ? "ok" : "danger");
+        addLog("system", `prover loaded; verifying keys match the ledger's certified anchor (keyset epoch ${keysRef.current.keysetEpoch}) and embedded proving-key lineage ${okT && okD ? "verified" : "MISMATCH"}; setup=${keysRef.current.manifest.setup_mode}`, okT && okD ? "ok" : "danger");
         const params = new URLSearchParams(window.location.search);
         if (params.get("mode") === "demo") {
           await connect("demo");
@@ -534,7 +544,7 @@ export default function App() {
         </div>
         <Pill tone={status === "ready" ? "ok" : "warn"} data-testid="status">{status}</Pill>
         <Pill tone={lineage ? "ok" : lineage === null ? "dim" : "danger"}>
-          keyset {lineage === null ? "…" : lineage ? "integrity verified" : "MISMATCH"}
+          keyset {lineage === null ? "…" : lineage ? `bound to on-chain vk · epoch ${keysetEpoch}` : "MISMATCH"}
         </Pill>
         {setupMode && <Pill tone="warn">setup: {setupMode}</Pill>}
         <Pill tone="veil">Groth16 in your browser</Pill>

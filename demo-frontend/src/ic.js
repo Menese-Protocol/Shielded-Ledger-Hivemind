@@ -1,5 +1,5 @@
 // IC agent + typed actors for the demo (Menese DeFi Team).
-import { HttpAgent, Actor } from "@dfinity/agent";
+import { HttpAgent, Actor, AnonymousIdentity } from "@dfinity/agent";
 import { Principal } from "@dfinity/principal";
 import { HOST, CANISTERS } from "./config.js";
 import { idlFactory as ledgerIdl } from "./declarations/zk_ledger/zk_ledger.did.js";
@@ -31,6 +31,13 @@ async function agentFor(identity) {
     await agent.fetchRootKey();
   }
   return agent;
+}
+
+/// Boot-time read-only ledger actor. The verifying-key anchor must be read BEFORE any
+/// identity exists, because the keyset is loaded before the user connects.
+export async function anonymousLedger() {
+  const agent = await agentFor(new AnonymousIdentity());
+  return Actor.createActor(ledgerIdl, { agent, canisterId: CANISTERS.zk_ledger });
 }
 
 export async function actorsFor(identity) {

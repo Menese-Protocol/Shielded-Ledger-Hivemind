@@ -13,7 +13,8 @@
     "test:static-boot": "node scripts/verify-static-boot.mjs",
     "test:readpath": "node scripts/readpath/run-all.mjs",
     "verify:keyset": "node scripts/verify-keyset.mjs public/keys",
-    "verify:keyset:production": "node scripts/verify-keyset.mjs public/keys --require-real-value"
+    "verify:keyset:production": "node scripts/verify-keyset.mjs public/keys --require-real-value",
+    "test:keyset-cache": "node scripts/measure-keyset-cache.mjs"
   },
   "dependencies": {
     "@dfinity/agent": "^2.1.3",
