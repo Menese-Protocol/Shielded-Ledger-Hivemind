@@ -1,4 +1,4 @@
-// B-RESTORE-CORRECTNESS — A-3 zero-false-negative gate (Menese DeFi Team).
+// B-RESTORE-CORRECTNESS — zero-false-negative gate (Menese DeFi Team).
 //
 // On a MIXED-format corpus with owned notes planted at ADVERSARIAL positions (first, last,
 // page-boundary-straddling, dense cluster, inside the legacy-below-cutover region, and across a

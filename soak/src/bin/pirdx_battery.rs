@@ -767,7 +767,7 @@ fn main() {
                     // reproduce every balance — the "no financial state divergence" proof
                     // for every op the battery pushed through injected faults. (verify_full's
                     // extra tier-contract items — injection-class coverage, upgrade counts —
-                    // belong to the smoke tier, which S-4 runs separately.)
+                    // belong to the smoke tier, which the smoke tier runs separately.)
                     verify_financial(&ctx.runner);
                 }
             }

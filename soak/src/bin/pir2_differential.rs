@@ -261,7 +261,7 @@ fn main() {
         }
         println!("[diff] PHASE 2 PASS: {P2_CORPUS} records, {QUERIES} queries byte-identical (widths {widths:?})");
 
-        // ===== PHASE 3 (S-1): cross-target INSTRUCTION-COUNT equality gate =====
+        // ===== PHASE 3: cross-target INSTRUCTION-COUNT equality gate =====
         // §V2.4's auditable invariant says no branch on cell or query content; the trace's
         // `target_dependent_branches = 0` is a DECLARATION. This gate measures the claim:
         // for a fixed (shard, fill, stripe, kCols), the MEASURED `instructions` field must be

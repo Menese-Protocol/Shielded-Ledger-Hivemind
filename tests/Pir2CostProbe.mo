@@ -65,7 +65,7 @@ persistent actor Pir2CostProbe {
     Pir2.answerStripe(state, shard, fill, stripe, kCols, qu)
   };
 
-  /// TEETH for the S-1 instruction-equality privacy gate — the FORBIDDEN shape: a branch on
+  /// TEETH for the instruction-equality privacy gate — the FORBIDDEN shape: a branch on
   /// query content (skip columns whose qu word has a zero low bit), which makes the executed
   /// instruction count a function of the ciphertext the client sent. The differential's gate
   /// must DETECT this variant (unequal `instructions` across queries) while the production

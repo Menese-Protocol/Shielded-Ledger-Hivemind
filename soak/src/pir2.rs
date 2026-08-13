@@ -506,7 +506,7 @@ mod tests {
         assert_eq!(from_wire(&to_wire(&words)), words);
     }
 
-    // R2-SAMPLER (S-3): committed moment/tail regression for gaussian_error, with mutation
+    // R2-SAMPLER: committed moment/tail regression for gaussian_error, with mutation
     // teeth. Bounds committed BEFORE running (seeded → deterministic):
     //   |mean| <= 4σ/√n; σ̂ within σ·(1±0.01) both directions (sd(σ̂) ≈ σ/√(2n) ≈ 0.16%·σ;
     //   the rounded-Gaussian variance σ²+1/12 adds +0.025% — inside the window);

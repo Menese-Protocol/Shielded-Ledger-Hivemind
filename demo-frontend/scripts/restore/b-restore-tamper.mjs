@@ -1,4 +1,4 @@
-// B-RESTORE-TAMPER — A-2 mirror-tamper detection (Menese DeFi Team).
+// B-RESTORE-TAMPER — mirror-tamper detection (Menese DeFi Team).
 //
 // A malicious/faulty mirror serves corrupted detection pages; the certified detect_stream root
 // (trusted, never from the mirror) must cause the tampered segment to be REJECTED BEFORE its

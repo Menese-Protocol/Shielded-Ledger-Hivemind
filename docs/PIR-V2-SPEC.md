@@ -56,7 +56,7 @@ MUST trap if `pir2_params` echoes a different one (certification proves what the
 says, not that a seed is honest; the compiled constant is the actual defense against a
 trapdoored A).
 
-**Sampler note (measured by the S-3 battery, with mutation teeth):** every client draws the
+**Sampler note (measured by the sampler battery, with mutation teeth):** every client draws the
 noise by Box–Muller over 53-bit uniforms and rounds to an integer. Two properties are
 inherent and accepted: (1) a hard tail cap at `sqrt(2·ln(2^53+1)) ≈ 8.57σ` — the true
 Gaussian mass beyond it is ≈ 1e-17, far below any decode or security margin at these
@@ -125,7 +125,7 @@ detects a partial-schedule client (B12 proof C).
 inspectable loop bounds** — the scan loop's bounds are public functions of `(f, stripe)`
 and the source carries no data-dependent branch on cell or query content — NOT dynamic
 information-flow evidence. The measured claim is enforced separately: the differential's
-S-1 gate asserts the trace's `instructions` field EXACTLY equal across different-target
+The instruction-equality gate asserts the trace's `instructions` field EXACTLY equal across different-target
 queries at identical `(σ, f, stripe, kCols)` on a deterministic replica (word assembly runs
 in fixed-width lanes so the count cannot depend on wire content), with teeth proven against
 a deliberately leaky harness variant.
@@ -203,7 +203,7 @@ IS the 10⁸-scale stripe measurement.
 | quantity | measured | note |
 |---|---|---|
 | fold hint maintenance | 196.1M instr, 2.35 MB alloc / record | **flat across 10⁴/10⁶/4×10⁶**; runs in the background fold chunk (20 records ≈ 4×10⁹ instr ≤ the 5×10⁹ budget), NEVER in the money message |
-| stripe matvec | 255–261 instr/madd; K=486 → 1.078e9 instr | `target_dependent_branches = 0`; **flat across tiers**; instruction count EXACTLY equal across targets (S-1 gate, fixed-width word lanes) |
+| stripe matvec | 255–261 instr/madd; K=486 → 1.078e9 instr | `target_dependent_branches = 0`; **flat across tiers**; instruction count EXACTLY equal across targets (instruction-equality gate, fixed-width word lanes) |
 | inner loop | 283 instr/madd (pure-Nat32 widening) | measured winner of 7 variants (v6); vs 360 for the Nat64 shape |
 | query wire | 4·m_cols(pinned) | 34,956 B at a 2¹⁸ shard's full fill |
 | response wire | 4·m_rows = 34,560 B / stripe | ≪ 2 MiB per message |

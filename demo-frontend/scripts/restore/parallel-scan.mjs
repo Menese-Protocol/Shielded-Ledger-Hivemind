@@ -1,4 +1,4 @@
-// Parallel, streaming, resumable birthday-less restore scanner (Menese DeFi Team) — A-3.
+// Parallel, streaming, resumable birthday-less restore scanner (Menese DeFi Team).
 //
 // Streams DPAGE(4096)-aligned segments from an untrusted mirror in CHUNKS to a worker_threads pool
 // (native ECDH kernel). Each worker VERIFIES-BEFORE-SCANS every segment against the trusted

@@ -1,4 +1,4 @@
-//! §7 finding F-1 demonstration (NOT a gate target): the RAW arkworks VK deserializer is
+//! Raw-deserializer demonstration (NOT a gate target): the RAW arkworks VK deserializer is
 //! unbounded on a malformed length prefix. Kept so the finding stays reproducible and as a
 //! standing teeth that the bounded `decode_vk` target is the right boundary. The gate does
 //! NOT run this target (it is a known, documented uncontrolled-allocation demonstration).

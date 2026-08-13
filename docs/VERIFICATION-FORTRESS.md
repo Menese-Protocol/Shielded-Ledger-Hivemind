@@ -86,7 +86,7 @@ uses); the L3-flat verifier — interpreter-hostile by measurement — runs comp
 
 ## Provenance / finding
 
-§7 surfaced finding **F-1**: arkworks' raw VerifyingKey
+§7 surfaced a finding: arkworks' raw VerifyingKey
 deserializer performs an unbounded allocation on a malformed length prefix. It is not a
 production exposure (VKs decode only through the bounded wire parsers); the gate target fuzzes
 the bounded parser the system actually uses.

@@ -1,7 +1,7 @@
 //! Driver for tests/ReadPathProbe.mo — read-path A0 + detection-stream cost probe on PocketIC.
 //!
 //! Measures, on a realistic FRONTEND-shaped note population:
-//!   * A0: exact `icrc3_get_blocks` wire bytes per note (shield shape vs transfer shape),
+//!   * Exact `icrc3_get_blocks` wire bytes per note (shield shape vs transfer shape),
 //!     via the marginal candid response length of `note_blocks_range`.
 //!   * P3: the `detection_stream` per-note instruction + allocation cost (block decode +
 //!     per-note SHA-256 checksum + note_ciphertext[0..40] slice), and the committed
@@ -72,7 +72,7 @@ fn main() {
     }
     println!("[pop] note_log at {appended} (shield [0,{shield_total}), transfer [{shield_total},{})", shield_total + transfer_total);
 
-    // A0: marginal wire bytes/note = (len(range of W) - len(range of 1)) / (W-1), removing the
+    // Marginal wire bytes/note = (len(range of W) - len(range of 1)) / (W-1), removing the
     // fixed candid response framing. Measured separately in the shield and transfer regions.
     let wire_marginal = |from: u64, w: u64| -> f64 {
         let l1 = query("note_blocks_range", candid::encode_args((candid::Nat::from(from), candid::Nat::from(1u64))).unwrap()).len();

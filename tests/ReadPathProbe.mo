@@ -4,7 +4,7 @@
 /// canister imports it. It builds a phash-chained note population through the REAL
 /// NoteCodec + ICRC3 code with realistic FRONTEND envelope shapes, then:
 ///   - exposes `note_blocks_range` so the Rust driver can measure the exact candid wire
-///     size of an `icrc3_get_blocks`-shaped response (A0: bytes/note, shield vs transfer);
+///     size of an `icrc3_get_blocks`-shaped response (bytes/note, shield vs transfer);
 ///   - times the EXACT `detection_stream` core (blockAt → NoteCodec.decode → slice
 ///     note_ciphertext[0..40]) with Prim.performanceCounter(0) + allocation deltas — the
 ///     honest cost (getting note_ciphertext requires a full decode + per-note
@@ -127,7 +127,7 @@ persistent actor ReadPathProbe {
     }
   };
 
-  /// A0: exactly the `icrc3_get_blocks` per-block wire shape. The Rust driver measures the
+  /// Exactly the `icrc3_get_blocks` per-block wire shape. The Rust driver measures the
   /// candid-encoded length of this response / count to get bytes-per-note.
   public query func note_blocks_range(from : Nat, count : Nat) : async [Block] {
     let result = List.empty<Block>();

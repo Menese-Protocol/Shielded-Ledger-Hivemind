@@ -87,7 +87,7 @@ if (row === "baseline") {
 } else if (row === "cores4") {
   // pin THIS scan to 4 cores: re-exec under taskset, synthetic self-gen mode at 1e7
   // (workers generate their DPAGE-aligned segments; generation stands in for the network
-  // download exactly as in the A-4 scale proof)
+  // download exactly as in the scale proof)
   const inner = spawnSync("taskset", ["-c", "0-3", process.execPath, fileURLToPath(import.meta.url), "cores4-inner"], { stdio: "inherit" });
   process.exit(inner.status ?? 1);
 } else if (row === "cores4-inner") {

@@ -266,7 +266,7 @@ cost probes, an inner-loop micro-bench, and a keyless-observer privacy battery.
   indistinguishability for different targets, selector-marginal chi-square (with a skew
   self-test for teeth), a negative control that detects a leaking partial-schedule client,
   match-independent shard set, and the uniform-scan schedule — two seeds, 11 checks.
-- **S-1 instruction-equality gate** — differential PHASE 3: the measured `instructions`
+- **Instruction-equality gate** — differential PHASE 3: the measured `instructions`
   trace field must be EXACTLY equal across different-target queries at identical
   (shard, fill, stripe, kCols); teeth via the probe's deliberately leaky
   `answer_stripe_leaky` variant (harness-only), which must produce unequal counts.
@@ -277,7 +277,7 @@ cost probes, an inner-loop micro-bench, and a keyless-observer privacy battery.
   block log (AC-D2..D5), money-message instruction delta + fold-chunk budget (AC-D6), and
   the certified `pir2_boundary` leaf (D7). `PIRDX_EXPECT=coupled` runs the same assertions
   as the recorded RED against a synchronous-fold build.
-- **S-3 sampler battery** — `cd demo-frontend && node scripts/readpath/s3-sampler-battery.mjs`
+- **Sampler battery** — `cd demo-frontend && node scripts/readpath/s3-sampler-battery.mjs`
   (build `prover-wasm/pkg-node` first with `wasm-pack build --target nodejs --out-dir
   pkg-node`): committed moment/tail/zero-fraction bounds with mutation teeth for the JS twin,
   the shipped wasm sampler (via `pir_selectors` noise extraction), and `pir_random_u64`;
@@ -393,7 +393,7 @@ Node-only, standalone (`node scripts/restore/<file>` from `demo-frontend/`):
   corruption re-run with its detector disabled is either accepted silently (chain verify
   load-bearing) or caught by the independent position-continuity guard (defense in depth).
 - **`bench-envelope.mjs`** (device envelope, one row per invocation) +
-  **`scale-run.mjs`** (A-4 scale proof): the measured rows and zero-FN censuses published
+  **`scale-run.mjs`** (scale proof): the measured rows and zero-FN censuses published
   in `docs/RESTORE-BENCHMARKS.md`.
 
 ## 5c. The detect-chain battery: frontier + persistence

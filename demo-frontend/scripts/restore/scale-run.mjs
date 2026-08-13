@@ -1,4 +1,4 @@
-// A-4 scale proof — ONE clean measurement of a birthday-less restore at N notes with W workers
+// Scale proof — ONE clean measurement of a birthday-less restore at N notes with W workers
 // (Menese DeFi Team). Run one (N,W) per process (fresh heap, no cross-run contamination); a shell
 // loop drives the 1/2/4/8 table and the tiers. Workers self-generate their DPAGE-aligned synthetic
 // segments (no 4.8 GB on disk — generation stands in for the network download), VERIFY each chunk

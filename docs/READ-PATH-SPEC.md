@@ -130,7 +130,7 @@ from the deploy record, never a guess.
    caller can force the full `detection_stream`/`icrc3_get_blocks` scan work. Production must bound
    this (metered windows, dedicated replicas); for the valueless demo it is accepted and documented.
 
-## Birthday-less restore at scale (residual #3, closed operationally)
+## Birthday-less restore at scale (closed operationally)
 
 A wallet with no birthday must scan the full detection stream from genesis. Detection stays Ω(N)
 — privacy forbids a recipient index — so closure means making the honest linear scan cheap in

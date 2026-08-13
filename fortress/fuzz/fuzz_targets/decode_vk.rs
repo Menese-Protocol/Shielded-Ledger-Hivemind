@@ -4,7 +4,7 @@
 //! parse and asserts it is a total function: no panic, no unbounded allocation, and it never
 //! accepts a length/shape-inconsistent key.
 //!
-//! (The RAW arkworks deserializer is unbounded on a malformed length prefix — finding F-1,
+//! (The RAW arkworks deserializer is unbounded on a malformed length prefix,
 //! described in docs/VERIFICATION-FORTRESS.md "Provenance / finding"; that path is
 //! demonstrated by `decode_vk_raw` and is NOT on any untrusted-input path in production.)
 #![no_main]

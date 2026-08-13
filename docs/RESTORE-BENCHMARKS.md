@@ -11,7 +11,7 @@ here re-proves it under its specific constraint.
 
 Reproduce any row with one command from `demo-frontend/`
 (`node scripts/restore/bench-envelope.mjs <row>`); results append to
-`scripts/restore/bench-results.jsonl`. The 10⁸-scale table lives in the A-4 scale proof
+`scripts/restore/bench-results.jsonl`. The 10⁸-scale table lives in the scale proof
 (`scripts/restore/scale-run.mjs`); this document is the CONSTRAINED-device envelope.
 
 ## Measured rows (headless, reproducible)
@@ -28,7 +28,7 @@ Reproduce any row with one command from `demo-frontend/`
 Reading the envelope:
 
 - **CPU-bound**: on 4 pinned cores the scan holds ~119k notes/s — a 10⁸-record history is
-  ~14 minutes on a 4-core budget device, linearly better with more cores (the A-4 proof
+  ~14 minutes on a 4-core budget device, linearly better with more cores (the scale proof
   measured 10⁸ in 6.47 min at 8 workers).
 - **Bandwidth-bound**: at 10 Mbps the wall tracks the link floor within 5% — verification
   and scanning hide entirely behind the download. At 50 Mbps the two are balanced. The

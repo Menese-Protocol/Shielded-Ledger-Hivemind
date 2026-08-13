@@ -14,7 +14,7 @@ targets add domain assertions (idempotent decode, canonical re-check).
 | `decode_g2` | compressed G2 (blst) | total; idempotent decode |
 | `decode_fr` | 32-byte LE Fr canonicality (blst) | total; accepted scalar survives a round-trip re-check |
 | `decode_proof` | arkworks Groth16 proof (compressed + uncompressed) | total; malformed → Err, never panic |
-| `decode_vk` | the BOUNDED wire-format VK parser (same IC-length bound as `cross_oracle::parse_vk`) | total, no unbounded alloc (finding F-1: the RAW arkworks deserializer is unbounded — `decode_vk_raw` reproduces it, off the gate) |
+| `decode_vk` | the BOUNDED wire-format VK parser (same IC-length bound as `cross_oracle::parse_vk`) | total, no unbounded alloc (the RAW arkworks deserializer is unbounded — `decode_vk_raw` reproduces it, off the gate) |
 | `public_input_parser` | Groth16 public-input vector (u64 count + 32-byte-LE canonical Fr) | total; bounded count; never accepts a non-canonical (≥ r) scalar |
 | `ceremony_contribution` | ceremony contribution wire decoder (`ceremony::transcript::delta_from_wire`) | total; malformed → Err, no unbounded alloc |
 | `ceremony_transcript` | ceremony transcript framing (length-prefixed delta records) | total on arbitrary framing; bounded loop |
