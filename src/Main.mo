@@ -489,6 +489,16 @@ persistent actor ZkLedger {
   // A fresh configure() installs the recipient-bound v2 statement immediately.
   var transfer_statement_version : Nat = 1;
   var test_fail_after_token_once : Bool = false;
+  /// ONE-WAY seal on every fault-injection hook. Set by `seal_test_hooks`, never cleared, and
+  /// stable across upgrades.
+  ///
+  /// The README classifies the fault-injection surface as belonging to the DEMO deployment and
+  /// says it must not exist in a real-value one. Motoko has no conditional compilation, so a
+  /// build variant would be a second binary someone has to remember to use -- and the failure
+  /// mode of "remember" is the one that ships the wrong wasm. A seal that cannot be undone is
+  /// checkable from outside: the pool is sealed before value arrives, and no later call, upgrade,
+  /// or administrator can bring the hooks back.
+  var test_hooks_sealed : Bool = false;
   // Fault-injection hook for the PIR fold (AC-D1/AC-D4 battery; test_fail_after_token_once
   // precedent): while > 0, the fold path traps. In the synchronous wiring the in-message
   // rollback keeps the counter armed (every transfer traps until disarmed) — the exact
@@ -1569,6 +1579,14 @@ persistent actor ZkLedger {
   public shared ({ caller }) func __detect_rebuild_chunk() : async Bool {
     if (not Principal.equal(caller, selfPrincipal())) Runtime.trap("detect-rebuild:self-only");
     if (not detect_rebuild_active) return true;
+    // Same three bounds the audit note walk carries, for the same reasons. This path reads the
+    // SAME variable-length notes through `StableLog.get`, so a count cap alone bounds how many
+    // notes a chunk touches and says nothing about the bytes it moves or the instructions it
+    // charges. Exiting early needs no new state: `detect_rebuild_cursor` already persists the
+    // position and the driver re-arms on a `false` return, so both exits are resumable by
+    // construction rather than by adding a second cursor.
+    let chunk_c0 = Prim.performanceCounter(0);
+    var steppedBytes : Nat = 0;
     var stepped : Nat = 0;
     while (stepped < AUDIT_NOTES_PER_CHUNK and detect_rebuild_cursor < noteCount()) {
       let encoded = switch (StableLog.get(note_log, detect_rebuild_cursor)) {
@@ -1588,6 +1606,12 @@ persistent actor ZkLedger {
       };
       detect_rebuild_cursor += 1;
       stepped += 1;
+      steppedBytes += encoded.size();
+      // Both checked AFTER at least one note has been folded, so a single note larger than the
+      // whole budget still makes progress and the walk can never stall. Returning `false` is the
+      // existing "not done" reply, so the driver resumes from the cursor rather than restarting.
+      if (steppedBytes >= AUDIT_BYTES_PER_CHUNK) return false;
+      if (Prim.performanceCounter(0) - chunk_c0 >= AUDIT_INSTRUCTIONS_PER_CHUNK) return false;
     };
     if (detect_rebuild_cursor >= noteCount()) {
       // atomic swap in the SAME message the walk catches the live tail
@@ -1689,6 +1713,261 @@ persistent actor ZkLedger {
   public query ({ caller }) func compact_cost() : async Nat64 {
     if (not isAdministrator(caller)) Runtime.trap("REJECT:not-administrator");
     compact_instructions
+  };
+
+  /// Release an unshield intent that can NEVER finalize, writing off its change notes.
+  /// The accounting below is checked by `tests/ReleaseSolvencyNegativeControl.mo`, which knocks out
+  /// each guard in turn and shows it holds its own invariant and only its own.
+  ///
+  /// WHY. `repair_tree_state` closes the idle corruption traps but refuses while a pending
+  /// exists, and relaxing that would not help: the pending captured `root_after` against the
+  /// corrupt tree, so after a repair the finalize cross-check disagrees and it still cannot
+  /// settle. The lifecycle model leaves 8 funds-stuck states, all in-flight, and the worst is a
+  /// paid intent whose receipt can never be written.
+  ///
+  /// THE HAZARD THIS AVOIDS. Nullifiers are burned only in `finalizeUnshield`, never at intent
+  /// creation. So for a PAID intent the input notes are still spendable and `pool_value` still
+  /// claims the money. Simply clearing the pending would be a double-spend AND a solvency break.
+  /// The release therefore branches on what actually happened on the token ledger, established by
+  /// the same `reconcileUnshieldBlock` the resume path uses — never by a flag and never by the
+  /// caller's assertion.
+  ///
+  /// THIS IS A WRITE-OFF, NOT A RECOVERY. On the paid branch the two change notes are NOT
+  /// appended, because the tree is corrupt — that is the premise. Their value is lost. The reply
+  /// names it so the administrator calling it cannot mistake this for a repair.
+  public shared ({ caller }) func release_unfinalizable_unshield() : async Result<{
+    payout_found : Bool;
+    nullifiers_burned : Nat;
+    pool_debited : Nat;
+    change_notes_lost : Nat;
+  }> {
+    if (not isAdministrator(caller)) return #err("REJECT:not-administrator");
+    let pending = switch (pending_unshield) {
+      case (?value) value;
+      case null return #err("REJECT:no-pending-unshield");
+    };
+
+    // PROVE it cannot finalize, rather than trusting that it looks stuck. This is the same
+    // rebuild `finalizeUnshield` performs; if it succeeds the intent CAN settle and the normal
+    // path must be used instead of destroying value here.
+    switch (
+      frontierAppend(
+        currentTree(),
+        [blobToHex(pending.output_1.commitment), blobToHex(pending.output_2.commitment)],
+      )
+    ) {
+      case (#ok(_)) return #err("REJECT:intent-can-finalize");
+      case (#err(_)) {};
+    };
+
+    let outcome = await reconcileUnshieldBlock(pending);
+
+    // COMMIT-POINT DISCIPLINE, the same the resume path applies: state can change across an
+    // await, so the pending is RE-READ and confirmed identical before anything is written. A
+    // release applied to an intent that moved underneath us would burn the wrong nullifiers.
+    let current = switch (pending_unshield) {
+      case (?value) value;
+      case null return #err("REJECT:pending-unshield-changed");
+    };
+    if (current.intent_id != pending.intent_id) return #err("REJECT:pending-unshield-changed");
+
+    switch (outcome) {
+      // An inconclusive read must NEVER be treated as absent. That distinction is the difference
+      // between a write-off and taking money that was never paid.
+      case (#error(message)) return #err("PENDING:unshield-reconcile-scan:" # message);
+
+      // Nothing left the token ledger. Clear the intent and touch nothing else: the input notes
+      // stay spendable, which is correct, because no money moved.
+      case (#absent) {
+        pending_unshield := null;
+        pending_unshield_prepared := null;
+        if (pending_unshield_prepaid_debit > 0) { pending_unshield_prepaid_debit := 0 };
+        refreshCertification();
+        #ok({ payout_found = false; nullifiers_burned = 0; pool_debited = 0; change_notes_lost = 0 })
+      };
+
+      // The payout landed. From here nothing is fallible and the write is total.
+      case (#found(_)) {
+        addNullifier(current.nullifier_1);
+        addNullifier(current.nullifier_2);
+        pool_value -= current.pool_debit;
+        if (pending_unshield_prepaid_debit > 0) {
+          prepaid_fee_revenue += pending_unshield_prepaid_debit;
+          pending_unshield_prepaid_debit := 0;
+        };
+        epoch += 1;
+        switch (StableBlobSet.put(completed_unshield_intents, current.intent_id)) {
+          case (#ok(true)) {
+            unshields_put_counter += 1;
+            unshields_fold_digest := xorFold(unshields_fold_digest, current.intent_id);
+          };
+          case (#ok(false)) Runtime.trap("stable-state:completed-unshield-duplicate");
+          case (#err(message)) Runtime.trap(message);
+        };
+        pending_unshield := null;
+        pending_unshield_prepared := null;
+        refreshCertification();
+        #ok({
+          payout_found = true;
+          nullifiers_burned = 2;
+          pool_debited = current.pool_debit;
+          change_notes_lost = 2;
+        })
+      };
+    }
+  };
+
+  /// Seal every fault-injection hook, permanently and irreversibly.
+  ///
+  /// There is deliberately NO unseal. The value of this call is entirely in being one-way: the
+  /// pool is sealed before real value arrives, and from then on no administrator, no upgrade and
+  /// no later call can re-arm a hook that can break the payout path. A reversible switch would
+  /// carry the same risk it exists to remove.
+  ///
+  /// Idempotent — sealing an already-sealed pool succeeds rather than erroring, so a deployment
+  /// runbook that runs it twice is not told something is wrong.
+  ///
+  /// Verifiable from outside: `test_hooks_status` reports the seal, so the classification of a
+  /// deployment as demo-or-real can be checked rather than asserted.
+  public shared ({ caller }) func seal_test_hooks() : async Result<()> {
+    if (not isAdministrator(caller)) return #err("REJECT:not-administrator");
+    test_hooks_sealed := true;
+    // Disarm anything already armed, so sealing is not merely "no NEW faults" while a previously
+    // armed one-shot is still waiting to fire on the next payout.
+    test_fail_after_token_once := false;
+    test_pir2_fold_trap_remaining := 0;
+    #ok(())
+  };
+
+  /// Whether the fault-injection surface is sealed. Open to every caller: this is the fact a
+  /// user or a reviewer needs to classify a deployment, and withholding it would make the
+  /// classification unverifiable from outside.
+  public query func test_hooks_status() : async Bool { test_hooks_sealed };
+
+  /// Repair a tree state that holds a non-canonical value, and clear quarantine as a consequence.
+  /// The lane guard and the root derivation are both checked by
+  /// `tests/RepairGuardNegativeControl.mo`; the reachability claim below by
+  /// `tests/IntentLifecycleModel.mo`.
+  ///
+  /// WHY THIS EXISTS. The lifecycle model enumerates 30 reachable states and finds 12 from which
+  /// settlement is unreachable, every one of them carrying a non-canonical stored value. The
+  /// worst is a paid-but-unfinalized intent: the token payout has landed and the intent can never
+  /// finalize, because `finalizeUnshield` rebuilds the frontier from `currentTree()` and a bad
+  /// lane makes `frontierAppend` return `#err` forever. Adding this one transition takes all 12
+  /// to zero.
+  ///
+  /// WHY IT IS SHAPED THIS WAY. A function that can write `tree_state` can install any root it
+  /// likes — which is exactly the defect the intake fix closed. So the administrator does NOT
+  /// name a root. They supply LANES; every lane must parse as a canonical field element through
+  /// the same check intake uses; and the canister DERIVES the root from them with
+  /// `frontierRootOf`, whose agreement with the append walk is pinned by
+  /// `tests/FrontierRootProperty.mo`. A caller cannot assert a root into existence here.
+  ///
+  /// It refuses on a healthy pool, and the refusal is measured against the LIVE state rather than
+  /// trusting `state_quarantine` — a flag can be stale, the stored values cannot. It refuses
+  /// while any intent is in flight, because moving the anchor under a settlement is its own
+  /// defect. Nothing is written on any refusal path: a partial repair is worse than none.
+  public shared ({ caller }) func repair_tree_state(lanes : [Text], next_index : Nat64) : async Result<TreeState> {
+    if (not isAdministrator(caller)) return #err("REJECT:not-administrator");
+    if (not configured()) return #err("REJECT:unconfigured");
+    // No repair while a settlement could be relying on the current anchor.
+    if (pending_shield != null or pending_unshield != null) return #err("REJECT:pending-in-flight");
+
+    // Refuse on a healthy pool, verified against stored values rather than the flag.
+    let live = currentTree();
+    var offenders = 0;
+    switch (PoseidonTree.parseFieldElement(live.root)) { case (?_) {}; case null offenders += 1 };
+    for (lane in live.filled.vals()) {
+      switch (PoseidonTree.parseFieldElement(lane)) { case (?_) {}; case null offenders += 1 };
+    };
+    if (offenders == 0) return #err("REJECT:pool-not-corrupt");
+
+    if (lanes.size() != PoseidonTree.DEPTH) return #err("REJECT:frontier-length");
+    if (next_index >= (1 : Nat64) << 32) return #err("REJECT:tree-full");
+
+    // Every supplied lane must be canonical, or nothing happens.
+    let parsed = Prim.Array_init<Nat>(PoseidonTree.DEPTH, 0);
+    var i = 0;
+    for (lane in lanes.vals()) {
+      switch (PoseidonTree.hexToNat(lane)) {
+        case (?value) { parsed[i] := value };
+        case null return #err("REJECT:lane-field");
+      };
+      i += 1;
+    };
+
+    // The root is DERIVED, never supplied.
+    let zeros = PoseidonTree.zeroHashes();
+    let frontier : PoseidonTree.Frontier = {
+      filled = Array.fromVarArray(parsed);
+      nextIndex = next_index;
+    };
+    let derivedRootHex = PoseidonTree.natToHex(PoseidonTree.frontierRootOf(frontier, zeros));
+    let rootBlob = switch (hexToBlob(derivedRootHex)) {
+      case (?value) value;
+      case null return #err("REJECT:root-encode");
+    };
+    let repaired : TreeState = { filled = lanes; root = derivedRootHex; next_index };
+
+    // Every refusal is above this line. From here the write is total.
+    tree_state := ?repaired;
+    note_root := rootBlob;
+    addRoot(rootBlob);
+    state_quarantine := false;
+    state_quarantine_values := [];
+    refreshCertification();
+    #ok(repaired)
+  };
+
+  /// Slots inspected by one `canonicality_scan` call. A key read is 32 bytes against the 1 byte
+  /// the audit's tag walk reads, so this window is deliberately far smaller than
+  /// `AUDIT_SLOTS_PER_CHUNK`: at that width a census would read ~134 MB per call.
+  let CANONICALITY_SLOTS_PER_CALL : Nat64 = 65_536;
+
+  /// Canonicality census over one window of a set.
+  ///
+  /// The postupgrade scan covers `tree_state` and the pendings, and it is bounded deliberately.
+  /// It cannot cover `historical_roots` or the nullifier set, because those are unbounded and an
+  /// unbounded postupgrade is the defect class this ledger has already closed once. So the census
+  /// lives here instead: bounded per call, resumable through a cursor the CALLER carries, and
+  /// therefore adding no stable state and no cost to any existing path.
+  ///
+  /// REPORTS ONLY, and that is a deliberate choice rather than an omission. Finding a
+  /// non-canonical key does NOT raise quarantine, because quarantine currently has no exit --
+  /// nothing in the canister can clear the flag or repair the value. Wiring a new way INTO a
+  /// state with no way out would convert a reporting gap into a freezing hazard, which is
+  /// strictly worse than the gap. When a repair path exists, this is where it would be armed.
+  ///
+  /// Counts only: the reply carries totals, never key bytes, so it discloses nothing a membership
+  /// query would not. Admin-gated on the `compact_cost` precedent above; it is a
+  /// confidentiality-only gate on a single-replica answer, and nothing an attacker could act on.
+  public query ({ caller }) func canonicality_scan(
+    target : CompactTarget,
+    from : Nat64,
+    count : Nat64,
+  ) : async Result<{ scanned : Nat; offenders : Nat; next : Nat64; done : Bool }> {
+    if (not isAdministrator(caller)) return #err("REJECT:not-administrator");
+    let set = switch (target) {
+      case (#roots) historical_roots;
+      case (#nullifiers) spent_nullifiers;
+      case (#shields) completed_shield_intents;
+      case (#unshields) completed_unshield_intents;
+    };
+    let capacity = StableBlobSet.activeCapacity(set);
+    let window = if (count == 0 or count > CANONICALITY_SLOTS_PER_CALL) CANONICALITY_SLOTS_PER_CALL else count;
+    switch (StableBlobSet.keysRange(set, set.table_offset, capacity, from, window)) {
+      case (#err(message)) #err(message);
+      case (#ok(keys)) {
+        var offenders = 0;
+        for (k in keys.vals()) {
+          // `blobToNat` returns null at or above the field modulus, so it IS the canonicality
+          // predicate. `natToHex` would TRAP on exactly the keys this census exists to find.
+          switch (PoseidonTree.blobToNat(k)) { case (?_) {}; case null offenders += 1 };
+        };
+        let next = if (from + window > capacity) capacity else from + window;
+        #ok({ scanned = keys.size(); offenders; next; done = next >= capacity })
+      };
+    }
   };
 
   public shared ({ caller }) func detect_chain_rebuild_resume() : async Result<()> {
@@ -2060,6 +2339,7 @@ persistent actor ZkLedger {
   /// Touches ONLY test state, never ledger state, so it carries no guard check — the battery
   /// must be able to disarm while degraded.
   public shared ({ caller }) func test_arm_pir2_fold_trap(count : Nat) : async Result<()> {
+    if (test_hooks_sealed) return #err("REJECT:test-hooks-sealed");
     if (not isAdministrator(caller)) return #err("REJECT:not-administrator");
     test_pir2_fold_trap_remaining := count;
     #ok(())
@@ -2069,6 +2349,7 @@ persistent actor ZkLedger {
   /// (XOR 0xFF), bounded to the shard's span — the AC-D4 repairability battery's injection
   /// (admin; the repair path must restore byte-identity from the authoritative log).
   public shared ({ caller }) func test_pir2_corrupt_hint(shard : Nat, offset : Nat, len : Nat) : async Result<()> {
+    if (test_hooks_sealed) return #err("REJECT:test-hooks-sealed");
     if (not isAdministrator(caller)) return #err("REJECT:not-administrator");
     if (not pir2_state.enabled) return #err("REJECT:pir2-not-enabled");
     let g = Pir2.geometry(pir2_state.shard_size);
@@ -2938,6 +3219,7 @@ persistent actor ZkLedger {
   };
 
   public shared ({ caller }) func test_arm_fail_after_token_once() : async Result<()> {
+    if (test_hooks_sealed) return #err("REJECT:test-hooks-sealed");
     switch (guardRejection()) { case (?message) return #err(message); case null {} };
     if (not isAdministrator(caller)) return #err("REJECT:not-administrator");
     if (pending_shield != null or pending_unshield != null) return #err("REJECT:pending-token-mutation");
@@ -3090,15 +3372,27 @@ persistent actor ZkLedger {
   public query func icrc3_get_blocks(args : [GetBlocksArgs]) : async GetBlocksResult {
     let result = List.empty<Block>();
     var emitted : Nat = 0;
+    // A block carries a variable-length note, so `MAX_BLOCKS_PER_CALL` bounds how MANY blocks a
+    // reply holds and says nothing about the bytes they carry. The count cap binds first for
+    // ordinary traffic and stops binding exactly when traffic is abnormal, which is when the
+    // bound is wanted -- the same reasoning that put a byte ceiling on the audit note walk.
+    var emittedBytes : Nat = 0;
     label ranges for (range in args.vals()) {
       if (range.start < noteCount()) {
         let end = Nat.min(range.start + range.length, noteCount());
         var i = range.start;
         while (i < end) {
           if (emitted >= MAX_BLOCKS_PER_CALL) break ranges;
-          List.add(result, { id = i; block = NoteAudit.blockValue(blockAt(i)) });
+          let decoded = blockAt(i);
+          List.add(result, { id = i; block = NoteAudit.blockValue(decoded) });
           emitted += 1;
+          // The ciphertext is the variable-length part of a block; every other field is fixed
+          // width, so it is the term that makes a reply's size unbounded in anything but count.
+          emittedBytes += decoded.note_ciphertext.size();
           i += 1;
+          // Checked AFTER the append, so a single oversized block is still returned rather than
+          // making the range unreadable. `log_length` below lets a caller resume from `i`.
+          if (emittedBytes >= AUDIT_BYTES_PER_CHUNK) break ranges;
         };
       };
     };
