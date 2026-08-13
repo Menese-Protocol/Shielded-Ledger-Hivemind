@@ -41,11 +41,55 @@
       "type": "custom",
       "candid": "nns_adapter/nns_adapter.did",
       "wasm": "nns_adapter/target/wasm32-unknown-unknown/release/nns_adapter.wasm"
+    },
+    "scale_fixture": {
+      "type": "motoko",
+      "main": "tests/ScaleFixture.mo"
+    },
+    "scale_fixture_layout1": {
+      "type": "motoko",
+      "main": "tests/ScaleFixtureLayout1.generated.mo"
+    },
+    "scale_fixture_b": {
+      "type": "motoko",
+      "main": "tests/ScaleFixture.mo"
+    },
+    "scale_fixture_c": {
+      "type": "motoko",
+      "main": "tests/ScaleFixture.mo"
+    },
+    "icrc3_archive_fixture": {
+      "type": "motoko",
+      "main": "tests/Icrc3ArchiveFixture.mo"
+    },
+    "hash_parity_fixture": {
+      "type": "motoko",
+      "main": "tests/HashParityFixture.mo"
+    },
+    "hash_parity_fixture_b": {
+      "type": "motoko",
+      "main": "tests/HashParityFixture.mo"
+    },
+    "window_fixture": {
+      "type": "motoko",
+      "main": "tests/WindowFixture.mo"
+    },
+    "zk_ledger_u1": {
+      "type": "motoko",
+      "main": "src/Main.mo"
+    },
+    "evil_tree_oracle": {
+      "type": "motoko",
+      "main": "tests/EvilTreeOracle.mo"
+    },
+    "honest_tree_oracle": {
+      "type": "motoko",
+      "main": "tests/HonestTreeOracle.mo"
     }
   },
   "networks": {
     "local": {
-      "bind": "127.0.0.1:4945",
+      "bind": "127.0.0.1:41403",
       "type": "ephemeral"
     }
   }

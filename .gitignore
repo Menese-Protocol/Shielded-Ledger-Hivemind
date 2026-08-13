@@ -19,3 +19,13 @@ node_modules/
 /src/MainTestHooks.generated.mo
 demo-frontend/scripts/restore/scale-results.jsonl
 demo-frontend/scripts/restore/bench-resume.ckpt.json
+
+# Lab artifacts — reproducible via the tests in scripts/ and demo-frontend/tests/, not shipped.
+evidence/
+*.log
+HANDOFF*.md
+SESSION-CHECKPOINT*.md
+session-checkpoint*.md
+AUTONOMOUS-*.md
+MISSION-*.md
+scratch/
