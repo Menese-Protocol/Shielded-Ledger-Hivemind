@@ -1,4 +1,4 @@
-// S-3 sampler-hardening battery (Menese DeFi Team) — moment/tail regression for the PIR
+// Sampler-hardening battery (Menese DeFi Team) — moment/tail regression for the PIR
 // noise samplers, with committed thresholds and mutation teeth.
 //
 // Samplers under test:

@@ -1,4 +1,15 @@
-import assert from "node:assert/strict";
+import assertRaw from "node:assert/strict";
+
+// Executed-assertion counter. Delegates to node:assert/strict UNCHANGED and records what actually
+// EXECUTED. No assertion is weakened, added or reordered -- this wraps, it does not alter. A
+// runtime counter is required rather than a static one: this file runs its assertions in loops,
+// so a call-site grep undercounts them.
+let passed = 0;
+const count = (fn) => (...a) => { const r = fn(...a); passed += 1; return r; };
+const assert = new Proxy(assertRaw, {
+  apply: (t, self, a) => { const r = Reflect.apply(t, self, a); passed += 1; return r; },
+  get: (t, p) => { const v = Reflect.get(t, p); return typeof v === "function" ? count(v.bind(t)) : v; },
+});
 import { parseDemoAmount } from "../src/amounts.js";
 
 const accepted = new Map([
@@ -19,3 +30,4 @@ for (const text of ["", " ", ".1", "-1", "+1", "1e3", "1.000000001", "1,2,3", "N
 }
 
 console.log("AMOUNT PARSER: exact 8-decimal and malformed-input battery GREEN");
+console.log(`=== RESULT: ${passed} passed, 0 failed ===`);

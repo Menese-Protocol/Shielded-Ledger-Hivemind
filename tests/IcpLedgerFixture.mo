@@ -82,6 +82,7 @@ persistent actor IcpLedgerFixture {
     get_blocks : shared query NnsBlock.GetBlocksArgs -> async NnsBlock.GetBlocksResult;
     get_encoded_blocks : shared query NnsBlock.GetBlocksArgs -> async NnsBlock.GetEncodedBlocksResult;
   };
+  type Icrc3ArchiveActor = actor { icrc3_get_blocks : GetBlocksCallback };
 
   let NAME = "Internet Computer";
   let SYMBOL = "ICP";
@@ -99,6 +100,15 @@ persistent actor IcpLedgerFixture {
   // when armed, the NEXT icrc2_transfer_from traps mid-call, exercising the backend's
   // rollback of a failed token inter-canister call.
   var trap_next_transfer_from : Bool = false;
+  // ICRC-3 archiving. Blocks below icrc3_archived_count are served by the archive canister, not
+  // inline — the shape a real archiving ledger presents, and the shape this view used to be
+  // structurally incapable of producing.
+  var icrc3_archived_count : Nat = 0;
+  var icrc3_archive_id : ?Principal = null;
+  // Forces the next transfer to answer #GenericError, the variant no specification makes
+  // transient. Used to prove a pending intent still reaches a terminal state under an error the
+  // ledger cannot classify.
+  var generic_error_transfers : Nat = 0;
   var decimals : Nat8 = 8;
   var archive_id : ?Principal = null;
   var archived_count : Nat = 0;
@@ -285,7 +295,42 @@ persistent actor IcpLedgerFixture {
   public query func icrc1_name() : async Text { NAME };
   public query func icrc1_symbol() : async Text { SYMBOL };
   public query func icrc1_decimals() : async Nat8 { decimals };
-  public query func icrc1_fee() : async Nat { fee_e8s };
+  /// `configure_token_ledger` sets `token_configuring := true` and then awaits this. Holding
+  /// the reply open is the only way to have an upgrade land INSIDE that await, which is the
+  /// premise this test rests on and which nothing else could stage — a stopped callee rejects
+  /// immediately rather than blocking. Each hop is a real self-call, so `hops` is a delay in
+  /// message rounds. Shared rather than `query` because a query cannot await.
+  var slow_fee_hops : Nat = 0;
+
+  public shared func test_arm_slow_fee(hops : Nat) : async () { slow_fee_hops := hops };
+
+  public shared func __slow_hop(n : Nat) : async () {
+    if (n == 0) return;
+    let self : actor { __slow_hop : shared (Nat) -> async () } =
+      actor (Principal.toText(Principal.fromActor(IcpLedgerFixture)));
+    await self.__slow_hop(n - 1);
+  };
+
+  /// The ledger declares this `shared query` (Main.mo:69) and a query cannot make an
+  /// inter-canister call, so the self-call chain above can never run inside it — which is why 3,000
+  /// and 40,000 hops behaved identically. Compute is the only delay a query can express, so the
+  /// window is widened by burning instructions instead. Capped well under the 5e9 query ceiling.
+  var burn_fee_rounds : Nat = 0;
+
+  public shared func test_arm_burn_fee(rounds : Nat) : async () { burn_fee_rounds := rounds };
+
+  public query func icrc1_fee() : async Nat {
+    if (burn_fee_rounds > 0) {
+      var i : Nat = 0;
+      var acc : Nat = 7;
+      while (i < burn_fee_rounds * 1_000_000) {
+        acc := (acc * 31 + i) % 1_000_003;
+        i += 1;
+      };
+      if (acc == 0) return 0;
+    };
+    fee_e8s
+  };
   public query func icrc1_metadata() : async [(Text, MetadataValue)] {
     [
       ("icrc1:name", #Text(NAME)),
@@ -305,6 +350,10 @@ persistent actor IcpLedgerFixture {
   };
 
   public shared ({ caller }) func icrc1_transfer(args : TransferArg) : async TransferResult {
+    if (generic_error_transfers > 0) {
+      generic_error_transfers -= 1;
+      return #Err(#GenericError({ error_code = 9; message = "TEST_ONLY:unclassifiable" }));
+    };
     switch (validateTime(args.created_at_time)) {
       case (#tooOld) return #Err(#TooOld);
       case (#future(value)) return #Err(#CreatedInFuture({ ledger_time = value }));
@@ -459,6 +508,10 @@ persistent actor IcpLedgerFixture {
 
   public shared ({ caller }) func icrc2_transfer_from(args : ICRC2.TransferFromArgs) : async ICRC2.TransferFromResult {
     if (trap_next_transfer_from) { trap_next_transfer_from := false; Runtime.trap("TEST_ONLY:token-call-trap") };
+    if (generic_error_transfers > 0) {
+      generic_error_transfers -= 1;
+      return #Err(#GenericError({ error_code = 9; message = "TEST_ONLY:unclassifiable" }));
+    };
     switch (validateTime(args.created_at_time)) {
       case (#tooOld) return #Err(#TooOld);
       case (#future(value)) return #Err(#CreatedInFuture({ ledger_time = value }));
@@ -601,20 +654,59 @@ persistent actor IcpLedgerFixture {
     }
   };
 
+  /// ICRC-3 view WITH archiving, mirroring what query_blocks already does for the legacy surface.
+  /// Blocks below icrc3_archived_count are not served inline; the reply names the archive and the
+  /// sub-range, and the caller is expected to follow the callback.
   public query func icrc3_get_blocks(ranges : [ICRC2.GetBlocksArgs]) : async FullGetBlocksResult {
     let result = List.empty<ICRC2.Block>();
+    let deferred = List.empty<ArchivedBlocks>();
     for (range in ranges.vals()) {
       let end = Nat.min(blocks.size(), range.start + range.length);
-      var index = range.start;
+      // live window
+      let localStart = Nat.max(range.start, icrc3_archived_count);
+      var index = localStart;
       while (index < end) {
         List.add(result, { id = index; block = blocks[index] });
         index += 1;
       };
+      // archived portion of the SAME request
+      let archivedEnd = Nat.min(end, icrc3_archived_count);
+      if (range.start < archivedEnd) {
+        switch (icrc3_archive_id) {
+          case (?id) List.add(deferred, {
+            args = [{ start = range.start; length = archivedEnd - range.start }];
+            callback = (actor (Principal.toText(id)) : Icrc3ArchiveActor).icrc3_get_blocks;
+          });
+          case null {};
+        };
+      };
     };
-    { blocks = List.toArray(result); log_length = blocks.size(); archived_blocks = [] }
+    { blocks = List.toArray(result); log_length = blocks.size(); archived_blocks = List.toArray(deferred) }
   };
 
-  public query func icrc3_get_archives(_args : GetArchivesArgs) : async [ArchiveInfo] { [] };
+  public query func icrc3_get_archives(_args : GetArchivesArgs) : async [ArchiveInfo] {
+    switch (icrc3_archive_id) {
+      case (?id) if (icrc3_archived_count > 0) [{ canister_id = id; start = 0; end = icrc3_archived_count }] else [];
+      case null [];
+    }
+  };
+
+  /// Move the first `count` blocks behind `id`. The blocks stay in `blocks` so the fixture can
+  /// still answer about them internally; what changes is that the ICRC-3 view stops serving them
+  /// inline, which is exactly the condition the reconcile walk has to survive.
+  public shared func test_set_icrc3_archive(id : ?Principal, count : Nat) : async () {
+    icrc3_archive_id := id; icrc3_archived_count := count;
+  };
+
+  public query func test_icrc3_archive() : async { archived : Nat; archive : ?Principal } {
+    { archived = icrc3_archived_count; archive = icrc3_archive_id }
+  };
+
+  /// The blocks the archive must be loaded with, so a battery can hand them over verbatim.
+  public query func test_blocks_range(start : Nat, count : Nat) : async [ICRC2.Block] {
+    let end = Nat.min(blocks.size(), start + count);
+    if (start >= end) [] else Array.tabulate<ICRC2.Block>(end - start, func(i) { { id = start + i; block = blocks[start + i] } })
+  };
 
   system func postupgrade() { refreshCertification() };
 
@@ -630,6 +722,13 @@ persistent actor IcpLedgerFixture {
   public query func test_mode() : async DedupMode { dedup_mode };
   public shared func test_set_fee(value : Nat) : async () { fee_e8s := value };
   public shared func test_arm_transfer_from_trap() : async () { trap_next_transfer_from := true };
+  /// The arm above is written one-shot -- `:510` clears the flag then traps -- but a TRAP ROLLS
+  /// BACK the clearing assignment, so it re-arms on every rollback and can never disarm itself.
+  /// That cannot be fixed inside the trapping message by construction, so a separate entry point
+  /// is required. Symmetry worth keeping: a `return` does NOT roll back state, which is how a
+  /// misplaced check once burned nullifiers; a `trap` DOES, which is why this hook stuck.
+  public shared func test_disarm_transfer_from_trap() : async () { trap_next_transfer_from := false };
+  public shared func test_arm_generic_error(n : Nat) : async () { generic_error_transfers := n };
   public shared func test_set_decimals(value : Nat8) : async () { decimals := value };
   public shared func test_set_archive(id : ?Principal, count : Nat) : async () {
     assert count <= legacy_blocks.size();

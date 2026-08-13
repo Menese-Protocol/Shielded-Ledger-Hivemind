@@ -72,8 +72,8 @@ fn edge_values() -> Vec<F> {
         F::zero(),
         F::from(1u64),
         F::from(2u64),
-        -F::from(1u64), // P-1
-        -F::from(2u64), // P-2
+        -F::from(1u64), // p-1, i.e. -1 reduced mod the field modulus
+        -F::from(2u64), // p-2
         F::from(u64::MAX),
         F::from(u64::MAX) + F::from(1u64), // 2^64
     ]
