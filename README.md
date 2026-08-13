@@ -117,6 +117,27 @@ a scan of the public commitment log recovers every note you own; starting from y
 sealed birthday, not from block zero. Instant trial identities are memory-only by design and
 vanish with the tab.
 
+## Trusting the keys you prove with
+
+Everything above is about the keys you own. One more key decides whether a proof is worth
+anything: the proving key the browser downloads over the network, like any other asset.
+
+Checking each key file against a manifest proves less than it appears to. The manifest is served
+from the same origin as the files it describes, so an attacker who controls the served assets
+replaces all five together and every hash still agrees. That catches corruption. It never
+catches substitution.
+
+So the browser checks the keys against the ledger instead. The canister publishes a certified
+**verifying-key anchor** over the keys it will actually verify against. The browser reads that
+anchor from the canister, recomputes the digest from the key text itself rather than trusting
+the digest field of the reply it is checking, and refuses to load a keyset that disagrees. The
+comparison crosses a trust boundary: the anchor comes from consensus, the keys come from a web
+server, and only the canister can move the anchor.
+
+The refusal is mandatory rather than advisory. The loader will not return a keyset without an
+anchor, so no caller can quietly fall back to the weaker check, and a mismatch names which half
+failed instead of surfacing later as an unexplained verification error.
+
 ## Finding your notes; the read path
 
 A shielded pool has no balance table to consult, so every wallet must recognize its own notes
