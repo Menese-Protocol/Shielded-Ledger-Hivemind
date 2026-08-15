@@ -47,9 +47,23 @@ const toxic = run(toxicDir);
 assert.notEqual(toxic.status, 0, "publicly reproducible setup randomness was accepted");
 assert.match(toxic.stderr, /publicly reproducible setup randomness/);
 
+// The production gate no longer turns on the manifest's `real_value_eligible` boolean -- a
+// hand-editable field cannot authorise a deployment -- so this asserts the new refusal AND that
+// flipping the boolean does not buy a pass. The second half is the one that matters: it is the
+// exact edit someone in a hurry would make.
 const production = run(source, ["--require-real-value"]);
-assert.notEqual(production.status, 0, "single-party DEMO keyset was misclassified as real-value eligible");
-assert.match(production.stderr, /not real-value eligible/);
+assert.notEqual(production.status, 0, "single-party DEMO keyset was accepted for real value");
+assert.match(production.stderr, /no ceremony transcript recorded/);
 
-console.log("KEYSET NEGATIVES: byte mutation, public toxic waste, and real-value gate GREEN");
+const flippedDir = await mkdtemp(join(tmpdir(), "picp-keyset-flipped-"));
+await cp(source, flippedDir, { recursive: true });
+const flippedPath = join(flippedDir, "SETUP-MANIFEST.json");
+const flipped = JSON.parse(await readFile(flippedPath, "utf8"));
+flipped.real_value_eligible = true;
+await writeFile(flippedPath, JSON.stringify(flipped));
+const flippedRun = run(flippedDir, ["--require-real-value"]);
+assert.notEqual(flippedRun.status, 0, "flipping real_value_eligible to true bought a production pass");
+assert.match(flippedRun.stderr, /no ceremony transcript recorded/);
+
+console.log("KEYSET NEGATIVES: byte mutation, public toxic waste, real-value gate, and manifest-flip GREEN");
 console.log(`=== RESULT: ${passed} passed, 0 failed ===`);

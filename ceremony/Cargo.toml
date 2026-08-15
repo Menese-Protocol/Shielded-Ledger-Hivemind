@@ -35,6 +35,11 @@ path = "src/bin/verify_transcript.rs"
 name = "emit-pok-vector"
 path = "src/bin/emit_pok_vector.rs"
 
+# Test-only: manufactures the two invalid transcripts the verifier's negative tests need.
+[[bin]]
+name = "corrupt-transcript"
+path = "src/bin/corrupt_transcript.rs"
+
 [dependencies]
 # The exact circuits the ceremony specializes, over BLS12-381 (Poseidon, notes, tree, R1CS).
 common = { path = "../circuit/common", features = ["bls12-381"] }

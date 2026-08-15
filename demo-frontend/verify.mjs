@@ -6,6 +6,8 @@
 import { chromium } from "playwright";
 import fs from "fs";
 import { execFileSync } from "child_process";
+import { existsSync } from "fs";
+import { resolve } from "path";
 
 const URL = process.env.DEMO_URL || "http://localhost:5178/";
 const SHOT = process.env.SHOT_DIR || "verify-shots";
@@ -132,9 +134,30 @@ try {
   await A.page.fill('[data-testid="unshield-amt"]', "1234");
   const transferBlocksBefore = await A.page.locator('[data-testid="ledger-entry"][data-btype="1xfer"]').count();
   if (process.env.ARM_UNSHIELD_FAULT === "1") {
-    execFileSync("dfx", ["canister", "call", "zk_ledger", "test_arm_fail_after_token_once", "()"], {
-      cwd: process.cwd(), stdio: "pipe",
+    // D-3: the shipped wasm has no arming entry — the three were moved to
+    // scripts/test-hooks.frag.mo and exist only in the hook build. The flag and its consumption
+    // sites are still in the shipped binary, so arm by upgrading to the hook build, calling the
+    // entry, and upgrading straight back; the flag is stable and survives the return trip. The
+    // fault is therefore taken by the SHIPPED binary, which is the one this run is verifying.
+    const hookWasm = "/tmp/zk_ledger_test_verify.wasm";
+    const repoRoot = existsSync(resolve(process.cwd(), "dfx.json"))
+      ? process.cwd()
+      : resolve(process.cwd(), "..");
+    execFileSync("scripts/build-test-wasm.sh", ["scripts/test-hooks.frag.mo", hookWasm], {
+      cwd: repoRoot, stdio: "pipe",
     });
+    execFileSync("dfx", ["canister", "install", "zk_ledger", "--mode", "upgrade",
+      "--wasm-memory-persistence", "keep", "--yes", "--wasm", hookWasm], {
+      cwd: repoRoot, stdio: "pipe",
+    });
+    try {
+      execFileSync("dfx", ["canister", "call", "zk_ledger", "test_arm_fail_after_token_once", "()"], {
+        cwd: repoRoot, stdio: "pipe",
+      });
+    } finally {
+      execFileSync("dfx", ["canister", "install", "zk_ledger", "--mode", "upgrade",
+        "--wasm-memory-persistence", "keep", "--yes"], { cwd: repoRoot, stdio: "pipe" });
+    }
   }
   await A.page.click('[data-testid="unshield-run"]');
   await idle(A.page);

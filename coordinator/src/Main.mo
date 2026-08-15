@@ -4,13 +4,29 @@
 /// delta-dependent parameters (per circuit), each contribution's proof of knowledge and parameter
 /// hashes, the participant queue and log, the ceremony window, and the finalize beacon. There is no
 /// field, argument, or code path that receives, stores, or reconstructs any participant's secret.
-/// The secret is sampled, applied, and destroyed in the contributor's browser; only transformed
-/// public parameters and a proof are uploaded (apply-and-destroy, Bowe-Gabizon-Miers 2017).
+/// The secret is sampled, applied, and destroyed in the contributor's process; only transformed
+/// public parameters and a proof are uploaded (apply-and-destroy, Bowe-Gabizon-Miers 2017). The
+/// SHIPPED contributor is the Rust CLI in `ceremony/`. The upload API is deliberately shaped so a
+/// browser client can feed WebCrypto bytes (`contribute.rs`), but no browser contributor exists in
+/// this repository, and this header must not be read as describing one.
 ///
-/// On acceptance the coordinator runs the O(1)-pairing proof-of-knowledge check on-chain (soundness)
-/// and records the contribution; the full delta-division-consistency check (correctness) is run
-/// off-chain by the standalone verifier over the published transcript, which this canister serves in
-/// full. Parameters are uploaded and downloaded in <2 MB chunks (a transfer contribution is ~2.5 MB).
+/// 🔴 WHAT IS AND IS NOT CHECKED ON-CHAIN. On acceptance the coordinator runs the AFFORDABLE
+/// STRUCTURAL checks on-chain — each point canonical, on the curve, non-identity; the delta
+/// actually advanced; correct length — and records the proof and its hashes into the immutable
+/// public transcript. It does NOT run the proof-of-knowledge verification: `checkOneCircuit` calls
+/// `PokVerify.structuralCheck`, never `verifyPok`. The SOUNDNESS-critical subgroup + pairing
+/// verification runs OFF-CHAIN, in the standalone verifier, over the published transcript (it
+/// re-runs exactly `PokVerify.verifyPok`'s math in arkworks). The reason is measured, not
+/// preference: a full verification in this pure-Nat BLS12-381 tower costs well over the IC
+/// 40e9-instruction single-message limit — the subgroup checks alone are literal [r]P scalar
+/// multiplications.
+///
+/// This paragraph previously claimed the coordinator ran the O(1)-pairing proof-of-knowledge check
+/// on-chain "(soundness)", which contradicted both the comment at the acceptance boundary below
+/// and `PokVerify`'s own header, and which the code does not do. It is the first thing a reviewer
+/// reads, and it claimed a soundness property the canister does not enforce.
+///
+/// Parameters are uploaded and downloaded in <2 MB chunks (a transfer contribution is ~2.5 MB).
 
 import Principal "mo:core/Principal";
 import Blob "mo:core/Blob";

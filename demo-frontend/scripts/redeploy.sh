@@ -6,7 +6,19 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 KEYS=public/keys
 
-node scripts/verify-keyset.mjs "$KEYS"
+# THE REAL-VALUE GATE IS WIRED HERE, and it is the mode that actually verifies a ceremony
+# transcript rather than reading a manifest boolean. `REAL_VALUE=1` demands it; the default demo
+# redeploy does not, and says so out loud rather than leaving the reader to assume it was applied.
+# The gate FAILS today by design — no ceremony has been held — so REAL_VALUE=1 aborts this script,
+# which is the correct behaviour for a stack whose keys are single-party OS-CSPRNG.
+if [ "${REAL_VALUE:-0}" = "1" ]; then
+  echo "[redeploy] REAL_VALUE=1 — verifying the ceremony transcript before deploying"
+  node scripts/verify-keyset.mjs "$KEYS" --require-real-value
+else
+  node scripts/verify-keyset.mjs "$KEYS"
+  echo "[redeploy] DEMO CLASSIFICATION: the real-value gate was NOT applied to this deploy."
+  echo "[redeploy] Run 'REAL_VALUE=1 scripts/redeploy.sh' to require a verified ceremony transcript."
+fi
 
 dfx deploy tree_oracle >/dev/null 2>&1 || true
 dfx deploy zk_ledger --mode reinstall -y >/dev/null
