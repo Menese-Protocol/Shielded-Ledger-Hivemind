@@ -39,13 +39,23 @@ fi
 echo "[layout1] generated source differs from ScaleFixture.mo in exactly one line (the import)"
 
 # Paths are made project-relative: an evidence artefact must not carry the auditor's checkout path.
-dfx build scale_fixture_layout1 2>&1 | grep -v "^WARNING" | sed "s|$ROOT/||g" | tail -3
+# The output is CAPTURED rather than piped straight to `tail -3`. It used to be truncated to the
+# last three lines, which on a failure are the trailing lines of a Motoko type-error dump — the
+# error ITSELF scrolls off, so every reader of this abort saw "produced no wasm" and no reason.
+# That is why this failure has been expensive to diagnose. On success the same three lines print.
+BUILD_LOG=$(dfx build scale_fixture_layout1 2>&1 | grep -v "^WARNING" | sed "s|$ROOT/||g")
 built=".dfx/local/canisters/scale_fixture_layout1/scale_fixture_layout1.wasm"
 if [ ! -f "$built" ]; then
+  echo "$BUILD_LOG" | grep -E "error \[M[0-9]+\]" -A2 | head -12 | sed 's/^/[layout1]   /'
+  echo "$BUILD_LOG" | tail -3 | sed 's/^/[layout1]   /'
   echo "[layout1] ABORT: build produced no wasm at $built"
+  echo "[layout1] The frozen module is sha256-pinned to 3a5f4c1^ and is deliberately not"
+  echo "[layout1] regenerable, so a symbol tests/ScaleFixture.mo uses but the frozen module"
+  echo "[layout1] lacks cannot be fixed here — the pin itself has to be re-decided."
   rm -f "$GEN"
   exit 2
 fi
+echo "$BUILD_LOG" | tail -3
 mkdir -p "$(dirname "$OUT")"
 cp "$built" "$OUT"
 rm -f "$GEN"
