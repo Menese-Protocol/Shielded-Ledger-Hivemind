@@ -20,6 +20,10 @@ import Nat32 "mo:core/Nat32";
 import Nat64 "mo:core/Nat64";
 import Nat8 "mo:core/Nat8";
 import Principal "mo:core/Principal";
+// Unused by the shipped actor since the PIR hint-corruption hook moved to
+// `scripts/test-hooks.frag.mo`, and RETAINED deliberately: the fragment is injected into the
+// actor body by `scripts/build-test-wasm.sh` and cannot add its own imports, so the hook build
+// needs this one here. Renaming it `_Region` to quiet M0194 would break that build.
 import Region "mo:core/Region";
 import Runtime "mo:core/Runtime";
 import Sha256 "mo:sha2/Sha256";
@@ -488,21 +492,57 @@ persistent actor ZkLedger {
   // An upgraded v1 deployment remains locked until the administrator rotates the transfer VK.
   // A fresh configure() installs the recipient-bound v2 statement immediately.
   var transfer_statement_version : Nat = 1;
-  var test_fail_after_token_once : Bool = false;
-  /// ONE-WAY seal on every fault-injection hook. Set by `seal_test_hooks`, never cleared, and
-  /// stable across upgrades.
+  // ==== fault-injection state — ARMED FROM NOWHERE IN THIS BINARY ====
+  //
+  // The three arming entry points, and the one-way seal that used to gate them, are NOT in this
+  // file. They live in `scripts/test-hooks.frag.mo` and exist only in the hook build produced by
+  // `scripts/build-test-wasm.sh`, alongside the strictly more dangerous primitives that were
+  // already handled that way (`test_force_double_credit`, `test_set_tree_root_hex`).
+  //
+  // Why the seal went with them. The seal was a PRESENT-TENSE assertion doing duty as a
+  // PAST-TENSE guarantee: its status query told a reviewer the hooks cannot be used from now on,
+  // and told them nothing about whether one had been used an hour earlier. No shipped state
+  // could promote it, because nothing recorded an invocation. Build-time exclusion replaces that
+  // unverifiable claim with one anyone can check without trusting the operator: the installed
+  // module hash equals the hash of a binary whose source provably contains no arming code.
+  // CWE-489 catalogues the mitigation at the Build/Distribution phase for exactly this reason.
+  //
+  // 🔴 WHAT REMAINS, STATED SO IT IS NOT MISREAD. The two flags below and their consumption sites
+  // are still here, because the fragment is injected additively and cannot reach inside a product
+  // function body to reinstate a check. In this binary nothing can set them: with the arming
+  // entries absent, the only writer is a stable-state stager — `ScaleFixture.test_preset_fail_after_token`
+  // writing the variable before a fixture-to-ledger upgrade, which is how the batteries arm it and
+  // which no production pool has a path to. Absence of an ingress is what this change buys; it is
+  // not the same as absence of the branch, and the two must not be conflated.
+  /// RESERVED, never read, never written. This is the seal flag D-3 retired; the sealer, the
+  /// status query and all three arming entries are gone, and nothing in this file consults it.
   ///
-  /// The README classifies the fault-injection surface as belonging to the DEMO deployment and
-  /// says it must not exist in a real-value one. Motoko has no conditional compilation, so a
-  /// build variant would be a second binary someone has to remember to use -- and the failure
-  /// mode of "remember" is the one that ships the wrong wasm. A seal that cannot be undone is
-  /// checkable from outside: the pool is sealed before value arrives, and no later call, upgrade,
-  /// or administrator can bring the hooks back.
+  /// It is kept DECLARED because deleting a stable variable under enhanced orthogonal persistence
+  /// is not free, and the alternatives were measured rather than reasoned about. A migration
+  /// expression that consumes it (`with migration = func(old : { test_hooks_sealed : Bool }) : {}`)
+  /// upgrades a pre-D-3 pool correctly — and then refuses two upgrades this repository performs
+  /// constantly, because dfx checks stable compatibility against the canister's DECLARED main:
+  ///
+  ///   fixture -> ledger staging   M0169 "the previous program version does not contain ..."
+  ///   this build -> this build    M0169, same cause
+  ///   pre-D-3 -> this build       Upgraded code   (the only arm it helps)
+  ///
+  /// Writing the consumed field `?Bool` so it tolerates absence passes the static check and then
+  /// TRAPS at runtime (IC0503) on both arms, rolling the upgrade back — a loud refusal turned into
+  /// a silent-looking failure, so it was rejected. Deleting the variable with no migration at all
+  /// refuses every pre-D-3 baseline install, which is most of this repository's red legs.
+  ///
+  /// So the field is reserved rather than removed: one name, one meaning, never reused — the
+  /// Protocol Buffers reserved-field discipline: reserve a retired name, never reuse it. What the
+  /// D-3 change buys is the ARMING SURFACE, and that is gone from the interface, which
+  /// `scripts/hook-exclusion-battery.sh` measures directly against the shipped candid and the
+  /// running canister. Removing the declaration is an operator decision with the costs above, not
+  /// a cleanup.
   var test_hooks_sealed : Bool = false;
-  // Fault-injection hook for the PIR fold (AC-D1/AC-D4 battery; test_fail_after_token_once
-  // precedent): while > 0, the fold path traps. In the synchronous wiring the in-message
-  // rollback keeps the counter armed (every transfer traps until disarmed) — the exact
-  // money-path coupling the derived-index decoupling removes.
+  var test_fail_after_token_once : Bool = false;
+  // While > 0, the PIR fold path traps. In the synchronous wiring the in-message rollback keeps
+  // the counter armed (every transfer traps until disarmed) — the exact money-path coupling the
+  // derived-index decoupling removes.
   var test_pir2_fold_trap_remaining : Nat = 0;
   let stable_layout_version : Nat = STABLE_LAYOUT_VERSION;
 
@@ -1817,33 +1857,6 @@ persistent actor ZkLedger {
     }
   };
 
-  /// Seal every fault-injection hook, permanently and irreversibly.
-  ///
-  /// There is deliberately NO unseal. The value of this call is entirely in being one-way: the
-  /// pool is sealed before real value arrives, and from then on no administrator, no upgrade and
-  /// no later call can re-arm a hook that can break the payout path. A reversible switch would
-  /// carry the same risk it exists to remove.
-  ///
-  /// Idempotent — sealing an already-sealed pool succeeds rather than erroring, so a deployment
-  /// runbook that runs it twice is not told something is wrong.
-  ///
-  /// Verifiable from outside: `test_hooks_status` reports the seal, so the classification of a
-  /// deployment as demo-or-real can be checked rather than asserted.
-  public shared ({ caller }) func seal_test_hooks() : async Result<()> {
-    if (not isAdministrator(caller)) return #err("REJECT:not-administrator");
-    test_hooks_sealed := true;
-    // Disarm anything already armed, so sealing is not merely "no NEW faults" while a previously
-    // armed one-shot is still waiting to fire on the next payout.
-    test_fail_after_token_once := false;
-    test_pir2_fold_trap_remaining := 0;
-    #ok(())
-  };
-
-  /// Whether the fault-injection surface is sealed. Open to every caller: this is the fact a
-  /// user or a reviewer needs to classify a deployment, and withholding it would make the
-  /// classification unverifiable from outside.
-  public query func test_hooks_status() : async Bool { test_hooks_sealed };
-
   /// Repair a tree state that holds a non-canonical value, and clear quarantine as a consequence.
   /// The lane guard and the root derivation are both checked by
   /// `tests/RepairGuardNegativeControl.mo`; the reachability claim below by
@@ -2333,33 +2346,6 @@ persistent actor ZkLedger {
       case (?(digest, covered)) #ok({ digest; covered });
       case null #err("REJECT:pir2-no-boundary");
     }
-  };
-
-  /// Arm `count` forced fold traps (admin; AC-D1 containment battery). Arming with 0 disarms.
-  /// Touches ONLY test state, never ledger state, so it carries no guard check — the battery
-  /// must be able to disarm while degraded.
-  public shared ({ caller }) func test_arm_pir2_fold_trap(count : Nat) : async Result<()> {
-    if (test_hooks_sealed) return #err("REJECT:test-hooks-sealed");
-    if (not isAdministrator(caller)) return #err("REJECT:not-administrator");
-    test_pir2_fold_trap_remaining := count;
-    #ok(())
-  };
-
-  /// Deliberately corrupt `len` bytes of shard `shard`'s hint region at byte `offset`
-  /// (XOR 0xFF), bounded to the shard's span — the AC-D4 repairability battery's injection
-  /// (admin; the repair path must restore byte-identity from the authoritative log).
-  public shared ({ caller }) func test_pir2_corrupt_hint(shard : Nat, offset : Nat, len : Nat) : async Result<()> {
-    if (test_hooks_sealed) return #err("REJECT:test-hooks-sealed");
-    if (not isAdministrator(caller)) return #err("REJECT:not-administrator");
-    if (not pir2_state.enabled) return #err("REJECT:pir2-not-enabled");
-    let g = Pir2.geometry(pir2_state.shard_size);
-    let total = Nat64.toNat(Pir2.hintBytesPerShard(g));
-    if (offset >= total or len == 0 or offset + len > total) return #err("REJECT:corrupt-range");
-    let base = Pir2.hRowOffset(g, shard, 0) + Nat64.fromNat(offset);
-    let bytes = Blob.toArray(Region.loadBlob(pir2_state.h_region, base, len));
-    let flipped = Array.tabulate<Nat8>(len, func(i) { bytes[i] ^ 0xFF });
-    Region.storeBlob(pir2_state.h_region, base, Blob.fromArray(flipped));
-    #ok(())
   };
 
   /// Fail-closed rejection for every state-mutating endpoint while the guard is set.
@@ -3216,15 +3202,6 @@ persistent actor ZkLedger {
     // because it is confidentiality only -- no state changes and no money moves through a query.
     if (not isAdministrator(caller)) return #err("REJECT:not-administrator");
     #ok({ shield = pending_shield; unshield = pending_unshield })
-  };
-
-  public shared ({ caller }) func test_arm_fail_after_token_once() : async Result<()> {
-    if (test_hooks_sealed) return #err("REJECT:test-hooks-sealed");
-    switch (guardRejection()) { case (?message) return #err(message); case null {} };
-    if (not isAdministrator(caller)) return #err("REJECT:not-administrator");
-    if (pending_shield != null or pending_unshield != null) return #err("REJECT:pending-token-mutation");
-    test_fail_after_token_once := true;
-    #ok(())
   };
 
   public query func storage_status() : async StorageStatus { storageStatusValue() };

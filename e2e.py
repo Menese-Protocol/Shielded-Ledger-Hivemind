@@ -464,6 +464,46 @@ def call(canister: str, method: str, argument: str = "()", *, query: bool = Fals
     return json.loads(result.stdout) if result.stdout.strip() else None
 
 
+def arm_fail_after_token_via_hook_build() -> Any:
+    """Arm the fail-after-token fault, which the SHIPPED binary has no entry point for.
+
+    D-3 moved the three arming entries out of src/Main.mo into scripts/test-hooks.frag.mo, so
+    the shipped wasm answers `Canister has no update method`. The flag itself and its consumption
+    sites are still in the shipped binary -- an additive-only fragment cannot reach inside a
+    product function body -- so the fault is armed by upgrading to the hook build, calling the
+    entry, and upgrading straight back. The flag is stable, so it survives the return trip.
+
+    That ordering is deliberate and it makes this leg STRONGER than it was: the trap is taken by
+    the SHIPPED binary, the one that ships, rather than by a test build that merely resembles it.
+    """
+    hook_wasm = "/tmp/zk_ledger_test_e2e.wasm"
+    build = subprocess.run(
+        ["scripts/build-test-wasm.sh", "scripts/test-hooks.frag.mo", hook_wasm],
+        cwd=HERE, capture_output=True, text=True,
+    )
+    if build.returncode != 0:
+        raise RuntimeError(f"hook build failed: {build.stderr.strip() or build.stdout.strip()}")
+    if "INJECTION IS NOT ADDITIVE-ONLY" in build.stdout:
+        raise RuntimeError("hook injection was not additive-only")
+    swap = subprocess.run(
+        ["dfx", "canister", "install", "zk_ledger", "--mode", "upgrade",
+         "--wasm-memory-persistence", "keep", "--yes", "--wasm", hook_wasm],
+        cwd=HERE, capture_output=True, text=True,
+    )
+    if swap.returncode != 0:
+        raise RuntimeError(f"hook wasm install failed: {swap.stderr.strip()}")
+    try:
+        return call("zk_ledger", "test_arm_fail_after_token_once")
+    finally:
+        restore = subprocess.run(
+            ["dfx", "canister", "install", "zk_ledger", "--mode", "upgrade",
+             "--wasm-memory-persistence", "keep", "--yes"],
+            cwd=HERE, capture_output=True, text=True,
+        )
+        if restore.returncode != 0:
+            raise RuntimeError(f"shipped wasm restore failed: {restore.stderr.strip()}")
+
+
 def call_raw(canister: str, method: str, argument: str = "()") -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["dfx", "canister", "call", canister, method, argument, "--output", "json"],
@@ -1353,7 +1393,7 @@ def main() -> None:
         NNS_ADAPTER_CANISTER
     )
     assert all("ok" in result for result in approval_adapter_hints), approval_adapter_hints
-    armed = call("zk_ledger", "test_arm_fail_after_token_once")
+    armed = arm_fail_after_token_via_hook_build()
     assert "ok" in armed, armed
     callback_trap = call_raw("zk_ledger", "shield", deposit1_arg)
     pending_status = call("zk_ledger", "status", query=True)

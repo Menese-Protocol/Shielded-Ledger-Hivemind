@@ -173,3 +173,64 @@
       boundary_count = List.size(detect_chain_state.boundaries);
     }
   };
+
+  // Decode-cost measurement (hook-wasm ONLY): call the PRODUCT hexToBlob and report instructions, so a
+  // battery can show the unbounded decode (RED) vs the bounded reject (GREEN) on the real function.
+  public func test_measure_hex_to_blob(hex : Text) : async (Nat64, Nat) {
+    let c0 = Prim.performanceCounter(0);
+    let r = hexToBlob(hex);
+    let c1 = Prim.performanceCounter(0);
+    (c1 - c0, switch (r) { case (?b) b.size(); case null 999_999 })
+  };
+
+  // ==== the three formerly-sealed arming entries (D-3, option (c)) ====
+  //
+  // These used to live in src/Main.mo behind a one-way runtime seal that DEFAULTED OPEN, so the
+  // shipped binary carried them and an auditor checking README's "must not exist" found them
+  // present and callable. They are now excluded at build time, exactly like the strictly more
+  // dangerous primitives above, and the seal is gone with them: a module hash anyone can check
+  // replaces a boolean the canister asserted about itself. CWE-489 places the mitigation at the
+  // Build/Distribution phase for this reason.
+  //
+  // The administrator gate is RETAINED — build-time exclusion is the outer control, not a licence
+  // to drop the inner one. The seal check is deliberately NOT carried over: in this build there is
+  // no seal to consult, and a hook that consults a flag no binary sets is theatre.
+  //
+  // The state they arm is declared in src/Main.mo, because its consumption sites are inside
+  // product function bodies that an additive-only fragment cannot reach into. Nothing in the
+  // shipped binary can write either flag.
+
+  /// Arm `count` forced PIR-fold traps. Arming with 0 disarms. Touches ONLY test state, never
+  /// ledger state, so it carries no guard check — a battery must be able to disarm while degraded.
+  public shared ({ caller }) func test_arm_pir2_fold_trap(count : Nat) : async Result<()> {
+    if (not isAdministrator(caller)) return #err("REJECT:not-administrator");
+    test_pir2_fold_trap_remaining := count;
+    #ok(())
+  };
+
+  /// Deliberately corrupt `len` bytes of shard `shard`'s hint region at byte `offset` (XOR 0xFF),
+  /// bounded to the shard's span — the repairability injection; the repair path must restore
+  /// byte-identity from the authoritative log.
+  public shared ({ caller }) func test_pir2_corrupt_hint(shard : Nat, offset : Nat, len : Nat) : async Result<()> {
+    if (not isAdministrator(caller)) return #err("REJECT:not-administrator");
+    if (not pir2_state.enabled) return #err("REJECT:pir2-not-enabled");
+    let g = Pir2.geometry(pir2_state.shard_size);
+    let total = Nat64.toNat(Pir2.hintBytesPerShard(g));
+    if (offset >= total or len == 0 or offset + len > total) return #err("REJECT:corrupt-range");
+    let base = Pir2.hRowOffset(g, shard, 0) + Nat64.fromNat(offset);
+    let bytes = Blob.toArray(Region.loadBlob(pir2_state.h_region, base, len));
+    let flipped = Array.tabulate<Nat8>(len, func(i) { bytes[i] ^ 0xFF });
+    Region.storeBlob(pir2_state.h_region, base, Blob.fromArray(flipped));
+    #ok(())
+  };
+
+  /// Force the next payout to fail AFTER the token transfer and before the finalize commit.
+  /// Refused while an intent is in flight, which is why the batteries stage the flag from the
+  /// fixture side instead of calling this.
+  public shared ({ caller }) func test_arm_fail_after_token_once() : async Result<()> {
+    switch (guardRejection()) { case (?message) return #err(message); case null {} };
+    if (not isAdministrator(caller)) return #err("REJECT:not-administrator");
+    if (pending_shield != null or pending_unshield != null) return #err("REJECT:pending-token-mutation");
+    test_fail_after_token_once := true;
+    #ok(())
+  };
