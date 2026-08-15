@@ -46,6 +46,10 @@
       "type": "motoko",
       "main": "tests/ScaleFixture.mo"
     },
+    "cost_model_fixture": {
+      "type": "motoko",
+      "main": "tests/CostModelFixture.mo"
+    },
     "scale_fixture_layout1": {
       "type": "motoko",
       "main": "tests/ScaleFixtureLayout1.generated.mo"
