@@ -506,8 +506,27 @@ persistent actor IcpLedgerFixture {
     #Ok(index)
   };
 
+  /// Consumes an armed transfer-from trap. It exists as a separate entry point because it has to
+  /// run in a message of its OWN: this one returns normally, so its write commits, while the
+  /// message that traps cannot commit anything. Fixture plumbing, not ledger surface — the
+  /// leading underscores match `__slow_hop`.
+  public shared func __consume_transfer_from_trap() : async () { trap_next_transfer_from := false };
+
   public shared ({ caller }) func icrc2_transfer_from(args : ICRC2.TransferFromArgs) : async ICRC2.TransferFromResult {
-    if (trap_next_transfer_from) { trap_next_transfer_from := false; Runtime.trap("TEST_ONLY:token-call-trap") };
+    // The arm is consumed BEFORE the trap, in a different message. Written inline — which is what
+    // this line used to do (`trap_next_transfer_from := false; Runtime.trap(...)`) — the disarm is
+    // discarded together with the trap, so the hook re-armed on every rollback and a second call
+    // trapped again; one-trap-then-recovery was not expressible. Two IC properties make the disarm
+    // survive here: the self-call executes as its own message and commits when it returns, and
+    // `await` is itself a commit point, so the trap below rolls back only the continuation. What
+    // the caller observes is unchanged — the reply is still a CanisterError rejection carrying
+    // `TEST_ONLY:token-call-trap`. Unarmed, the branch is not taken and no self-call is made.
+    if (trap_next_transfer_from) {
+      let self : actor { __consume_transfer_from_trap : shared () -> async () } =
+        actor (Principal.toText(Principal.fromActor(IcpLedgerFixture)));
+      await self.__consume_transfer_from_trap();
+      Runtime.trap("TEST_ONLY:token-call-trap");
+    };
     if (generic_error_transfers > 0) {
       generic_error_transfers -= 1;
       return #Err(#GenericError({ error_code = 9; message = "TEST_ONLY:unclassifiable" }));
@@ -721,13 +740,20 @@ persistent actor IcpLedgerFixture {
   public shared func test_set_dedup_mode(mode : DedupMode) : async () { dedup_mode := mode };
   public query func test_mode() : async DedupMode { dedup_mode };
   public shared func test_set_fee(value : Nat) : async () { fee_e8s := value };
+  /// One-shot: the arm is consumed by `__consume_transfer_from_trap` before the trap fires, so
+  /// exactly the next `icrc2_transfer_from` faults and the one after it succeeds. It did NOT
+  /// behave that way before the disarm was moved out of the trapping message — a TRAP ROLLS BACK
+  /// its own message including the clearing assignment, so the flag re-armed on every rollback.
+  /// Symmetry worth keeping, and the reason `test_arm_generic_error` never had this defect: a
+  /// `return` does NOT roll back state, which is how a misplaced check once burned nullifiers; a
+  /// `trap` DOES, which is why this hook stuck.
   public shared func test_arm_transfer_from_trap() : async () { trap_next_transfer_from := true };
-  /// The arm above is written one-shot -- `:510` clears the flag then traps -- but a TRAP ROLLS
-  /// BACK the clearing assignment, so it re-arms on every rollback and can never disarm itself.
-  /// That cannot be fixed inside the trapping message by construction, so a separate entry point
-  /// is required. Symmetry worth keeping: a `return` does NOT roll back state, which is how a
-  /// misplaced check once burned nullifiers; a `trap` DOES, which is why this hook stuck.
+  /// Cancels an arm that was never consumed. Kept as an explicit control now that the hook
+  /// disarms itself: a battery that arms and then decides not to fire needs a way back.
   public shared func test_disarm_transfer_from_trap() : async () { trap_next_transfer_from := false };
+  /// Lets a battery read the arm state without firing it — the observation that distinguishes
+  /// "disarmed" from "never armed" when a trap leaves no reply to inspect.
+  public query func test_transfer_from_trap_armed() : async Bool { trap_next_transfer_from };
   public shared func test_arm_generic_error(n : Nat) : async () { generic_error_transfers := n };
   public shared func test_set_decimals(value : Nat8) : async () { decimals := value };
   public shared func test_set_archive(id : ?Principal, count : Nat) : async () {
