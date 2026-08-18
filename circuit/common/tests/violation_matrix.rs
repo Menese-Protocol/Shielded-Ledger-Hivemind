@@ -246,6 +246,7 @@ fn violated_witness_fails_proof_generation_or_verification() {
     // ark-groth16-0.5.0/src/prover.rs:193 is a debug_assert!, so the prover PANICS under
     // cargo test (debug-assertions on) and the assertion is compiled OUT under release. The
     // panic unwound past the match, so neither arm was ever reached.
+    // Thresholds: docs/thresholds/THRESHOLDS-prover-negative-path.md.
     assert!(!satisfied(&bad), "{UNSAT_MSG}");
 
     // The end-to-end leg, correct in BOTH profiles. Panic (debug), Err, or a proof that

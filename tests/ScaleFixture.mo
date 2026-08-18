@@ -315,8 +315,9 @@ persistent actor ScaleFixture {
 
   // Instruction cost of hexToBytes over a caller-supplied Text, measured directly.
   // Wall-clock cannot resolve this -- a ~1.2s consensus round swamps the decode -- and arguing
-  // instruction cost from a duration is the proxy substitution the committed thresholds
-  // forbid. Calls the PRODUCTION function; adds no stable variable, so the upgrade gap does not bite.
+  // instruction cost from a duration is the proxy substitution
+  // docs/thresholds/THRESHOLDS-budget-guard.md F-3 forbids.
+  // Calls the PRODUCTION function; adds no stable variable, so the upgrade gap does not bite.
   // Instruction cost of the PRODUCTION vk preparation: `configure` does TWO of these in one
   // message with no budget check. No stable variable.
   // boundaryProofAt -> merkleProof, unbounded in boundary count.

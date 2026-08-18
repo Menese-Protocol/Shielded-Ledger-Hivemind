@@ -3433,7 +3433,8 @@ persistent actor ZkLedger {
   // verify every page, and there is no backfill path — so it arms only on an empty log. Additive:
   // flag off leaves append, certification, and every existing endpoint byte-identical to 44692fc.
   // Administrator-only: enabling puts DetectChain.append's unbounded-in-N work back inside the
-  // post-payout commit, which is the precondition the payout-path instruction bound relies on. The
+  // post-payout commit, which is the precondition docs/thresholds/THRESHOLDS-prepare-commit.md
+  // P-1 relies on. The
   // authorisation check runs FIRST so a caller who is not the administrator learns nothing about
   // the pool's state from the answer.
   public shared ({ caller }) func detect_chain_enable() : async Result<()> {

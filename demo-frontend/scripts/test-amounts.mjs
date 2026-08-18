@@ -1,7 +1,8 @@
 import assertRaw from "node:assert/strict";
 
 // Executed-assertion counter. Delegates to node:assert/strict UNCHANGED and records what actually
-// EXECUTED. No assertion is weakened, added or reordered -- this wraps, it does not alter. A
+// EXECUTED. No assertion is weakened, added or reordered
+// (docs/thresholds/THRESHOLDS-assertion-count.md N-6) -- this wraps, it does not alter. A
 // runtime counter is required rather than a static one: this file runs its assertions in loops,
 // so a call-site grep undercounts them.
 let passed = 0;
