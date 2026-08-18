@@ -224,6 +224,18 @@ def artifact_checks() -> dict[str, Any]:
     }
 
 
+def vk_anchor_leaf(canister: str) -> bytes | None:
+    """The certified `vk` leaf (digest(32) + epoch 8B BE), or None while unconfigured.
+
+    The certified tuple gained this leaf with the verifying-key anchor; the oracle's
+    canonical reconstruction must carry it or every structural check fails on a
+    configured ledger."""
+    anchor = call(canister, "verifying_key_anchor", query=True)
+    if not anchor.get("certified"):
+        return None
+    return as_blob(anchor["digest"]) + as_int(anchor["epoch"]).to_bytes(8, "big")
+
+
 def cert_command(
     mode: str,
     canister: str,
@@ -234,7 +246,8 @@ def cert_command(
     note_root: bytes,
     minimum_tip: int,
 ) -> list[str]:
-    return [
+    vk_leaf = vk_anchor_leaf(canister)
+    return ([
         str(CERT_ORACLE),
         mode,
         "--url",
@@ -257,7 +270,7 @@ def cert_command(
         AUDIT_PASS_DIGEST.hex(),
         "--minimum-tip",
         str(minimum_tip),
-    ]
+    ] + (["--vk-anchor", vk_leaf.hex()] if vk_leaf is not None else []))
 
 
 def cert_fetch(
@@ -502,6 +515,11 @@ def arm_fail_after_token_via_hook_build() -> Any:
         )
         if restore.returncode != 0:
             raise RuntimeError(f"shipped wasm restore failed: {restore.stderr.strip()}")
+        # An upgrade restarts the chunked stable-state audit; every certified snapshot taken
+        # before it completes carries an audit leaf of {state: running}. The rule stated on
+        # wait_audit_pass — called after EVERY zk_ledger upgrade — applies to the hook
+        # round-trip too, or the pre/post-upgrade certified-tuple comparison races the audit.
+        wait_audit_pass("hook-build restore")
 
 
 def call_raw(canister: str, method: str, argument: str = "()") -> subprocess.CompletedProcess[str]:
@@ -1398,6 +1416,12 @@ def main() -> None:
     callback_trap = call_raw("zk_ledger", "shield", deposit1_arg)
     pending_status = call("zk_ledger", "status", query=True)
     pending_atomicity = call("zk_ledger", "atomicity_status", query=True)
+    # atomicity_status is redacted for EVERY caller: the intent handle is salted and
+    # transfer_args is withheld. The raw record is the administrator affordance
+    # pending_intent_detail -- the deployer that ran configure() is that administrator -- and
+    # the raw intent_id is what the token leg wrote as its idempotency memo, so the memo
+    # comparisons below need it.
+    pending_unredacted = call("zk_ledger", "pending_intent_detail", query=True)["ok"]["shield"][0]
     pending_storage = call("zk_ledger", "storage_status", query=True)
     pending_snapshot = call("zk_ledger", "certified_snapshot", query=True)
     pending_user_balance = as_int(call(ICP_LEDGER_CANISTER, "icrc1_balance_of", f"({user_account})", query=True))
@@ -1417,7 +1441,7 @@ def main() -> None:
         query=True,
     )["blocks"][0]
     pending_hint = hint_from_block(pending_target, pending_fixture_block["block"])
-    pending_transfer_args = pending_atomicity["pending"][0]["transfer_args"]
+    pending_transfer_args = pending_unredacted["transfer_args"]
     pending_hint_matches_persisted = (
         pending_hint["amount"] == as_int(pending_transfer_args["amount"])
         and pending_hint["effective_fee"] == as_int(pending_transfer_args["fee"][0])
@@ -1482,7 +1506,7 @@ def main() -> None:
     # re-call of transfer_from would now fail #TooOld. Recovery must still finalize by reconciling the
     # already-minted 2xfer via memo == intent_id (idempotency key), never via the dedup cache. This
     # closes the trapped-after-transfer strand (money in pool, no note) that a long outage would open.
-    recovery_intent = as_blob(pending_atomicity["pending"][0]["intent_id"])
+    recovery_intent = as_blob(pending_unredacted["intent_id"])
     window_advance_ns = 90_000_000_000_000
     call(ICP_LEDGER_CANISTER, "test_advance_time", f"({window_advance_ns})")
     window_probe = call(
@@ -1512,7 +1536,7 @@ def main() -> None:
     token_log_after_resume = call(
         ICP_LEDGER_CANISTER, "icrc3_get_blocks", "(vec { record { start = 0; length = 1000 } })", query=True
     )
-    first_intent = as_blob(pending_atomicity["pending"][0]["intent_id"])
+    first_intent = as_blob(pending_unredacted["intent_id"])
     shield1_expected = {
         "amount": 70,
         "fee": ICP_FEE_E8S,
@@ -2119,32 +2143,35 @@ def main() -> None:
         key: value for key, value in pending_post_upgrade_snapshot.items() if key != "certificate"
     }
     gate4_capability = capability_positive and capability_mutant_rejected
-    gate4_shield = (
-        shield_no_allowance["outcome"] == "REJECT:token:InsufficientAllowance"
-        and shield_no_allowance["verifier_outcome"] == "ACCEPT"
-        and stable_tuple(shield_error_before_status) == stable_tuple(shield_error_after_status)
-        and shield_error_before_storage == shield_error_after_storage
-        and as_int(shield_error_before_token["log_length"])
-        == as_int(shield_error_after_token["log_length"])
-        and callback_trap.returncode != 0
-        and "TEST_ONLY:fail-after-token-before-finalize" in (callback_trap.stdout + callback_trap.stderr)
-        and pending_user_balance == user_initial_e8s - 2 * ICP_FEE_E8S - 70
-        and pending_pool_balance == 70
-        and as_int(pending_status["note_count"]) == 0
-        and pending_atomicity["pending"]
-        and pending_atomicity["test_fault_armed"] is False
-        and len(shield1_blocks) == 1
-        and resumed["outcome"] == "ACCEPT"
-        and resumed["verifier_outcome"] == "ACCEPT"
-        and idempotent_retry["outcome"] == "ACCEPT:already-finalized"
-        and token_length_before_idempotent == token_length_after_idempotent
-        and deposit2["outcome"] == "ACCEPT"
-        and final_user_balance == user_initial_e8s - 3 * ICP_FEE_E8S - shield_value_e8s
-        and final_pool_balance == shield_value_e8s
-        and as_int(final_allowance["allowance"]) == 0
-        and final_atomicity["pending"] == []
-        and as_int(final_atomicity["completed_intents"]) == 2
-    )
+    # Named clauses rather than one opaque conjunction, so a red gate names its cause in the
+    # report instead of demanding a debugger.
+    gate4_shield_clauses = {
+        "no_allowance_reject": shield_no_allowance["outcome"] == "REJECT:token:InsufficientAllowance:no-effect",
+        "no_allowance_verifier": shield_no_allowance["verifier_outcome"] == "ACCEPT",
+        "error_status_stable": stable_tuple(shield_error_before_status) == stable_tuple(shield_error_after_status),
+        "error_storage_stable": shield_error_before_storage == shield_error_after_storage,
+        "error_token_log_stable": as_int(shield_error_before_token["log_length"])
+        == as_int(shield_error_after_token["log_length"]),
+        "callback_trap_nonzero": callback_trap.returncode != 0,
+        "callback_trap_marker": "TEST_ONLY:fail-after-token-before-finalize" in (callback_trap.stdout + callback_trap.stderr),
+        "pending_user_balance": pending_user_balance == user_initial_e8s - 2 * ICP_FEE_E8S - 70,
+        "pending_pool_balance": pending_pool_balance == 70,
+        "pending_note_count_zero": as_int(pending_status["note_count"]) == 0,
+        "pending_present": bool(pending_atomicity["pending"]),
+        "fault_disarmed": pending_atomicity["test_fault_armed"] is False,
+        "one_shield_block": len(shield1_blocks) == 1,
+        "resumed_accept": resumed["outcome"] == "ACCEPT",
+        "resumed_verifier": resumed["verifier_outcome"] == "ACCEPT",
+        "idempotent_retry": idempotent_retry["outcome"] == "ACCEPT:already-finalized",
+        "idempotent_token_log": token_length_before_idempotent == token_length_after_idempotent,
+        "deposit2_accept": deposit2["outcome"] == "ACCEPT",
+        "final_user_balance": final_user_balance == user_initial_e8s - 3 * ICP_FEE_E8S - shield_value_e8s,
+        "final_pool_balance": final_pool_balance == shield_value_e8s,
+        "allowance_consumed": as_int(final_allowance["allowance"]) == 0,
+        "no_pending_left": final_atomicity["pending"] == [],
+        "two_completed_intents": as_int(final_atomicity["completed_intents"]) == 2,
+    }
+    gate4_shield = all(gate4_shield_clauses.values())
     gate4_recovery = (
         pending_changed_reject["outcome"] == "REJECT:pending-token-mutation"
         and pending_changed_reject["verifier_outcome"] == "NOT_CALLED"
@@ -2253,18 +2280,19 @@ def main() -> None:
             "adapter_block_mutant_rejected",
         )
     )
-    nns_gate4_roundtrip = (
-        pending_hint_control
-        and "ok" in approval_adapter_sync
-        and all("ok" in result for result in approval_adapter_hints)
-        and deposit2_pending["outcome"] == "PENDING:token-block-mismatch"
-        and "ok" in deposit2_sync
-        and all("ok" in result for result in deposit2_hints)
-        and resumed["outcome"] == "ACCEPT"
-        and deposit2["outcome"] == "ACCEPT"
-        and final_pool_balance == shield_value_e8s
-        and as_int(deposited["note_count"]) == 2
-    )
+    nns_gate4_clauses = {
+        "pending_hint_control": bool(pending_hint_control),
+        "approval_adapter_sync": "ok" in approval_adapter_sync,
+        "approval_adapter_hints": all("ok" in result for result in approval_adapter_hints),
+        "deposit2_pending_mismatch": deposit2_pending["outcome"] == "PENDING:token-block-absent",
+        "deposit2_sync": "ok" in deposit2_sync,
+        "deposit2_hints": all("ok" in result for result in deposit2_hints),
+        "resumed_accept": resumed["outcome"] == "ACCEPT",
+        "deposit2_accept": deposit2["outcome"] == "ACCEPT",
+        "final_pool_balance": final_pool_balance == shield_value_e8s,
+        "two_notes": as_int(deposited["note_count"]) == 2,
+    }
+    nns_gate4_roundtrip = all(nns_gate4_clauses.values())
     assertions = {
         "G1-HASH": gate1_static["hash"],
         "G1-MAP": gate1_static["map"] and map_runtime,
@@ -2417,6 +2445,8 @@ def main() -> None:
                 "mutant_duplicate_block_count": len(mutant_block["blocks"]),
             },
             "shield": {
+                "clauses": gate4_shield_clauses,
+                "no_allowance_outcome": shield_no_allowance,
                 "failed_without_allowance": shield_no_allowance,
                 "approval": approve,
                 "callback_trap_exit": callback_trap.returncode,
@@ -2444,6 +2474,12 @@ def main() -> None:
                 "pending_storage_equal": pending_storage == pending_post_upgrade_storage,
                 "pending_atomicity_equal": pending_atomicity == pending_post_upgrade_atomicity,
                 "pending_certified_tuple_equal": pending_snapshot_logical == pending_post_upgrade_logical,
+                "pending_certified_tuple_diff": {
+                    key: [repr(pending_snapshot_logical.get(key))[:4000],
+                          repr(pending_post_upgrade_logical.get(key))[:4000]]
+                    for key in set(pending_snapshot_logical) | set(pending_post_upgrade_logical)
+                    if pending_snapshot_logical.get(key) != pending_post_upgrade_logical.get(key)
+                },
             },
             "fail_closed_unshield": {
                 "recipient_bound_statement_accepted": withdraw_crypto["accepted"],
@@ -2483,6 +2519,8 @@ def main() -> None:
             ),
         },
         "nns_icrc3_adapter": {
+            "roundtrip_clauses": nns_gate4_clauses,
+            "deposit2_pending_outcome": deposit2_pending,
             "pinned_commit": "c6a37193d91ddad3254fccce83fff18809fbbc1d",
             "pinned_candid_compatible": pinned_candid_compat,
             "dynamic_metadata": dynamic_metadata,

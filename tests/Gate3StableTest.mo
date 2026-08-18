@@ -114,7 +114,10 @@ assert switch (StableBlobSet.validate(set)) { case (#ok(_)) true; case (#err(_))
 Region.storeNat8(set.region, 0, 0);
 assert unitError(StableBlobSet.validate(set), "stable-set:magic");
 Region.storeNat8(set.region, 0, 0x5a);
-Region.storeNat32(set.region, 8, 2);
+// 99 is invalid under EVERY layout. This used to plant 2, which stopped being a corruption the
+// moment layout 2 became the live version (validate accepts 1 and LAYOUT_VERSION alike), so the
+// assertion below tripped on a VALID header and the canister could not install.
+Region.storeNat32(set.region, 8, 99);
 assert unitError(StableBlobSet.validate(set), "stable-set:layout-version");
 Region.storeNat32(set.region, 8, StableBlobSet.LAYOUT_VERSION);
 assert switch (StableBlobSet.validate(set)) { case (#ok(_)) true; case (#err(_)) false };

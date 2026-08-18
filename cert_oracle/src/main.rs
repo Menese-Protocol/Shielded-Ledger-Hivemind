@@ -30,6 +30,11 @@ struct ExpectedTuple {
     /// only on deployments with the pir2 layer enabled AND a DPAGE boundary reached; the
     /// canonical tree without it is byte-identical to the pre-pir2 one
     pir2_boundary: Option<Vec<u8>>,
+    /// optional verifying-key anchor leaf (digest(32) ‖ epoch 8B BE) — present as soon as
+    /// the ledger is configured with verifying keys; label "vk" in the certified tuple
+    vk_anchor: Option<Vec<u8>>,
+    /// optional detect-chain stream leaf — present only while detect_chain is enabled
+    detect_stream: Option<Vec<u8>>,
     minimum_tip: u64,
 }
 
@@ -92,6 +97,20 @@ fn expected(args: &[String]) -> Result<ExpectedTuple, String> {
             ),
             None => None,
         },
+        vk_anchor: match args.iter().position(|value| value == "--vk-anchor") {
+            Some(position) => Some(
+                hex::decode(args.get(position + 1).ok_or("missing value for --vk-anchor")?)
+                    .map_err(|e| e.to_string())?,
+            ),
+            None => None,
+        },
+        detect_stream: match args.iter().position(|value| value == "--detect-stream") {
+            Some(position) => Some(
+                hex::decode(args.get(position + 1).ok_or("missing value for --detect-stream")?)
+                    .map_err(|e| e.to_string())?,
+            ),
+            None => None,
+        },
         minimum_tip: argument(args, "--minimum-tip")?
             .parse()
             .map_err(|e| format!("minimum tip: {e}"))?,
@@ -118,17 +137,38 @@ fn canonical_tree(tuple: &ExpectedTuple, tip_index_leaf: Vec<u8>, note_root: Vec
             fork(
                 labeled("archive_manifest", leaf(tuple.archive_manifest.clone())),
                 fork(
-                    labeled("audit", leaf(tuple.audit_digest.clone())),
+                    // mirrors src/CertifiedTuple.mo zkTree: the audit leaf forks with the
+                    // detect_stream leaf only while the detect chain is enabled
+                    match &tuple.detect_stream {
+                        Some(ds) => fork(
+                            labeled("audit", leaf(tuple.audit_digest.clone())),
+                            labeled("detect_stream", leaf(ds.clone())),
+                        ),
+                        None => labeled("audit", leaf(tuple.audit_digest.clone())),
+                    },
                     fork(
                         labeled("encoding_version", leaf(leb128(tuple.encoding_version))),
                         fork(
                             labeled("note_count", leaf(leb128(tuple.note_count))),
-                            match &tuple.pir2_boundary {
-                                Some(boundary) => fork(
+                            // mirrors zkTree's tail: note_root folds with the optional
+                            // pir2_boundary and vk-anchor leaves, labels alphabetical
+                            match (&tuple.pir2_boundary, &tuple.vk_anchor) {
+                                (None, None) => labeled("note_root", leaf(note_root)),
+                                (Some(boundary), None) => fork(
                                     labeled("note_root", leaf(note_root)),
                                     labeled("pir2_boundary", leaf(boundary.clone())),
                                 ),
-                                None => labeled("note_root", leaf(note_root)),
+                                (None, Some(anchor)) => fork(
+                                    labeled("note_root", leaf(note_root)),
+                                    labeled("vk", leaf(anchor.clone())),
+                                ),
+                                (Some(boundary), Some(anchor)) => fork(
+                                    labeled("note_root", leaf(note_root)),
+                                    fork(
+                                        labeled("pir2_boundary", leaf(boundary.clone())),
+                                        labeled("vk", leaf(anchor.clone())),
+                                    ),
+                                ),
                             },
                         ),
                     ),
