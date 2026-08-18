@@ -3062,10 +3062,34 @@ persistent actor ZkLedger {
 
   public query func status() : async LedgerStatus { statusValue() };
 
-  /// Names the values that put this pool in quarantine, so the operator can see
+  /// Names the values that put this pool in quarantine, so an operator can see
   /// WHAT is wrong rather than only THAT something is. Empty when the pool is clean.
-  public query func quarantine_status() : async (Bool, [Text]) {
-    (state_quarantine, state_quarantine_values)
+  /// A fourth exposure site, closed. This was an UNAUTHENTICATED query returning the raw offender
+  /// list, and that list is not only tree data: `postupgrade`'s quarantine scan puts
+  /// `shield-commitment:<hex>` and `unshield-commitment:<hex>` into it, taken from
+  /// the PENDING intents. So a public caller could read an in-flight intent's output commitment.
+  ///
+  /// The earlier exposure enumeration missed it because that enumeration was about `intent_id` and
+  /// was closed over the `AtomicityPending` type -- and this method uses neither. A per-intent
+  /// FIELD escaped a per-intent HANDLE audit. The root and lane entries are already public
+  /// (`status()` carries `note_root`), but the two commitment entries are exactly the
+  /// note-to-intent linkage the pool must not publish, which is `pending_intent_detail`'s stated
+  /// reason for being caller-bound.
+  ///
+  /// Redacted on the `finalize_divergence` precedent rather than gated outright, and the split is
+  /// the same RFC 6973 6.1 data-minimisation reading: the BOOLEAN stays open to every caller,
+  /// because an operator -- not only the administrator -- must be able to see that a pool is
+  /// quarantined, and the flag carries no linkage. The VALUES become administrator-only, because
+  /// they do. Gating the flag as well would defeat the observable to buy no privacy; publishing the
+  /// values buys an oracle for nothing. A non-administrator gets the count instead, so the
+  /// observable stays actionable ("quarantined, 3 offenders") without naming them.
+  ///
+  /// Non-blocking preserved structurally: a `query` mutates nothing. Single-replica answer with no
+  /// consensus, same caveat as `compact_cost` and `finalize_divergence` -- the administrator branch
+  /// is only as strong as the replica answering it. Confidentiality only; no state changes here.
+  public query ({ caller }) func quarantine_status() : async (Bool, [Text]) {
+    if (isAdministrator(caller)) return (state_quarantine, state_quarantine_values);
+    (state_quarantine, [Nat.toText(state_quarantine_values.size()) # " offenders withheld"])
   };
 
   public query func recipient_binding(recipient : ICRC2.Account) : async Result<Blob> {

@@ -1010,6 +1010,25 @@ persistent actor ScaleFixture {
   public query func set_digest(which : Text) : async Blob { StableBlobSet.digest(setState(which)) };
   public query func set_size(which : Text) : async Nat { StableBlobSet.size(setState(which)) };
 
+  /// Quarantine-exposure staging. `set_tree_root_hex` alone changes only `tree_state.root`, so the
+  /// ledger's `validateStableStateBounded` trips `stable-state:tree-root` (the hex no longer
+  /// matches `note_root`) and `postupgrade` TRAPS before the quarantine scan ever runs. Setting
+  /// BOTH consistently is what reaches that scan: a root that is well-formed hex and matches
+  /// `note_root`, but is NON-CANONICAL as a field element, passes validation and is then collected
+  /// as an offender -- which is the state `quarantine_status` publishes.
+  /// Separate method rather than a change to `set_tree_root_hex`, so no existing battery moves.
+  public func set_note_root_hex(root : Text) : async Bool {
+    switch (hexToBlob(root)) {
+      case (?blob) {
+        let state = currentTree();
+        tree_state := ?{ filled = state.filled; root; next_index = state.next_index };
+        note_root := blob;
+        true
+      };
+      case null false;
+    };
+  };
+
   public func set_tree_root_hex(root : Text) : async () {
     let state = currentTree();
     tree_state := ?{ filled = state.filled; root; next_index = state.next_index };
