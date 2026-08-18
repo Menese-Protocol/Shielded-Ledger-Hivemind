@@ -42,6 +42,26 @@ import C "../../src/groth16/Curve";
 import Wire "Wire";
 import PokVerify "PokVerify";
 
+// `staging` is an actor-level `var` in a `persistent actor`, so it is STABLE state, and the
+// contribution-staging fix changed its element type from Blob to Nat8. `moc --stable-compatible`
+// rejects that outright -- "Compatibility error [M0170] … Blob is not compatible with type Nat8 in
+// `blocks` (used by `List` in `List` in `depositChunks` in `Staging` in `staging`)" -- so a deployed
+// coordinator could not be upgraded to the fixed build at all. Caught by running the check rather
+// than by reasoning about the diff, which did not look like it touched persistence.
+//
+// DROPPING the old value is the right migration here, not converting it. `staging` is a per-turn,
+// pre-transcript scratch buffer holding ONE contributor's partial chunk upload: nothing in the
+// transcript, the queue, the running challenge or the finalize path reads it, `abort_contribution`
+// already discards it as a supported transition, and a contributor whose upload is interrupted
+// re-runs `begin_contribution`. Carrying a half-uploaded delta across a code change would be the
+// riskier choice. Same shape as demo-frontend/DemoTokenLedger.mo:26.
+(with migration = func(_old : {
+  var staging : ?{
+    who : Principal;
+    transferChunks : List.List<Blob>;
+    depositChunks : List.List<Blob>;
+  };
+}) : {} { {} })
 persistent actor CeremonyCoordinator {
   // upload-cost telemetry
 
@@ -162,22 +182,31 @@ persistent actor CeremonyCoordinator {
   var currentTurnStart : Int = 0;
 
   // contribution staging (during a turn)
+  /// Second pair of the chunk-accumulation fix. The `finish_init` fix above was applied to the
+  /// INIT accumulators only; these are the same mechanism, and they kept the pre-fix shape --
+  /// `List<Blob>` filled at upload, walked byte-by-byte by `concatBlobs` inside ONE message in
+  /// `appendContribution`. This path is the worse of the two: `finish_init` runs once per
+  /// CEREMONY, `appendContribution` runs once per CONTRIBUTOR, so every participant paid the walk.
+  /// Same fix, same reasoning: accumulate bytes as chunks arrive and leave the submit path one
+  /// array conversion per set. Nothing about what is stored or hashed changes.
   type Staging = {
     who : Principal;
-    transferChunks : List.List<Blob>;
-    depositChunks : List.List<Blob>;
+    transferChunks : List.List<Nat8>;
+    depositChunks : List.List<Nat8>;
   };
+  /// Telemetry for the staging path, mirroring `finishInitInstructions`: the concatenation cost
+  /// in `appendContribution`, measurable rather than argued.
+  var contributionConcatInstructions : Nat64 = 0;
   var staging : ?Staging = null;
 
   // ------------------------------------------------------------------------------------------
   // helpers
   // ------------------------------------------------------------------------------------------
 
-  func concatBlobs(chunks : List.List<Blob>) : Blob {
-    let bytes = List.empty<Nat8>();
-    List.forEach<Blob>(chunks, func(b) { for (x in b.vals()) { List.add(bytes, x) } });
-    Blob.fromArray(List.toArray(bytes));
-  };
+  // `concatBlobs` lived here. With the staging accumulators converted it had no caller left, and a
+  // dead byte-by-byte concatenator is exactly the thing a later chunk path would reach for again
+  // (CWE-561). Removed rather than left for reuse; `moc` flagged it M0194 the moment the last call
+  // site went.
 
   func be4(n : Nat) : [Nat8] { Wire.natToBE(n, 4) };
 
@@ -307,6 +336,8 @@ persistent actor CeremonyCoordinator {
 
   public query func finish_init_cost() : async Nat64 { finishInitInstructions };
 
+  public query func contribution_cost() : async Nat64 { contributionConcatInstructions };
+
   func onlyAuthority(caller : Principal) : ?Text {
     if (caller != authority) { ?"only the ceremony authority may call this" } else { null };
   };
@@ -406,8 +437,8 @@ persistent actor CeremonyCoordinator {
     currentTurnStart := now; // reset the clock for the active contributor
     staging := ?{
       who = caller;
-      transferChunks = List.empty<Blob>();
-      depositChunks = List.empty<Blob>();
+      transferChunks = List.empty<Nat8>();
+      depositChunks = List.empty<Nat8>();
     };
     #ok("staging open; upload your chunks then submit");
   };
@@ -417,8 +448,8 @@ persistent actor CeremonyCoordinator {
       case (?s) {
         if (s.who != caller) { return #err("staging owned by another contributor") };
         switch (circuit) {
-          case (#transfer) { List.add(s.transferChunks, chunk) };
-          case (#deposit) { List.add(s.depositChunks, chunk) };
+          case (#transfer) { for (x in chunk.vals()) { List.add(s.transferChunks, x) } };
+          case (#deposit) { for (x in chunk.vals()) { List.add(s.depositChunks, x) } };
         };
         #ok("chunk accepted");
       };
@@ -462,8 +493,10 @@ persistent actor CeremonyCoordinator {
   func appendContribution(caller : Principal, now : Int, transferPok : PokWire, depositPok : PokWire, isBeacon : Bool, beacon : Blob) : R {
     let s = switch (staging) { case (?s) s; case (null) { return #err("no staging") } };
     if (s.who != caller) { return #err("not your staging") };
-    let transferDelta = concatBlobs(s.transferChunks);
-    let depositDelta = concatBlobs(s.depositChunks);
+    let c0 = Prim.performanceCounter(0);
+    let transferDelta = Blob.fromArray(List.toArray(s.transferChunks));
+    let depositDelta = Blob.fromArray(List.toArray(s.depositChunks));
+    contributionConcatInstructions := Prim.performanceCounter(0) - c0;
     switch (checkOneCircuit(transferDelta, expectedLen(transferHLen, transferLLen), currentDeltas().0, transferPok)) {
       case (#err(e)) { return #err("transfer: " # e) }; case (#ok) {};
     };
@@ -521,7 +554,7 @@ persistent actor CeremonyCoordinator {
   public shared ({ caller }) func begin_beacon_staging() : async R {
     switch (onlyAuthority(caller)) { case (?e) { return #err(e) }; case (null) {} };
     if (not initDone or finalized) { return #err("not accepting the beacon") };
-    staging := ?{ who = caller; transferChunks = List.empty<Blob>(); depositChunks = List.empty<Blob>() };
+    staging := ?{ who = caller; transferChunks = List.empty<Nat8>(); depositChunks = List.empty<Nat8>() };
     #ok("beacon staging open");
   };
 

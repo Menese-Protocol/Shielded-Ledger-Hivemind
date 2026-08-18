@@ -89,6 +89,10 @@
     "honest_tree_oracle": {
       "type": "motoko",
       "main": "tests/HonestTreeOracle.mo"
+    },
+    "coordinator": {
+      "main": "coordinator/src/Main.mo",
+      "type": "motoko"
     }
   },
   "networks": {
