@@ -4968,6 +4968,17 @@ persistent actor ZkLedger {
     if (not StableBlobSet.contains(historical_roots, args.anchor)) {
       return mutation("REJECT:unknown-anchor", "NOT_CALLED");
     };
+    // Canonicity co-located with the spent-set write. `fieldSized` only checks the 32-byte length;
+    // a non-canonical encoding (nf + k·P, still 32 bytes) reduces to a spent nullifier's field
+    // element at the verifier yet is a byte-distinct key in `spent_nullifiers`, so a size-only gate
+    // plus a byte-keyed set would admit a double-spend. The verifier decode already rejects
+    // non-canonical inputs (Groth16Wire.readFr -> Fr.isCanonical), but that defense sits a layer
+    // away from this write; parse-don't-validate HERE (as commitments already do via
+    // parseFieldElement) keeps the guard next to the byte-keyed set it protects.
+    if (PoseidonTree.blobToNat(args.nullifier_1) == null or
+        PoseidonTree.blobToNat(args.nullifier_2) == null) {
+      return mutation("REJECT:nullifier-noncanonical", "NOT_CALLED");
+    };
     if (args.nullifier_1 == args.nullifier_2) {
       return mutation("REJECT:duplicate-nullifier-in-tx", "NOT_CALLED");
     };
