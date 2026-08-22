@@ -39,6 +39,10 @@ import F "groth16/FrFlat";
 
 module {
   public let DEPTH : Nat = 32;
+  // Leading domain tag absorbed by the 2-to-1 Merkle compression (mirrors `TAG_MERGE = 4` in the
+  // reference circuit `common`/`tree_common`), so an inner-node image is domain-separated from the
+  // pk/nf/cm note images and from a bare 2-input hash. MUST match the circuit or roots diverge.
+  let TAG_MERGE : Nat = 4;
   let PARTIAL_ROUNDS : Nat = 57;
   let ROUNDS : Nat = 65; // 8 full + 57 partial
   let HALF_FULL : Nat = 4; // full_rounds / 2
@@ -171,13 +175,12 @@ module {
     readCanonical(w, S1)
   };
 
-  /// 2-to-1 Merkle compression: `hash_n([l, r])` = one permutation of [0, l, r].
+  /// 2-to-1 Merkle compression: `hash_n([TAG_MERGE, l, r])`. Absorbing three elements is a
+  /// two-permutation duplex (permute on the full rate section when `r` arrives, then once more
+  /// before the squeeze) — identical to `hashN([TAG_MERGE, l, r])`, which is used here so the one
+  /// absorb schedule is not transcribed twice. The leading tag domain-separates node images.
   public func merkleCompress(l : Nat, r : Nat) : Nat {
-    let w = newArena();
-    loadMont(w, S1, l);
-    loadMont(w, S2, r);
-    permuteCore(w);
-    readCanonical(w, S1)
+    hashN([TAG_MERGE, l, r])
   };
 
   /// zeros[0] = 0 (the empty leaf); zeros[i+1] = compress(zeros[i], zeros[i]).
@@ -215,20 +218,24 @@ module {
     var idx = frontier.nextIndex;
     var level : Nat = 0;
     while (level < DEPTH) {
+      // Tagged 2-to-1 compression `hash_n([TAG_MERGE, l, r])`, chained in Montgomery form:
+      // absorb the tag and the left child (state [0, TAG_MERGE, l]), permute, absorb the right
+      // child into the rate lane (S1 += r), permute, read S1. Two permutations, matching `hashN`
+      // and the reference `merkle_compress` — SIB holds r, S2 holds l for the shared tail.
       if (idx % 2 == 0) {
-        filled[level] := readCanonical(w, CUR);
-        loadMont(w, SIB, zeros[level]);
-        F.setZero(w, S0);
-        F.copy(w, S1, w, CUR);
-        F.copy(w, S2, w, SIB);
+        filled[level] := readCanonical(w, CUR); // left child cached before CUR is reused as l
+        loadMont(w, SIB, zeros[level]);         // r = empty subtree at this level
+        F.copy(w, S2, w, CUR);                  // l = current node
       } else {
-        loadMont(w, SIB, filled[level]);
-        F.setZero(w, S0);
-        F.copy(w, S1, w, SIB);
-        F.copy(w, S2, w, CUR);
+        F.copy(w, SIB, w, CUR);                 // r = current node
+        loadMont(w, S2, filled[level]);         // l = cached left sibling
       };
+      F.setZero(w, S0);
+      loadMont(w, S1, TAG_MERGE);               // leading domain tag
+      permuteCore(w);                            // permute [0, TAG_MERGE, l]
+      F.addInto(w, S1, w, S1, w, SIB);           // absorb r into the rate lane
       permuteCore(w);
-      F.copy(w, CUR, w, S1);
+      F.copy(w, CUR, w, S1);                     // chain the node image (Montgomery form)
       idx /= 2;
       level += 1;
     };

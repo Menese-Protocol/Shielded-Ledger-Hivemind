@@ -9,10 +9,12 @@
 //!   (re-derived here from the description; Tornado's code is GPL-3.0 and none of it is used)
 //! - conservation-in-one-circuit with fixed arity + 64-bit range checks: Aztec join-split shape.
 //!
-//! Domain separation: every note-level hash absorbs a leading tag (1=pk, 2=nf, 3=cm) so a
-//! commitment can never collide with a nullifier or an address image. Merkle inner nodes use
-//! bare 2-to-1 compression (leaves are already hash images; an inner-node value cannot be
-//! opened as a note commitment without a Poseidon preimage).
+//! Domain separation: every note-level hash absorbs a leading tag (1=pk, 2=nf, 3=cm) and Merkle
+//! inner nodes absorb their own leading tag (4=merge), so a node hash lives in a distinct domain
+//! from every note-level image AND from a bare 2-input hash. Leaves are already hash images and the
+//! tree depth is fixed, so a node value could never be opened as a note commitment even without the
+//! tag (that would need a Poseidon preimage); the merge tag makes the separation structural rather
+//! than a consequence of arity, matching the explicit personalization used by production designs.
 
 // Curve selection: default BN254 (the original PoC fixtures); `--features bls12-381` re-instantiates
 // the IDENTICAL circuits over the BLS12-381 scalar field — the curve of the measured Motoko
@@ -47,6 +49,9 @@ pub const TREE_DEPTH: usize = 32;
 pub const TAG_PK: u64 = 1;
 pub const TAG_NF: u64 = 2;
 pub const TAG_CM: u64 = 3;
+/// Leading tag absorbed by the 2-to-1 Merkle compression, so an inner-node image lives in a
+/// domain distinct from pk/nf/cm and from a bare 2-input hash.
+pub const TAG_MERGE: u64 = 4;
 
 /// Poseidon over BN254 Fr: rate 2, capacity 1, 8 full + 57 partial rounds, alpha = 5.
 /// Same parameter shape as the verifier-lab measurement so per-hash costs are comparable.
@@ -76,7 +81,7 @@ pub fn note_commitment(cfg: &PoseidonConfig<F>, v: u64, pk: F, rho: F, rcm: F) -
     hash_n(cfg, &[F::from(TAG_CM), F::from(v), pk, rho, rcm])
 }
 pub fn merkle_compress(cfg: &PoseidonConfig<F>, l: F, r: F) -> F {
-    hash_n(cfg, &[l, r])
+    hash_n(cfg, &[F::from(TAG_MERGE), l, r])
 }
 
 // ---------- the note ----------
@@ -265,7 +270,8 @@ fn merkle_root_gadget(
     for (sib, bit) in siblings.iter().zip(bits) {
         let l = FpVar::conditionally_select(bit, sib, &cur)?;
         let r = FpVar::conditionally_select(bit, &cur, sib)?;
-        cur = hash_n_gadget(cs.clone(), cfg, &[l, r])?;
+        let tag_merge = FpVar::constant(F::from(TAG_MERGE));
+        cur = hash_n_gadget(cs.clone(), cfg, &[tag_merge, l, r])?;
     }
     Ok(cur)
 }

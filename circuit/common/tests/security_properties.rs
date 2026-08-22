@@ -8,8 +8,9 @@ use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_snark::SNARK;
 use ark_std::rand::{rngs::StdRng, RngCore, SeedableRng};
 use common::{
-    derive_nf, derive_pk, hash_n, note_commitment, poseidon_config, DenseTree, DepositCircuit,
-    IncrementalTree, Note, PoseidonCfg, ScalarField as F, TransferCircuit, TAG_CM,
+    derive_nf, derive_pk, hash_n, merkle_compress, note_commitment, poseidon_config, DenseTree,
+    DepositCircuit, IncrementalTree, Note, PoseidonCfg, ScalarField as F, TransferCircuit, TAG_CM,
+    TAG_MERGE,
 };
 
 const TEST_SEED: [u8; 32] = [0x53; 32];
@@ -330,8 +331,48 @@ fn note_hash_domains_are_distinct() {
         let pk = derive_pk(&cfg, nk);
         let nf = derive_nf(&cfg, nk, rho);
         let cm = note_commitment(&cfg, rng.next_u64(), pk, rho, rcm);
+        // The merge (inner-node) domain joins pk/nf/cm as a fourth distinct image domain.
+        let node = merkle_compress(&cfg, pk, cm);
         assert_ne!(pk, nf);
         assert_ne!(pk, cm);
         assert_ne!(nf, cm);
+        assert_ne!(node, pk);
+        assert_ne!(node, nf);
+        assert_ne!(node, cm);
+    }
+}
+
+/// The Merkle inner-node hash is domain-separated by its leading TAG_MERGE=4, so a node image
+/// lives in a domain distinct from a bare 2-input hash and from a leaf commitment. This is the
+/// structural separation the tag buys: an attacker cannot reinterpret an inner-node value as a
+/// leaf commitment (or vice versa) without a Poseidon preimage, and the tag makes that true by
+/// construction rather than as a consequence of arity alone.
+#[test]
+fn merkle_node_domain_is_tag_separated() {
+    let cfg = poseidon_config();
+    let mut rng = StdRng::from_seed([0x4e; 32]);
+    for _ in 0..32 {
+        let l = F::rand(&mut rng);
+        let r = F::rand(&mut rng);
+        // The tagged node hash differs from the untagged 2-input hash of the same children:
+        // proof the tag actually moved the domain (not a no-op).
+        assert_ne!(
+            merkle_compress(&cfg, l, r),
+            hash_n(&cfg, &[l, r]),
+            "merge tag did not change the node hash — domain separation is not in effect"
+        );
+        // And it equals the tagged sponge over [TAG_MERGE, l, r] — pinning the exact preimage
+        // shape the circuit gadget and the Motoko verifier must reproduce byte-for-byte.
+        assert_eq!(
+            merkle_compress(&cfg, l, r),
+            hash_n(&cfg, &[F::from(TAG_MERGE), l, r]),
+            "merkle_compress must be hash_n([TAG_MERGE, l, r])"
+        );
+        // A node image is distinct from a leaf commitment built to mimic it (arity/tag confusion
+        // attempt): H(TAG_MERGE, l, r) != H(TAG_CM, v, pk, rho, rcm).
+        let cm = note_commitment(&cfg, rng.next_u64(), l, r, F::rand(&mut rng));
+        assert_ne!(merkle_compress(&cfg, l, r), cm);
+        // Cross-check: absorbing TAG_CM as the left child of a node does not collide with a leaf.
+        assert_ne!(merkle_compress(&cfg, F::from(TAG_CM), l), cm);
     }
 }
