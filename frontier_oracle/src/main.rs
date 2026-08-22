@@ -24,7 +24,7 @@ use ark_crypto_primitives::sponge::{
 use ark_ff::{BigInteger, PrimeField, Zero};
 use common::{
     f_to_hex, hash_n, merkle_compress, poseidon_config, zero_hashes, DenseTree, IncrementalTree,
-    PoseidonCfg, TREE_DEPTH,
+    PoseidonCfg, TAG_MERGE, TREE_DEPTH,
 };
 
 fn dec(x: &F) -> String {
@@ -83,11 +83,16 @@ fn edge_values() -> Vec<F> {
 /// arkworks path. Panics (exit != 0) on any disagreement.
 fn self_check(cfg: &PoseidonCfg<F>, seed: u64) {
     // 1. permute() extraction agrees with the sponge on compress inputs:
-    //    merkle_compress(l, r) must equal permute([0, l, r])[1].
+    //    merkle_compress(l, r) is hash_n([TAG_MERGE, l, r]) — a 3-input duplex: absorb the tag and
+    //    the left child ([0, TAG_MERGE, l]), permute, absorb the right child into rate lane 0,
+    //    permute, read rate lane 0. Verified here against a raw-permute path independent of the
+    //    merkle_compress definition.
     let mut rng = SplitMix(seed ^ 0xc0ffee);
     for _ in 0..200 {
         let (l, r) = (rng.field(), rng.field());
-        let via_perm = permute(cfg, [F::zero(), l, r])[1];
+        let mut s = permute(cfg, [F::zero(), F::from(TAG_MERGE), l]);
+        s[cfg.capacity] += r; // rate lane 0 after the permute
+        let via_perm = permute(cfg, s)[cfg.capacity];
         assert_eq!(via_perm, merkle_compress(cfg, l, r), "perm vs compress");
     }
     // 2. hash_n on 3..6 inputs equals a chain of raw permutes (verifies the duplex
