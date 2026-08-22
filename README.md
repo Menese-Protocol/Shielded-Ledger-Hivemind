@@ -11,6 +11,17 @@ provider can and cannot see.
 
 *Privacy you can watch.*
 
+## A note on this repository's history
+
+This repository is the public showcase of the shielded ledger, not its working tree. The
+system was built in private repositories whose combined history runs to over 1,200
+commits, interleaved with internal infrastructure, review tooling, and audit logs that
+are not part of the product. When work lands here it is squashed and committed per
+subsystem (circuit, verifier, ledger, ceremony, tests, docs), so the public log reads
+as a map of the system rather than a diary of its construction. The commit count here
+understates the work behind it, not the verification: every public state passes the
+full security gate before it is pushed.
+
 ## Why this exists
 
 Every public ledger publishes who paid whom, how much, forever. That is not an acceptable
