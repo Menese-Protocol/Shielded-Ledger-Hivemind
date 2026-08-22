@@ -24,11 +24,14 @@ cd "$ROOT"
 sha256sum -c fixtures/SHA256SUMS
 diff -u "$CIRCUIT/common/src/lib.rs" vendor/tree_common/src/lib.rs
 
-step "Deterministic test-vector reproducibility and explicit toxic-waste label"
+step "Deterministic test-vector reproducibility and explicit toxic-waste label (legacy provenance)"
 REGENERATED="$(mktemp -d)"
 trap 'rm -rf "$REGENERATED"' EXIT
+# `--statement legacy` is now explicit: the shipped default is the hardened statement, but the
+# frozen legacy vectors are kept reproducible byte-for-byte as provenance until every deployment
+# has rotated off the legacy verifying key.
 cargo run --quiet --release --manifest-path "$CIRCUIT/Cargo.toml" -p gen --features bls12-381 -- \
-  "$REGENERATED" --setup insecure-deterministic-test
+  "$REGENERATED" --setup insecure-deterministic-test --statement legacy
 for generated in "$REGENERATED"/*; do
   name="$(basename "$generated")"
   case "$name" in

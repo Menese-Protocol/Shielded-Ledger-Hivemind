@@ -4,7 +4,9 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const fixture = join(root, "fixtures", "pool-vectors-bls12-381");
+// Shipped statement is the hardened one (in-circuit fee/v_pub_out ranges + input-note
+// distinctness); the legacy fixtures remain in-tree for provenance only.
+const fixture = join(root, "fixtures", "pool-vectors-bls12-381-hardened");
 
 async function hex(name) {
   const value = (await readFile(join(fixture, name), "utf8")).trim().toLowerCase();

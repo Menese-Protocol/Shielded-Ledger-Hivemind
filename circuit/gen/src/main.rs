@@ -67,10 +67,12 @@ fn usage() -> ! {
          \n\
          insecure-deterministic-test: reproducible oracle fixtures only; NEVER deploy its keys\n\
          os-csprng-single-party: removes the public-seed flaw; still NOT an MPC ceremony\n\
-         --statement legacy (default): the pre-hardening transfer statement — reproduces the\n\
-                     frozen vectors byte-for-byte (the deployed verifying key's statement)\n\
-         --statement hardened: the hardened conservation statement (in-circuit fee/v_pub_out\n\
-                     ranges + input-note distinctness) — distinct keys, own fixture set"
+         --statement hardened (default): the hardened conservation statement (in-circuit\n\
+                     fee/v_pub_out ranges + input-note distinctness) — the shipped statement,\n\
+                     own fixture set (pool-vectors-bls12-381-hardened)\n\
+         --statement legacy: the pre-hardening transfer statement — reproduces the frozen\n\
+                     legacy vectors byte-for-byte, kept for provenance until every deployment\n\
+                     has rotated to the hardened verifying key"
     );
     std::process::exit(2)
 }
@@ -87,7 +89,7 @@ fn parse_args() -> (String, SetupMode, bool) {
         usage()
     };
     let legacy_statement = match args.next() {
-        None => true,
+        None => false, // hardened is the shipped default; pass `--statement legacy` for provenance
         Some(flag) => {
             let statement = if flag == "--statement" {
                 args.next().unwrap_or_else(|| usage())

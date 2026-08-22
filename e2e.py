@@ -22,7 +22,9 @@ from typing import Any
 
 
 HERE = Path(__file__).resolve().parent
-VECTORS = HERE / "fixtures" / "pool-vectors-bls12-381"
+# The shipped statement is the hardened one (in-circuit fee/v_pub_out ranges + input-note
+# distinctness). The legacy fixtures remain in-tree for provenance but are no longer the e2e target.
+VECTORS = HERE / "fixtures" / "pool-vectors-bls12-381-hardened"
 DIMENSION = 630
 OUTPUT_BITS = 256
 MASK64 = (1 << 64) - 1
