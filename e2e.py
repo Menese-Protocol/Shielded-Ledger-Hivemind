@@ -43,7 +43,7 @@ EMPTY_ARCHIVE_MANIFEST = hashlib.sha256(b"").digest()
 AUDIT_PASS_DIGEST = hashlib.sha256(
     hashlib.sha256(b"state").digest() + hashlib.sha256(b"pass").digest()
 ).digest()
-TREE_ORACLE_WASM_SHA256 = "271b4f029e6f3e506667321d5b2a4c7b44aeb3fbf0d6248a2be0029401fe307e"
+TREE_ORACLE_WASM_SHA256 = "676e8ba3f454973dc63257ada00cb4f51c937f1812ee4b316c4a46b7ce310618"
 ICP_DECIMALS = 8
 ICP_FEE_E8S = 10_000
 ICP_SYMBOL = "ICP"
