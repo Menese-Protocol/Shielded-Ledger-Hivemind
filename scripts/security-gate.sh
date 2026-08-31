@@ -73,6 +73,10 @@ step "Statement shape pins and legacy/hardened verifying-key binding proofs"
 cargo test --release --manifest-path "$CIRCUIT/Cargo.toml" -p common --features bls12-381 \
   --test statement_dims --test statement_binding
 
+step "Setup guard: wrong-flagged or non-blank setup instances are refused before key emission"
+cargo test --release --manifest-path "$CIRCUIT/Cargo.toml" -p gen --features bls12-381 \
+  --test setup_guard
+
 step "Browser prover compiles for wasm32 and uses the identical circuit"
 cargo check --manifest-path demo-frontend/prover-wasm/Cargo.toml --target wasm32-unknown-unknown
 if grep -rn 'Math\.random' demo-frontend/src demo-frontend/prover-wasm/src; then
@@ -81,6 +85,13 @@ if grep -rn 'Math\.random' demo-frontend/src demo-frontend/prover-wasm/src; then
 fi
 grep -qF 'getrandom::getrandom(&mut seed)' demo-frontend/prover-wasm/src/lib.rs
 grep -qF 'crypto.getRandomValues' demo-frontend/src/wallet.js
+
+step "Consensus-critical decode seams: source shape pins + adversarial verdict classes"
+bash scripts/consensus-seam-guard.sh
+node scripts/consensus-decode-regression.mjs
+
+step "Poseidon round-number margin re-derivation (F5)"
+python3 scripts/poseidon-round-margin.py
 
 step "Current eight-public-input vectors through the vendored Motoko verifier"
 node scripts/verify-current-groth16.mjs

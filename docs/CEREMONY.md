@@ -122,10 +122,20 @@ confirm the deployed coordinator was built from this source.
 
 ## 6. Phase-1 decision
 
-Requirement, measured from the circuits in this repository: the transfer circuit has 20146
-constraints (QAP domain 2^15 = 32768) and the deposit circuit has 724 constraints (QAP domain
+Requirement, measured from the circuits in this repository: the transfer circuit has 14261
+constraints over 14335 wires (QAP domain 2^14 = 16384) and the deposit circuit has 726 (QAP domain
 2^10 = 1024). Both specialize from one universal Phase-1 sized to the maximum, so Phase-1 must have
-power at least 15.
+power at least 14. The live parameters are the power-14 set in `ceremony-launch-p14/`; extract with
+the same upstream record and the same verified importer before any Phase-2 init.
+
+This requirement has moved twice and each move retired the previous parameters, so the history is
+recorded here rather than left to stale commit messages. The pre-tag circuit measured 20146
+constraints at 2^15. Carrying the domain tag into the Poseidon capacity grew it to 35637, which
+crossed into 2^16 and is why a power-16 set exists in `ceremony-launch-aug24/`. Raising the Merkle
+tree to arity 4 over 16 levels then cut it to 14261, which fits 2^14. The power-15 and power-16
+artifacts remain valid history and neither fits the current circuit: **do not launch from them.**
+`circuit/common/tests/statement_dims.rs` asserts these numbers, so a further circuit edit fails
+there rather than silently stranding a ceremony — which is exactly what happened twice.
 
 Decision: inherit the Zcash Sapling BLS12-381 Powers of Tau (power 21, about 90 reviewed
 participants). The alternatives were rejected: the Ethereum KZG ceremony is a KZG-structured string
@@ -146,7 +156,7 @@ without this structural check, so a wrong file or a wrong sub-format is rejected
 For local testing and the valueless demo, the same Phase-2 machinery runs against a locally generated
 power-15 string that is structurally identical but carries a test-tier provenance label and is never
 eligible for a real-value keyset. The Phase-2 code path is byte-identical for both; only the Phase-1
-bytes differ, and swapping in the inherited string is the operator's step at launch.
+bytes differ, and swapping in the inherited string is a launch step for whoever runs the ceremony.
 
 ## 7. Reproducible build
 
@@ -188,5 +198,5 @@ The standalone verifier and the contributor client are Rust and wasm builds pinn
   the keys are used with any value; on-chain acceptance alone is not sufficient assurance.
 - This repository produces the coordinator, the client, the reproducible build, the verifier, and the
   spec, and proves them on a local replica. The mainnet deployment of the coordinator and the launch
-  of the ceremony against the inherited Phase-1 string are the operator's steps and are not performed
+  of the ceremony against the inherited Phase-1 string are launch steps for whoever runs it, and are not performed
   here.

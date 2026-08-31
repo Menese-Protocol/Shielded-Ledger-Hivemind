@@ -53,8 +53,16 @@ One command, no replica. Its steps, in order:
 
 Requires `dfx`, [`mops`](https://mops.one), `didc`, and a Motoko compiler (the suite invokes
 `/opt/moc-1.4.1/moc`; adjust to your install). Run `dfx start --clean` in one terminal, then
-`dfx deploy && python3 e2e.py`. It prints one assertion table; every key must be `True`. The
-assertion keys group into gates:
+`dfx deploy && python3 e2e.py`. It prints one assertion table; every key must be `True`.
+
+**Check these four conditions before the first run on a machine.** This is the most
+condition-heavy surface, and each of them fails as something other than itself: the
+replica port in `dfx.json` is not the one `e2e.py` defaults to, the three oracle binaries are
+expected to exist rather than built by the suite, the replica must be started detached, and the
+whole surface is silently unrunnable when the host is near its cgroup PID ceiling — which
+presents as a compiler hang, not as a resource error.
+
+The assertion keys group into gates:
 
 - **`G1-*` (ICRC-3 conformance)**: representation-independent hashing against the official
   vectors, canonical map encoding, block shape, `phash` parent linkage, and range queries on
@@ -139,9 +147,13 @@ identical state hash.
 
 1. **Keyset gate**: regenerates the proving/verifying keys in-process from the deterministic
    test setup (seed 20260712) and asserts their SHA-256 against
-   `fixtures/pool-vectors-bls12-381/SETUP-MANIFEST.json`; then verifies the frozen fixture
+   `fixtures/pool-vectors-bls12-381-hardened/SETUP-MANIFEST.json` — the HARDENED statement is
+   the soak default, matching the shipped generator default; then verifies the frozen fixture
    proofs under the regenerated keys (and that the frozen tampered proof still fails). The soak
-   proves against exactly the keys the ledger is configured with.
+   proves against exactly the keys the ledger is configured with. `SOAK_STATEMENT=legacy`
+   selects the pre-hardening statement and its frozen `fixtures/pool-vectors-bls12-381` set,
+   kept for provenance only. The gate (and the hardened-default pin) also runs standalone,
+   without PocketIC: `cargo test --release --manifest-path soak/Cargo.toml --test keyset_gate`.
 2. **Counterfeit-mint guard (native)**: constructs withdrawal witnesses whose claimed public
    value exceeds the committed note value (the plain imbalance and the field-wrap variant of
    the 2018 Zcash counterfeiting class) and asserts the circuit is UNSATISFIABLE for both,

@@ -7,7 +7,7 @@
 #   1. FAIL-FAST: v1 burned 15 blind attempts against a resource-starved box, then looped
 #      forever on a deterministic resume panic. v2 aborts after MAX_FAST_FAILS consecutive
 #      attempts that die within STARTUP_WINDOW seconds — a fast repeat failure is a bug or
-#      a sick box, and restarting cannot fix either. It leaves a RED line for the operator.
+#      a sick box, and restarting cannot fix either. It leaves a RED line for whoever is watching the run.
 #   2. SCOPED CLEANUP: v1 pkill'd every pocket-ic and canister_sandbox on the box — this is
 #      a shared machine and that kills other lanes' replicas. v2 kills only servers spawned
 #      by the soak binary (their cmdline carries the soak_pocket_ic_ port-file marker) and

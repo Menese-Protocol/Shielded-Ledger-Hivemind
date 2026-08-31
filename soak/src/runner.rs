@@ -13,7 +13,7 @@
 use crate::candid_types as ct;
 use crate::cert;
 use crate::crypto::{f_bytes, MerkleMirror};
-use crate::keys::Keyset;
+use crate::keys::{self, Keyset};
 use crate::model::{derive_accounts, AccountKeys, Model};
 use crate::observer;
 use crate::pic_env::{self, Env};
@@ -335,11 +335,16 @@ impl Runner {
         let pauper = derive_accounts(tier.seed.wrapping_add(0xdead), tier.accounts + 1, &cfg)
             .pop()
             .unwrap();
+        // Statement-aware: the run's fixture proof (an arbitrary well-formed proof used by the
+        // CounterfeitMint injection, which the turnstile must reject BEFORE any verifier call)
+        // comes from the SAME fixture set as the run's keys, so the default soak path carries
+        // no reference to the legacy fixture set.
         let fixture_proof_hex = std::fs::read_to_string(
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .parent()
                 .unwrap()
-                .join("fixtures/pool-vectors-bls12-381/transfer_proof.hex"),
+                .join(keys::fixture_dir(keys.legacy_statement))
+                .join("transfer_proof.hex"),
         )
         .expect("read fixture transfer proof")
         .trim()

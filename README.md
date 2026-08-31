@@ -92,11 +92,23 @@ do not cross-verify (proven both ways by the statement-binding battery). The wal
 detects which statement a supplied proving key belongs to and assembles the matching witness,
 so it works unchanged on either side of a key rotation.
 
+The deposit statement carries one obligation the circuit does not enforce, stated here because
+an integrator must uphold it: there is no in-circuit range on the deposit's public amount
+`v_pub`. That a shield cannot mint a note worth 2^64 or more rests on the interface — the
+ledger types the amount `Nat64` in candid and embeds it with `nat64Field`, so an
+out-of-range public input is unrepresentable — and on the transparent leg, which moves
+exactly that many ICRC-2 tokens into custody before the note finalizes. Feed the deposit
+verifier an amount from a wider type, or skip the paid transparent leg, and the field-wrap
+over-issuance the hardened transfer statement closes in-circuit reopens for deposits. The
+enforcing seam (`src/Main.mo` `shield`, the `nat64Field(args.value)` embedding) is marked
+consensus-critical in source and structurally pinned by `scripts/consensus-seam-guard.sh`,
+with the decode behavior exercised by `scripts/consensus-decode-regression.mjs`.
+
 *The proving key never touches a server.*
 
-Proofs are produced in the user's browser. The hardened transfer circuit is 20,277 constraints
-(20,146 in the legacy statement) and proves in about 5 seconds in browser WebAssembly; a
-deposit proves in about 0.3 seconds.
+Proofs are produced in the user's browser. The hardened transfer circuit is 35,637 constraints
+(35,506 in the legacy statement, both grown by the domain-tagged Merkle compression) and
+proves in seconds in browser WebAssembly; a deposit proves in well under a second.
 
 ## Per-transfer fees without a public trail
 

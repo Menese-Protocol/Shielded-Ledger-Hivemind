@@ -24,6 +24,33 @@ const INSECURE_TEST_SEED: u64 = 20260712;
 const NOTE_DRAWS_BEFORE_TRANSFER_SETUP: usize = 8;
 const DRAWS_BETWEEN_SETUPS: usize = 13;
 
+/// The fixture set of a transfer statement. One function so the run entrypoint, the injection
+/// planner, and the keyset-gate test all resolve the SAME directory for a given statement.
+pub fn fixture_dir(legacy_statement: bool) -> &'static str {
+    if legacy_statement {
+        "fixtures/pool-vectors-bls12-381"
+    } else {
+        "fixtures/pool-vectors-bls12-381-hardened"
+    }
+}
+
+/// Statement selection for the whole soak run. The DEFAULT is the hardened statement — the
+/// shipped statement of the generator and of `fixtures/pool-vectors-bls12-381-hardened` —
+/// so an unparameterized soak exercises exactly what a deployment verifies.
+/// `SOAK_STATEMENT=legacy` selects the pre-hardening statement and its frozen fixture set,
+/// kept reproducible for provenance until every deployment has rotated off the legacy
+/// verifying key. Returns `(legacy_statement, fixture_dir)`.
+pub fn statement_from_env() -> (bool, &'static str) {
+    match std::env::var("SOAK_STATEMENT").as_deref() {
+        Err(_) | Ok("hardened") => (false, fixture_dir(false)),
+        Ok("legacy") => (true, fixture_dir(true)),
+        Ok(other) => {
+            eprintln!("SOAK_STATEMENT must be 'legacy' or 'hardened', got '{other}'");
+            std::process::exit(2);
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Keyset {
     pub transfer_pk: ProvingKey<Bls12_381>,
@@ -127,7 +154,7 @@ pub fn regenerate_and_verify(manifest_json: &str, legacy_statement: bool) -> Res
     })
 }
 
-/// B1 proof 2: the frozen fixture proofs from `fixtures/pool-vectors-bls12-381/` must verify
+/// B1 proof 2: the frozen fixture proofs from the statement's fixture directory must verify
 /// under the REGENERATED verifying keys (and the frozen bad proof must not), proving the
 /// regenerated setup is the same setup the fixtures were produced from — not merely one with
 /// matching hashes on disk.

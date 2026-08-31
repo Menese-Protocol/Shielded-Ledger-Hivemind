@@ -93,7 +93,10 @@ fn main() {
     let manifest_json =
         std::fs::read_to_string(root.join("fixtures/pool-vectors-bls12-381/SETUP-MANIFEST.json"))
             .expect("read setup manifest");
-    let keyset = keys::regenerate_and_verify(&manifest_json).expect("keyset");
+    // legacy_statement = true: this battery's baselines are pinned to the legacy fixture
+    // manifest it loads above, like the other battery binaries (missed when the signature
+    // gained the statement parameter — the soak RUN default is the hardened statement).
+    let keyset = keys::regenerate_and_verify(&manifest_json, true).expect("keyset");
     let mut wasms = pic_env::build_wasms(&root, &root.join("soak/target/wasms-detect"));
 
     // Hook wasm (corruption primitives; additive-only diff proven by the build script).

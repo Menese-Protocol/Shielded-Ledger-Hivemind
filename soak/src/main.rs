@@ -5,20 +5,6 @@ fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf()
 }
 
-/// Statement selection for the whole run: `SOAK_STATEMENT=legacy` (default — the statement of
-/// the deployed verifying key and the frozen `fixtures/pool-vectors-bls12-381`) or
-/// `SOAK_STATEMENT=hardened` (the hardened conservation statement with its own fixture set).
-fn statement_from_env() -> (bool, &'static str) {
-    match std::env::var("SOAK_STATEMENT").as_deref() {
-        Err(_) | Ok("legacy") => (true, "fixtures/pool-vectors-bls12-381"),
-        Ok("hardened") => (false, "fixtures/pool-vectors-bls12-381-hardened"),
-        Ok(other) => {
-            eprintln!("SOAK_STATEMENT must be 'legacy' or 'hardened', got '{other}'");
-            std::process::exit(2);
-        }
-    }
-}
-
 fn load_keys(root: &PathBuf, legacy_statement: bool, fixture_dir: &str) -> keys::Keyset {
     let manifest_path = root.join(fixture_dir).join("SETUP-MANIFEST.json");
     let manifest_json = std::fs::read_to_string(&manifest_path)
@@ -43,7 +29,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mode = args.get(1).map(String::as_str).unwrap_or("run");
     let root = repo_root();
-    let (legacy_statement, fixture_dir) = statement_from_env();
+    let (legacy_statement, fixture_dir) = keys::statement_from_env();
     let keyset = load_keys(&root, legacy_statement, fixture_dir);
 
     match mode {

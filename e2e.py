@@ -43,7 +43,11 @@ EMPTY_ARCHIVE_MANIFEST = hashlib.sha256(b"").digest()
 AUDIT_PASS_DIGEST = hashlib.sha256(
     hashlib.sha256(b"state").digest() + hashlib.sha256(b"pass").digest()
 ).digest()
-TREE_ORACLE_WASM_SHA256 = "676e8ba3f454973dc63257ada00cb4f51c937f1812ee4b316c4a46b7ce310618"
+# Rebuilt for the 4-ary tree. The previous pin (191b35bf...) was the last pre-4-ary build, made
+# while vendor/tree_common still exposed TREE_DEPTH=32; the oracle crate was never carried across
+# with the migration, so that binary walks a binary tree. Rebuild with:
+#   cargo build --release --target wasm32-unknown-unknown -p tree_oracle --features bls12-381
+TREE_ORACLE_WASM_SHA256 = "c1034be5909f179ee37a22891639e9f8267b0c05b72cdb3693f3de6c34da5fb3"
 ICP_DECIMALS = 8
 ICP_FEE_E8S = 10_000
 ICP_SYMBOL = "ICP"
@@ -1983,6 +1987,47 @@ def main() -> None:
         and after_replay_storage == before_replay_storage
     )
 
+    # Z4 — consensus-decode seams at the spent-set boundary (audit §4 rec 3), driven through
+    # the REAL entry point with adversarial encodings. nf1/nf2 are spent at this point, which
+    # is exactly the attack surface: (a) nf + r is byte-distinct from the spent nullifier yet
+    # reduces to the same field element, so a size-only gate plus the byte-keyed set would
+    # admit a double-spend — the ledger must refuse it as REJECT:nullifier-noncanonical with
+    # the verifier never consulted, in EITHER slot; (b) the same canonical nullifier in both
+    # slots must be refused as REJECT:duplicate-nullifier-in-tx BEFORE the spent-set check
+    # (for a legacy verifying key this guard is the only value-doubling defense).
+    fr_modulus = 0x73EDA753299D7D483339D80809A1D80553BDA402FFFE5BFEFFFFFFFF00000001
+    nf1_plus_r = (int.from_bytes(nf1, "little") + fr_modulus).to_bytes(32, "little")
+    nf2_plus_r = (int.from_bytes(nf2, "little") + fr_modulus).to_bytes(32, "little")
+    before_decode = stable_tuple(after_replay)
+    before_decode_storage = after_replay_storage
+    noncanonical_slot1 = call(
+        "zk_ledger",
+        "confidential_transfer",
+        transfer_argument(anchor, nf1_plus_r, nf2, cm1, cm2, fee, v_pub_out, read("transfer_proof.hex")),
+    )
+    noncanonical_slot2 = call(
+        "zk_ledger",
+        "confidential_transfer",
+        transfer_argument(anchor, nf1, nf2_plus_r, cm1, cm2, fee, v_pub_out, read("transfer_proof.hex")),
+    )
+    duplicate_nf = call(
+        "zk_ledger",
+        "confidential_transfer",
+        transfer_argument(anchor, nf1, nf1, cm1, cm2, fee, v_pub_out, read("transfer_proof.hex")),
+    )
+    after_decode = call("zk_ledger", "status", query=True)
+    after_decode_storage = call("zk_ledger", "storage_status", query=True)
+    z4 = (
+        noncanonical_slot1["outcome"] == "REJECT:nullifier-noncanonical"
+        and noncanonical_slot1["verifier_outcome"] == "NOT_CALLED"
+        and noncanonical_slot2["outcome"] == "REJECT:nullifier-noncanonical"
+        and noncanonical_slot2["verifier_outcome"] == "NOT_CALLED"
+        and duplicate_nf["outcome"] == "REJECT:duplicate-nullifier-in-tx"
+        and duplicate_nf["verifier_outcome"] == "NOT_CALLED"
+        and stable_tuple(after_decode) == before_decode
+        and after_decode_storage == before_decode_storage
+    )
+
     # PIR-private read of the first transfer output at note position 2.
     secret = tuple(secrets.randbits(1) for _ in range(DIMENSION))
     selectors = [encrypt_bit(secret, 1 if index == 2 else 0) for index in range(4)]
@@ -2077,6 +2122,7 @@ def main() -> None:
         and z0
         and z2
         and z3
+        and z4
         and pir_ok
         and "ok" in after_valid_validation
         and after_bad_storage == before_bad_storage
@@ -2214,7 +2260,7 @@ def main() -> None:
         and private_transfer_token_length_before == private_transfer_token_length_after
         and private_transfer_pool_before == private_transfer_pool_after == 100
         and "G4-FEE-ARITHMETIC PASS" in block_match_output
-        and z0 and z1 and z2 and z3 and pir_ok
+        and z0 and z1 and z2 and z3 and z4 and pir_ok
     )
     icp_round_trip = (
         icp_interface
@@ -2301,13 +2347,13 @@ def main() -> None:
         "G1-SHAPE": shape_positive and shape_negative,
         "G1-PHASH": parent_positive and parent_negative,
         "G1-RANGE": range_positive and range_negative,
-        "G1-REGRESSION": z0 and z1 and z2 and z3 and pir_ok,
+        "G1-REGRESSION": z0 and z1 and z2 and z3 and z4 and pir_ok,
         "G2-TREE": gate2_tree,
         "G2-CERT": gate2_cert,
         "G2-WITNESS": gate2_witness,
         "G2-ATOMIC": gate2_atomic,
         "G2-ROLLBACK": gate2_rollback,
-        "G2-REGRESSION": gate1_all and z0 and z1 and z2 and z3 and pir_ok,
+        "G2-REGRESSION": gate1_all and z0 and z1 and z2 and z3 and z4 and pir_ok,
         "G3-CODEC": gate3_codec,
         "G3-STORAGE": gate3_storage,
         "G3-UPGRADE": gate3_upgrade,
@@ -2325,6 +2371,7 @@ def main() -> None:
             and z1
             and z2
             and z3
+            and z4
             and pir_ok
         ),
         "G4-CAPABILITY": gate4_capability,
@@ -2346,6 +2393,7 @@ def main() -> None:
         "Z1": z1,
         "Z2": z2,
         "Z3": z3,
+        "Z4-DECODE-SEAMS": z4,
         "PIR": pir_ok,
     }
     report = {
