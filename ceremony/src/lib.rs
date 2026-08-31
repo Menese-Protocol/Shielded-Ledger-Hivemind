@@ -253,10 +253,12 @@ mod params_tests {
         let alice_pk = derive_pk(&cfg, alice_nk);
         let n1 = Note { v: 70, nk: alice_nk, rho: Fr::rand(&mut r), rcm: Fr::rand(&mut r) };
         let n2 = Note { v: 30, nk: alice_nk, rho: Fr::rand(&mut r), rcm: Fr::rand(&mut r) };
+        // The tree hashes on its own wider Poseidon instance, not the note one.
+        let cfg_tree = poseidon_config_tree();
         let dense = DenseTree { leaves: vec![n1.cm(&cfg), n2.cm(&cfg)] };
-        let anchor = dense.root(&cfg);
-        let (sib1, bits1) = dense.path(&cfg, 0);
-        let (sib2, bits2) = dense.path(&cfg, 1);
+        let anchor = dense.root(&cfg_tree);
+        let (rows1, pos1) = dense.path(&cfg_tree, 0);
+        let (rows2, pos2) = dense.path(&cfg_tree, 1);
         let nf1 = n1.nf(&cfg);
         let nf2 = n2.nf(&cfg);
         let out1 = Note { v: 55, nk: bob_nk, rho: nf1, rcm: Fr::rand(&mut r) };
@@ -275,8 +277,8 @@ mod params_tests {
             in_nk: [Some(n1.nk), Some(n2.nk)],
             in_rho: [Some(n1.rho), Some(n2.rho)],
             in_rcm: [Some(n1.rcm), Some(n2.rcm)],
-            in_siblings: [sib1, sib2],
-            in_bits: [bits1, bits2],
+            in_rows: [rows1, rows2],
+            in_pos: [pos1, pos2],
             out_v: [Some(Fr::from(out1.v)), Some(Fr::from(out2.v))],
             out_pk: [Some(bob_pk), Some(alice_pk)],
             out_rcm: [Some(out1.rcm), Some(out2.rcm)],

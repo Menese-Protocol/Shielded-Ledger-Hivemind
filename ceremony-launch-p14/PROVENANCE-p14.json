@@ -1,0 +1,11 @@
+{
+  "phase1_provenance": "inherited-reviewed-phase1",
+  "upstream_url": "https://archive.org/download/transcript_201804/transcript#record-88-of-89-bytes-106300550400-107508511199",
+  "response_file_sha256": "b656a7ee2fd23f184b58db584d0e8dd45bfed06efd9f5b47bb5cbaeb58a3f8d3",
+  "extracted_srs_sha256": "94f268950305fd23b50fa77dec3d540e2742d3472d7416160cce627566ae39e8",
+  "source_power": 21,
+  "target_power": 14,
+  "participant_attestations": [
+    "see published Zcash Sapling MPC attestation set"
+  ]
+}

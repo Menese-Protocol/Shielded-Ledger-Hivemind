@@ -1,6 +1,6 @@
 //! Local Phase-2 ceremony driver / simulator.
 //!
-//! This is the operator + battery tool. It can generate a test-tier SRS, initialize a ceremony,
+//! This is the local driver + battery tool. It can generate a test-tier SRS, initialize a ceremony,
 //! simulate honest contributions locally (sampling and destroying each secret in-process — the real
 //! contributor client D2 does this in the browser instead), finalize with a public beacon, verify
 //! the transcript with the standalone verifier core, and export the final arkworks keys plus a
@@ -17,6 +17,8 @@
 //!   finalize  <srs.bin> <transcript.bin> <beacon>   apply the public beacon and freeze
 //!   verify    <srs.bin> <transcript.bin>            replay + full verification (delegates to D4 core)
 //!   export    <srs.bin> <transcript.bin> <outdir>   write final keys, vks, hashes, SETUP-MANIFEST
+//!   emit-initial <transcript.bin> <outdir>          write the upload_initial_chunk wire payloads
+//!   assemble-transcript <srs> <parts> <out>         build a transcript from a LIVE coordinator
 //!   run       <power> <n> <outdir>                  end-to-end: gen-srs, n contributions, beacon,
 //!                                                    verify, export (the battery one-shot)
 
@@ -125,6 +127,129 @@ fn cmd_verify(srs_path: &str, t_path: &str) {
     }
 }
 
+/// Write the two initial delta-parameter blobs in the coordinator's wire format.
+///
+/// `upload_initial_chunk` consumes exactly these bytes and `finish_init` parses their lengths out
+/// of the stream, but `delta_to_wire` had no caller anywhere in the tree, so the authority
+/// launching a ceremony could not produce the payload the canister requires. This is the producer.
+///
+/// The layout is the one `Main.mo`'s `expectedLen`/`parseLens` decode:
+///   delta_g1 (96) | delta_g2 (192) | hLen u32 BE | h_query (hLen * 96) | lLen u32 BE | l (lLen * 96)
+fn cmd_emit_initial(t_path: &str, outdir: &str) {
+    let t: Transcript = read_obj(t_path);
+    std::fs::create_dir_all(outdir).unwrap();
+    // Deliberately NOT verified here: these are the transcript's OWN initial parameters, the
+    // starting point a verifier re-derives independently from the SRS and the circuits. Run
+    // `verify` (or verify-transcript) for that judgement; this command only serializes.
+    let write = |name: &str, d: &ceremony::transcript::DeltaParams| {
+        let bytes = ceremony::transcript::delta_to_wire(d);
+        std::fs::write(format!("{outdir}/{name}"), &bytes).unwrap();
+        eprintln!("wrote {outdir}/{name} ({} bytes)", bytes.len());
+    };
+    write("transfer_initial.wire", &t.transfer_initial);
+    write("deposit_initial.wire", &t.deposit_initial);
+    eprintln!(
+        "these are the upload_initial_chunk payloads; the coordinator must already be configured \
+         for power {}",
+        t.power
+    );
+}
+
+/// Assemble a verifiable transcript from a LIVE coordinator's exported parts.
+///
+/// The standalone verifier is the whole soundness story of this ceremony — docs/CEREMONY.md §5
+/// tells every participant and observer to run it — but nothing could turn a deployed
+/// coordinator's state into a transcript, so it could only ever verify what the local simulator
+/// produced. This is that missing half. The network side stays out of this crate deliberately
+/// (`ceremony` carries no agent dependency and is offline by design): a small client downloads the
+/// canister's bytes into a parts directory, and this command turns them into a transcript.
+///
+/// The fixed and initial parameters are taken from the SRS, NOT from the parts, because the SRS is
+/// the authority — and the canister's own initial deltas are then compared against the SRS-derived
+/// ones and REFUSED on mismatch. That check is the point: it proves the deployed coordinator was
+/// initialized with the parameters this SRS implies, which no amount of transcript replay could
+/// establish on its own.
+///
+/// Parts layout (written by scripts/export-live-ceremony.mjs):
+///   manifest.tsv          header line `power<TAB>finalized`, then one line per contribution
+///   initial_transfer.wire, initial_deposit.wire
+///   c<i>_transfer.wire,    c<i>_deposit.wire
+fn cmd_assemble_transcript(srs_path: &str, parts: &str, out: &str) {
+    use ceremony::transcript::{delta_from_wire, pok_from_wire, CircuitContribution, Contribution};
+
+    let srs: Phase1Srs = read_obj(srs_path);
+    let init = CeremonyInit::from_srs(&srs).unwrap_or_else(|e| die(&e));
+    let mut t = init.empty_transcript();
+
+    let read_wire = |name: &str| -> Vec<u8> {
+        std::fs::read(format!("{parts}/{name}"))
+            .unwrap_or_else(|e| die(&format!("read {parts}/{name}: {e}")))
+    };
+    let unhex = |s: &str, what: &str| -> Vec<u8> {
+        hex::decode(s).unwrap_or_else(|_| die(&format!("{what} is not hex")))
+    };
+
+    // The coordinator's initial parameters must be the ones this SRS derives.
+    for (name, want) in [
+        ("initial_transfer.wire", &init.transfer_initial),
+        ("initial_deposit.wire", &init.deposit_initial),
+    ] {
+        let got = delta_from_wire(&read_wire(name)).unwrap_or_else(|e| die(&e));
+        if &got != want {
+            die(&format!(
+                "{name} does not match the initial parameters derived from {srs_path} — the \
+                 coordinator was initialized from a different SRS or a different circuit"
+            ));
+        }
+    }
+    eprintln!("initial parameters match the SRS-derived ones");
+
+    let manifest = std::fs::read_to_string(format!("{parts}/manifest.tsv"))
+        .unwrap_or_else(|e| die(&format!("read manifest.tsv: {e}")));
+    let mut lines = manifest.lines();
+    let header: Vec<&str> = lines.next().unwrap_or_else(|| die("empty manifest")).split('\t').collect();
+    if header.len() != 2 {
+        die("manifest header must be `power<TAB>finalized`");
+    }
+    let power: u32 = header[0].parse().unwrap_or_else(|_| die("bad power in manifest"));
+    if power != t.power {
+        die(&format!("manifest power {power} != SRS power {}", t.power));
+    }
+    t.finalized = header[1] == "true";
+
+    for (n, line) in lines.filter(|l| !l.trim().is_empty()).enumerate() {
+        let f: Vec<&str> = line.split('\t').collect();
+        if f.len() != 11 {
+            die(&format!("contribution line {n} must have 11 tab-separated fields"));
+        }
+        let idx: usize = f[0].parse().unwrap_or_else(|_| die("bad index"));
+        if idx != n {
+            die(&format!("contribution indices must be dense and ordered; got {idx} at position {n}"));
+        }
+        let mk = |circuit: &str, a: &str, b: &str, c: &str| -> CircuitContribution {
+            let delta = delta_from_wire(&read_wire(&format!("c{n}_{circuit}.wire")))
+                .unwrap_or_else(|e| die(&format!("c{n}_{circuit}: {e}")));
+            let pok = pok_from_wire(
+                &unhex(a, "s_g1"), &unhex(b, "s_delta_g1"), &unhex(c, "r_delta_g2"),
+            )
+            .unwrap_or_else(|e| die(&format!("c{n}_{circuit} pok: {e}")));
+            CircuitContribution { delta, pok }
+        };
+        t.contributions.push(Contribution {
+            contributor: unhex(f[1], "contributor"),
+            timestamp: f[2].parse().unwrap_or_else(|_| die("bad timestamp")),
+            is_beacon: f[3] == "true",
+            beacon: unhex(f[4], "beacon"),
+            transfer: mk("transfer", f[5], f[6], f[7]),
+            deposit: mk("deposit", f[8], f[9], f[10]),
+        });
+    }
+
+    eprintln!("assembled {} contribution(s), finalized={}", t.contributions.len(), t.finalized);
+    write_obj(out, &t);
+    eprintln!("now verify it: verify-transcript {srs_path} {out} --selfcheck");
+}
+
 fn cmd_export(srs_path: &str, t_path: &str, outdir: &str) {
     let srs: Phase1Srs = read_obj(srs_path);
     let t: Transcript = read_obj(t_path);
@@ -225,7 +350,7 @@ fn main() {
     let a: Vec<String> = std::env::args().collect();
     if a.len() < 2 {
         eprintln!(
-            "usage:\n  ceremony-cli gen-srs <power> <out.srs.bin>\n  ceremony-cli init <srs> <out.transcript>\n  ceremony-cli contribute <srs> <transcript> <id-hex>\n  ceremony-cli finalize <srs> <transcript> <beacon>\n  ceremony-cli verify <srs> <transcript>\n  ceremony-cli export <srs> <transcript> <outdir>\n  ceremony-cli run <power> <n> <outdir>"
+            "usage:\n  ceremony-cli gen-srs <power> <out.srs.bin>\n  ceremony-cli init <srs> <out.transcript>\n  ceremony-cli contribute <srs> <transcript> <id-hex>\n  ceremony-cli finalize <srs> <transcript> <beacon>\n  ceremony-cli verify <srs> <transcript>\n  ceremony-cli export <srs> <transcript> <outdir>\n  ceremony-cli emit-initial <transcript> <outdir>\n  ceremony-cli assemble-transcript <srs> <parts-dir> <out.transcript>\n  ceremony-cli run <power> <n> <outdir>"
         );
         exit(2);
     }
@@ -236,6 +361,8 @@ fn main() {
         "finalize" if a.len() == 5 => cmd_finalize(&a[2], &a[3], &a[4]),
         "verify" if a.len() == 4 => cmd_verify(&a[2], &a[3]),
         "export" if a.len() == 5 => cmd_export(&a[2], &a[3], &a[4]),
+        "emit-initial" if a.len() == 4 => cmd_emit_initial(&a[2], &a[3]),
+        "assemble-transcript" if a.len() == 5 => cmd_assemble_transcript(&a[2], &a[3], &a[4]),
         "run" if a.len() == 5 => cmd_run(
             a[2].parse().unwrap_or_else(|_| die("bad power")),
             a[3].parse().unwrap_or_else(|_| die("bad n")),

@@ -240,6 +240,25 @@ pub fn delta_from_wire(bytes: &[u8]) -> Result<DeltaParams, String> {
     Ok(DeltaParams { delta_g1, delta_g2, h_query, l_query })
 }
 
+/// Parse a proof of knowledge from the coordinator's wire layout — the three uncompressed
+/// big-endian blobs its `PokWire` carries: `s_g1`(96) || `s_delta_g1`(96) || `r_delta_g2`(192).
+///
+/// The encode direction has always existed (the browser contributor writes exactly this shape) but
+/// nothing could read it back, so a contribution recorded on-chain could not be turned into a
+/// `Pok` off-chain — and therefore a live ceremony's transcript could not be assembled or verified.
+/// Every point gets the same full validation `delta_from_wire` applies: on curve, in the correct
+/// subgroup, non-identity.
+pub fn pok_from_wire(s_g1: &[u8], s_delta_g1: &[u8], r_delta_g2: &[u8]) -> Result<Pok, String> {
+    if s_g1.len() != 96 || s_delta_g1.len() != 96 || r_delta_g2.len() != 192 {
+        return Err("pok wire lengths must be 96/96/192".into());
+    }
+    Ok(Pok {
+        s_g1: g1_from_be(s_g1)?,
+        s_delta_g1: g1_from_be(s_delta_g1)?,
+        r_delta_g2: g2_from_be(r_delta_g2)?,
+    })
+}
+
 /// SHA-256 identity of the circuit-fixed params. The canister stores this as a 32-byte constant at
 /// init; the standalone verifier recomputes it from the SRS-derived fixed params and checks it.
 pub fn fixed_params_hash(f: &FixedParams) -> [u8; 32] {

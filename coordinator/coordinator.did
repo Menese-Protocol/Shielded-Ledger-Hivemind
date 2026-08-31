@@ -72,7 +72,7 @@ service : {
   begin_beacon_staging: () -> (R);
   begin_contribution: () -> (R);
   /// First caller becomes the authority and sets the ceremony parameters. `power`, the SRS and
-  /// fixed-params hashes, and the window come from the operator; they are all public.
+  /// fixed-params hashes, and the window come from whoever launches the ceremony; they are all public.
   configure: (p: nat32, srs_sha256: blob, transfer_fixed_hash: blob,
    deposit_fixed_hash: blob, start_time: int, end_time: int, turn_timeout:
    int) -> (R);

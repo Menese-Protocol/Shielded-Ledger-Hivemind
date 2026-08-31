@@ -265,7 +265,7 @@ pub fn vk_sha256(pk: &ProvingKey<Bls12_381>) -> String {
 pub fn selfcheck_keys_work(final_keys: &FinalKeys) -> Result<(), String> {
     use ark_ff::UniformRand;
     use ark_snark::SNARK;
-    use common::{derive_pk, DenseTree, Note};
+    use common::{derive_pk, poseidon_config_tree, DenseTree, Note};
     let cfg = poseidon_config();
     let mut r = rand::rngs::OsRng;
 
@@ -296,9 +296,15 @@ pub fn selfcheck_keys_work(final_keys: &FinalKeys) -> Result<(), String> {
     let n1 = Note { v: 70, nk: alice_nk, rho: Fr::rand(&mut r), rcm: Fr::rand(&mut r) };
     let n2 = Note { v: 30, nk: alice_nk, rho: Fr::rand(&mut r), rcm: Fr::rand(&mut r) };
     let dense = DenseTree { leaves: vec![n1.cm(&cfg), n2.cm(&cfg)] };
-    let anchor = dense.root(&cfg);
-    let (sib1, bits1) = dense.path(&cfg, 0);
-    let (sib2, bits2) = dense.path(&cfg, 1);
+    // The tree hashes under its OWN Poseidon instance (width 6, rate = TREE_ARITY),
+    // not the note/commitment instance held in `cfg`. Wrapping `cfg` in a TreeCfg
+    // would typecheck and then silently produce an anchor from the wrong
+    // permutation, so this must come from `poseidon_config_tree()`. The leaf
+    // commitments above still use `cfg`: a note commitment is not a tree node.
+    let tcfg = poseidon_config_tree();
+    let anchor = dense.root(&tcfg);
+    let (rows1, pos1) = dense.path(&tcfg, 0);
+    let (rows2, pos2) = dense.path(&tcfg, 1);
     let nf1 = n1.nf(&cfg);
     let nf2 = n2.nf(&cfg);
     let out1 = Note { v: 55, nk: bob_nk, rho: nf1, rcm: Fr::rand(&mut r) };
@@ -317,8 +323,11 @@ pub fn selfcheck_keys_work(final_keys: &FinalKeys) -> Result<(), String> {
         in_nk: [Some(n1.nk), Some(n2.nk)],
         in_rho: [Some(n1.rho), Some(n2.rho)],
         in_rcm: [Some(n1.rcm), Some(n2.rcm)],
-        in_siblings: [sib1, sib2],
-        in_bits: [bits1, bits2],
+        // 4-ary membership witness: the full ARITY-wide row per level plus the
+        // walked node's slot, which the circuit re-derives as a one-hot selector.
+        // Replaces the pre-4-ary sibling/direction-bit pair.
+        in_rows: [rows1, rows2],
+        in_pos: [pos1, pos2],
         out_v: [Some(Fr::from(out1.v)), Some(Fr::from(out2.v))],
         out_pk: [Some(bob_pk), Some(alice_pk)],
         out_rcm: [Some(out1.rcm), Some(out2.rcm)],

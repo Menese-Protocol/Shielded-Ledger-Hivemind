@@ -6,9 +6,19 @@
 /// field, argument, or code path that receives, stores, or reconstructs any participant's secret.
 /// The secret is sampled, applied, and destroyed in the contributor's process; only transformed
 /// public parameters and a proof are uploaded (apply-and-destroy, Bowe-Gabizon-Miers 2017). The
-/// SHIPPED contributor is the Rust CLI in `ceremony/`. The upload API is deliberately shaped so a
-/// browser client can feed WebCrypto bytes (`contribute.rs`), but no browser contributor exists in
-/// this repository, and this header must not be read as describing one.
+/// SHIPPED contributor is the browser client in `demo-frontend/contributor-client/`, which is the
+/// only client in this repository that can reach a deployed coordinator: it holds the
+/// `@dfinity/agent` actor and calls `upload_contribution_chunk` / `submit_contribution`, and the
+/// secret is sampled and destroyed inside `demo-frontend/contributor-wasm`'s
+/// `transform_contribution`. The Rust CLI in `ceremony/` is an OFFLINE tool — it generates,
+/// verifies and exports transcripts over local files and carries no agent dependency at all
+/// (`ceremony/Cargo.toml` pulls no ic-agent, candid or HTTP client), so it cannot contribute to a
+/// live ceremony.
+///
+/// This header previously named the Rust CLI as the shipped contributor and asserted that no
+/// browser contributor existed here. Both halves were false, and false in the direction that
+/// strands whoever is launching a ceremony: it points at the one tool that physically cannot talk
+/// to this canister. `docs/CEREMONY.md` §4 has always described the browser flow correctly.
 ///
 /// 🔴 WHAT IS AND IS NOT CHECKED ON-CHAIN. On acceptance the coordinator runs the AFFORDABLE
 /// STRUCTURAL checks on-chain — each point canonical, on the curve, non-identity; the delta
@@ -306,7 +316,8 @@ persistent actor CeremonyCoordinator {
   // ------------------------------------------------------------------------------------------
 
   /// First caller becomes the authority and sets the ceremony parameters. `power`, the SRS and
-  /// fixed-params hashes, and the window come from the operator; they are all public.
+  /// fixed-params hashes, and the window come from whoever launches the ceremony; they are all
+  /// public.
   public shared ({ caller }) func configure(
     p : Nat32,
     srs_sha256 : Blob,

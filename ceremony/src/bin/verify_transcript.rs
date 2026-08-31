@@ -15,7 +15,7 @@
 use ark_serialize::CanonicalDeserialize;
 use ceremony::session::{selfcheck_keys_work, verify_full_transcript};
 use ceremony::srs::Phase1Srs;
-use ceremony::transcript::Transcript;
+use ceremony::transcript::{fixed_params_hash, Transcript};
 use std::process::exit;
 
 fn read<T: CanonicalDeserialize>(path: &str) -> T {
@@ -58,6 +58,19 @@ fn main() {
             println!("  finalized (beacon)   : {}", report.finalized);
             println!("  transfer vk SHA-256  : {}", report.transfer_vk_sha256);
             println!("  deposit  vk SHA-256  : {}", report.deposit_vk_sha256);
+            // The coordinator's `configure` takes these two alongside the SRS hash, and they are
+            // public transcript data — but until now no binary emitted them, so whoever launches a
+            // ceremony had no way to obtain the arguments the canister requires. They are printed
+            // from the verified transcript specifically so the values that configure a coordinator
+            // are the ones an independent verification just accepted.
+            println!(
+                "  transfer fixed SHA256: {}",
+                hex::encode(fixed_params_hash(&transcript.transfer_fixed))
+            );
+            println!(
+                "  deposit  fixed SHA256: {}",
+                hex::encode(fixed_params_hash(&transcript.deposit_fixed))
+            );
             if selfcheck {
                 eprint!("running key self-check (prove+verify real transfer & deposit) ... ");
                 match selfcheck_keys_work(&final_keys) {
