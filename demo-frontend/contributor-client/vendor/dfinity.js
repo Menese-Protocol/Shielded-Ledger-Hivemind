@@ -9568,7 +9568,7 @@ var require_decoder = __commonJS({
           32: (val) => new URL2(val),
           35: (val) => new RegExp(val)
         }, opts.tags);
-        this.parser = parser(global, {
+        this.parser = parser(globalThis, {
           // eslint-disable-next-line no-console
           log: console.log.bind(console),
           pushInt: this.pushInt.bind(this),
@@ -16532,9 +16532,9 @@ function getDefaultFetch() {
     } else {
       throw new HttpDefaultFetchError("Fetch implementation was not available. You appear to be in a browser context, but window.fetch was not present.");
     }
-  } else if (typeof global !== "undefined") {
-    if (global.fetch) {
-      defaultFetch = global.fetch.bind(global);
+  } else if (typeof globalThis !== "undefined") {
+    if (globalThis.fetch) {
+      defaultFetch = globalThis.fetch.bind(globalThis);
     } else {
       throw new HttpDefaultFetchError("Fetch implementation was not available. You appear to be in a Node.js context, but global.fetch was not available.");
     }
@@ -16718,7 +16718,7 @@ var init_http = __esm({
           return queryResponse;
         });
         this.config = options;
-        __classPrivateFieldSet5(this, _HttpAgent_fetch, options.fetch || getDefaultFetch() || fetch.bind(global), "f");
+        __classPrivateFieldSet5(this, _HttpAgent_fetch, options.fetch || getDefaultFetch() || fetch.bind(globalThis), "f");
         __classPrivateFieldSet5(this, _HttpAgent_fetchOptions, options.fetchOptions, "f");
         __classPrivateFieldSet5(this, _HttpAgent_callOptions, options.callOptions, "f");
         __classPrivateFieldSet5(this, _HttpAgent_shouldFetchRootKey, (_a2 = options.shouldFetchRootKey) !== null && _a2 !== void 0 ? _a2 : false, "f");
@@ -17370,7 +17370,7 @@ var init_proxy = __esm({
 
 // node_modules/@dfinity/agent/lib/esm/agent/index.js
 function getDefaultAgent() {
-  const agent = typeof window === "undefined" ? typeof global === "undefined" ? typeof self === "undefined" ? void 0 : self.ic.agent : global.ic.agent : window.ic.agent;
+  const agent = typeof window === "undefined" ? typeof globalThis === "undefined" ? typeof self === "undefined" ? void 0 : self.ic.agent : globalThis.ic.agent : window.ic.agent;
   if (!agent) {
     throw new Error("No Agent could be found.");
   }
@@ -18433,8 +18433,8 @@ var CryptoError = class _CryptoError extends Error {
   }
 };
 function _getEffectiveCrypto(subtleCrypto) {
-  if (typeof global !== "undefined" && global["crypto"] && global["crypto"]["subtle"]) {
-    return global["crypto"]["subtle"];
+  if (typeof globalThis !== "undefined" && globalThis["crypto"] && globalThis["crypto"]["subtle"]) {
+    return globalThis["crypto"]["subtle"];
   }
   if (subtleCrypto) {
     return subtleCrypto;
@@ -19245,7 +19245,7 @@ var LocalStorage = class {
     if (this._localStorage) {
       return this._localStorage;
     }
-    const ls = typeof window === "undefined" ? typeof global === "undefined" ? typeof self === "undefined" ? void 0 : self.localStorage : global.localStorage : window.localStorage;
+    const ls = typeof window === "undefined" ? typeof globalThis === "undefined" ? typeof self === "undefined" ? void 0 : self.localStorage : globalThis.localStorage : window.localStorage;
     if (!ls) {
       throw new Error("Could not find local storage.");
     }
