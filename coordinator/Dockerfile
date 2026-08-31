@@ -8,7 +8,7 @@
 #   docker run --rm -v "$PWD:/out" ceremony-coordinator-build \
 #       bash -c "coordinator/build.sh && cp coordinator/coordinator.wasm coordinator/BUILD-HASH.txt /out/"
 #
-# Pins: dfx 0.31.0 (moc 1.1.0), mops CLI 2.8.0, mops packages core 1.0.0 + sha2 0.1.9 (mops.lock).
+# Pins: dfx 0.32.0 (moc 1.4.1), mops CLI 2.8.0, mops packages core 1.0.0 + sha2 0.1.9 (mops.lock).
 FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -17,7 +17,7 @@ RUN apt-get update && apt-get install -y \
     rm -rf /var/lib/apt/lists/*
 
 # Node (for mops) and dfx are pinned to exact versions.
-ARG DFX_VERSION=0.31.0
+ARG DFX_VERSION=0.32.0
 ARG MOPS_VERSION=2.8.0
 ARG NODE_MAJOR=20
 

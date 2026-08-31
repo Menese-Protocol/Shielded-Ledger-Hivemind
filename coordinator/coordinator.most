@@ -1,4 +1,4 @@
-// Version: 1.0.0
+// Version: 3.0.0
 type ContributionRec__819029864 =
   {
     beacon : Blob;
@@ -24,13 +24,14 @@ type Nat__920180692 = Nat;
 type PokWire__398356428 = {r_delta_g2 : Blob; s_delta_g1 : Blob; s_g1 : Blob};
 type Staging__263145621 =
   {
-    depositChunks : List__635498568<Blob>;
-    transferChunks : List__635498568<Blob>;
+    depositChunks : List__635498568<Nat8>;
+    transferChunks : List__635498568<Nat8>;
     who : Principal
   };
-actor {
+actor ({
   stable var authority : Principal;
   stable var configured : Bool;
+  stable var contributionConcatInstructions : Nat64;
   stable contributions :
     {
       var blockIndex : Nat__710901222;
@@ -45,18 +46,75 @@ actor {
   stable var depositLLen : Nat;
   stable var endTime : Int;
   stable var finalized : Bool;
+  stable var finishInitInstructions : Nat64;
   stable var genesis : Blob;
   stable var initDepositChunks :
     {
       var blockIndex : Nat__710901222;
-      var blocks : [var [var ?Blob]];
+      var blocks : [var [var ?Nat8]];
       var elementIndex : Nat__710901222
     };
   stable var initDone : Bool;
   stable var initTransferChunks :
     {
       var blockIndex : Nat__710901222;
-      var blocks : [var [var ?Blob]];
+      var blocks : [var [var ?Nat8]];
+      var elementIndex : Nat__710901222
+    };
+  stable var power : Nat32;
+  stable queue :
+    {
+      var blockIndex : Nat__710901222;
+      var blocks : [var [var ?Principal]];
+      var elementIndex : Nat__710901222
+    };
+  stable var queueHead : Nat;
+  stable var runningChallenge : Blob;
+  stable var srsSha256 : Blob;
+  in var staging :
+    ?{
+       depositChunks : List__635498568<Blob>;
+       transferChunks : List__635498568<Blob>;
+       who : Principal
+     };
+  stable var startTime : Int;
+  stable var transferFixedHash : Blob;
+  stable var transferHLen : Nat;
+  stable var transferInitial : Blob;
+  stable var transferInitialHash : Blob;
+  stable var transferLLen : Nat;
+  stable var turnTimeout : Int
+}, {
+  stable var authority : Principal;
+  stable var configured : Bool;
+  stable var contributionConcatInstructions : Nat64;
+  stable contributions :
+    {
+      var blockIndex : Nat__710901222;
+      var blocks : [var [var ?ContributionRec__819029864]];
+      var elementIndex : Nat__710901222
+    };
+  stable var currentTurnStart : Int;
+  stable var depositFixedHash : Blob;
+  stable var depositHLen : Nat;
+  stable var depositInitial : Blob;
+  stable var depositInitialHash : Blob;
+  stable var depositLLen : Nat;
+  stable var endTime : Int;
+  stable var finalized : Bool;
+  stable var finishInitInstructions : Nat64;
+  stable var genesis : Blob;
+  stable var initDepositChunks :
+    {
+      var blockIndex : Nat__710901222;
+      var blocks : [var [var ?Nat8]];
+      var elementIndex : Nat__710901222
+    };
+  stable var initDone : Bool;
+  stable var initTransferChunks :
+    {
+      var blockIndex : Nat__710901222;
+      var blocks : [var [var ?Nat8]];
       var elementIndex : Nat__710901222
     };
   stable var power : Nat32;
@@ -77,4 +135,4 @@ actor {
   stable var transferInitialHash : Blob;
   stable var transferLLen : Nat;
   stable var turnTimeout : Int
-};
+}) ;

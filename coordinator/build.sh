@@ -2,8 +2,8 @@
 # Deterministic one-command build of the Phase-2 ceremony coordinator wasm.
 #
 # Reproducibility contract (a ceremony coordinator whose binary cannot be reproduced is worthless):
-#   - moc      : 1.1.0  (shipped with dfx 0.31.0; we invoke $(dfx cache show)/moc, never /usr/bin/moc)
-#   - dfx      : 0.31.0
+#   - moc      : 1.4.1  (shipped with dfx 0.32.0; we invoke $(dfx cache show)/moc, never /usr/bin/moc)
+#   - dfx      : 0.32.0
 #   - mops     : 2.8.0 CLI, packages pinned in ../mops.lock (core 1.0.0, sha2 0.1.9)
 #   - sources  : coordinator/src/*.mo + the in-repo BLS12-381 tower src/groth16/*.mo
 # Two runs on the same toolchain produce a byte-identical wasm (identical SHA-256). For
@@ -17,8 +17,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
 
-EXPECT_DFX="0.31.0"
-EXPECT_MOC="1.1.0"
+EXPECT_DFX="0.32.0"
+EXPECT_MOC="1.4.1"
 
 dfx_ver="$(dfx --version 2>/dev/null | awk '{print $2}')"
 if [ "$dfx_ver" != "$EXPECT_DFX" ]; then

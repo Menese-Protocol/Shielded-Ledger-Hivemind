@@ -59,25 +59,54 @@ type CeremonyInfo =
 /// delta-dependent parameters (per circuit), each contribution's proof of knowledge and parameter
 /// hashes, the participant queue and log, the ceremony window, and the finalize beacon. There is no
 /// field, argument, or code path that receives, stores, or reconstructs any participant's secret.
-/// The secret is sampled, applied, and destroyed in the contributor's browser; only transformed
-/// public parameters and a proof are uploaded (apply-and-destroy, Bowe-Gabizon-Miers 2017).
+/// The secret is sampled, applied, and destroyed in the contributor's process; only transformed
+/// public parameters and a proof are uploaded (apply-and-destroy, Bowe-Gabizon-Miers 2017). The
+/// SHIPPED contributor is the browser client in `demo-frontend/contributor-client/`, which is the
+/// only client in this repository that can reach a deployed coordinator: it holds the
+/// `@dfinity/agent` actor and calls `upload_contribution_chunk` / `submit_contribution`, and the
+/// secret is sampled and destroyed inside `demo-frontend/contributor-wasm`'s
+/// `transform_contribution`. The Rust CLI in `ceremony/` is an OFFLINE tool — it generates,
+/// verifies and exports transcripts over local files and carries no agent dependency at all
+/// (`ceremony/Cargo.toml` pulls no ic-agent, candid or HTTP client), so it cannot contribute to a
+/// live ceremony.
 /// 
-/// On acceptance the coordinator runs the O(1)-pairing proof-of-knowledge check on-chain (soundness)
-/// and records the contribution; the full delta-division-consistency check (correctness) is run
-/// off-chain by the standalone verifier over the published transcript, which this canister serves in
-/// full. Parameters are uploaded and downloaded in <2 MB chunks (a transfer contribution is ~2.5 MB).
+/// This header previously named the Rust CLI as the shipped contributor and asserted that no
+/// browser contributor existed here. Both halves were false, and false in the direction that
+/// strands whoever is launching a ceremony: it points at the one tool that physically cannot talk
+/// to this canister. `docs/CEREMONY.md` §4 has always described the browser flow correctly.
+/// 
+/// 🔴 WHAT IS AND IS NOT CHECKED ON-CHAIN. On acceptance the coordinator runs the AFFORDABLE
+/// STRUCTURAL checks on-chain — each point canonical, on the curve, non-identity; the delta
+/// actually advanced; correct length — and records the proof and its hashes into the immutable
+/// public transcript. It does NOT run the proof-of-knowledge verification: `checkOneCircuit` calls
+/// `PokVerify.structuralCheck`, never `verifyPok`. The SOUNDNESS-critical subgroup + pairing
+/// verification runs OFF-CHAIN, in the standalone verifier, over the published transcript (it
+/// re-runs exactly `PokVerify.verifyPok`'s math in arkworks). The reason is measured, not
+/// preference: a full verification in this pure-Nat BLS12-381 tower costs well over the IC
+/// 40e9-instruction single-message limit — the subgroup checks alone are literal [r]P scalar
+/// multiplications.
+/// 
+/// This paragraph previously claimed the coordinator ran the O(1)-pairing proof-of-knowledge check
+/// on-chain "(soundness)", which contradicted both the comment at the acceptance boundary below
+/// and `PokVerify`'s own header, and which the code does not do. It is the first thing a reviewer
+/// reads, and it claimed a soundness property the canister does not enforce.
+/// 
+/// Parameters are uploaded and downloaded in <2 MB chunks (a transfer contribution is ~2.5 MB).
 service : {
   abort_contribution: () -> (R);
   /// The authority may open a staging slot for the beacon even though it is not "their turn".
   begin_beacon_staging: () -> (R);
   begin_contribution: () -> (R);
   /// First caller becomes the authority and sets the ceremony parameters. `power`, the SRS and
-  /// fixed-params hashes, and the window come from whoever launches the ceremony; they are all public.
+  /// fixed-params hashes, and the window come from whoever launches the ceremony; they are all
+  /// public.
   configure: (p: nat32, srs_sha256: blob, transfer_fixed_hash: blob,
    deposit_fixed_hash: blob, start_time: int, end_time: int, turn_timeout:
    int) -> (R);
+  contribution_cost: () -> (nat64) query;
   /// Freeze the initial parameters, compute their hashes and the genesis challenge.
   finish_init: () -> (R);
+  finish_init_cost: () -> (nat64) query;
   get_ceremony_info: () -> (CeremonyInfo) query;
   get_contribution: (i: nat) -> (opt ContributionMeta) query;
   get_contribution_chunk: (i: nat, circuit: Circuit, offset: nat, len:
