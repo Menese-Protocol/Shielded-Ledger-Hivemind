@@ -12,7 +12,7 @@
 use ark_bls12_381::Fr as F;
 use ark_ff::{PrimeField, UniformRand};
 use ark_std::rand::{rngs::StdRng, RngCore, SeedableRng};
-use common::{
+use common::{poseidon_config_tree, 
     derive_nf, derive_pk, note_commitment, poseidon_config, DenseTree, Note, TAG_CM, TAG_NF,
     TAG_PK,
 };
@@ -137,7 +137,7 @@ fn main() {
             filler(&mut rng).cm(&cfg),
         ];
         let tree = DenseTree { leaves };
-        let anchor = tree.root(&cfg);
+        let anchor = tree.root(&poseidon_config_tree());
         let nf0 = in0.nf(&cfg);
         let nf1 = in1.nf(&cfg);
         let total = in0.v + in1.v;

@@ -1,6 +1,7 @@
 #![cfg(feature = "bls12-381")]
 
 use ark_bls12_381::Bls12_381;
+use ark_crypto_primitives::sponge::{poseidon::PoseidonSponge, CryptographicSponge};
 use ark_ff::{One, UniformRand};
 use ark_groth16::{Groth16, Proof};
 use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystem};
@@ -8,6 +9,7 @@ use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_snark::SNARK;
 use ark_std::rand::{rngs::StdRng, RngCore, SeedableRng};
 use common::{
+    poseidon_config_tree, TREE_ARITY,
     derive_nf, derive_pk, hash_n, merkle_compress, note_commitment, poseidon_config, DenseTree,
     DepositCircuit, IncrementalTree, Note, PoseidonCfg, ScalarField as F, TransferCircuit, TAG_CM,
     TAG_MERGE,
@@ -81,9 +83,10 @@ fn transfer_case(
         filler().cm(cfg),
     ];
     let tree = DenseTree { leaves };
-    let anchor = tree.root(cfg);
-    let (siblings_1, bits_1) = tree.path(cfg, 1);
-    let (siblings_2, bits_2) = tree.path(cfg, 4);
+    let cfg_tree = poseidon_config_tree();
+    let anchor = tree.root(&cfg_tree);
+    let (rows_1, pos_1) = tree.path(&cfg_tree, 1);
+    let (rows_2, pos_2) = tree.path(&cfg_tree, 4);
     let nullifiers = [inputs[0].nf(cfg), inputs[1].nf(cfg)];
     let output_pk = [derive_pk(cfg, recipient_nk), derive_pk(cfg, owner_nk)];
     let output_rcm = [F::rand(rng), F::rand(rng)];
@@ -119,8 +122,8 @@ fn transfer_case(
         in_nk: [Some(inputs[0].nk), Some(inputs[1].nk)],
         in_rho: [Some(inputs[0].rho), Some(inputs[1].rho)],
         in_rcm: [Some(inputs[0].rcm), Some(inputs[1].rcm)],
-        in_siblings: [siblings_1, siblings_2],
-        in_bits: [bits_1, bits_2],
+        in_rows: [rows_1, rows_2],
+        in_pos: [pos_1, pos_2],
         out_v: [
             Some(F::from(output_values[0])),
             Some(F::from(output_values[1])),
@@ -170,8 +173,10 @@ fn randomized_transfers_enforce_conservation_membership_nullifiers_and_commitmen
 
         let mut wrong_path = honest.clone();
         let input = case % 2;
-        let level = (case * 7) % wrong_path.in_bits[input].len();
-        wrong_path.in_bits[input][level] = !wrong_path.in_bits[input][level];
+        let level = (case * 7) % wrong_path.in_pos[input].len();
+        // 5-ary: move the claimed slot within the row (was: flip the left/right bit). The one-hot
+        // selector then picks a sibling instead of the node carried up, so membership must fail.
+        wrong_path.in_pos[input][level] = (wrong_path.in_pos[input][level] + 1) % TREE_ARITY;
         assert_unsatisfied(wrong_path);
 
         let mut wrong_nullifier = honest.clone();
@@ -307,15 +312,16 @@ fn deposit_commitment_binds_amount_and_opening_across_edges() {
 fn incremental_and_dense_tree_roots_match_after_every_append() {
     let cfg = poseidon_config();
     let mut rng = StdRng::from_seed([0x71; 32]);
-    let mut incremental = IncrementalTree::new(&cfg);
+    let cfg_tree = poseidon_config_tree();
+    let mut incremental = IncrementalTree::new(&cfg_tree);
     let mut leaves = Vec::new();
     for _ in 0..40 {
         leaves.push(F::rand(&mut rng));
-        let incremental_root = incremental.append(&cfg, *leaves.last().unwrap());
+        let incremental_root = incremental.append(&cfg_tree, *leaves.last().unwrap());
         let dense_root = DenseTree {
             leaves: leaves.clone(),
         }
-        .root(&cfg);
+        .root(&cfg_tree);
         assert_eq!(incremental_root, dense_root);
     }
 }
@@ -332,7 +338,12 @@ fn note_hash_domains_are_distinct() {
         let nf = derive_nf(&cfg, nk, rho);
         let cm = note_commitment(&cfg, rng.next_u64(), pk, rho, rcm);
         // The merge (inner-node) domain joins pk/nf/cm as a fourth distinct image domain.
-        let node = merkle_compress(&cfg, pk, cm);
+        // Built with `from_fn` over TREE_ARITY rather than a literal row: a literal pins the
+        // test to one arity, and the arity has now changed twice. Alternating two DIFFERENT
+        // note images keeps the row non-uniform, so the check cannot pass by accident on a
+        // row whose slots are all equal.
+        let row: [F; TREE_ARITY] = core::array::from_fn(|i| if i % 2 == 0 { pk } else { cm });
+        let node = merkle_compress(&poseidon_config_tree(), &row);
         assert_ne!(pk, nf);
         assert_ne!(pk, cm);
         assert_ne!(nf, cm);
@@ -342,37 +353,82 @@ fn note_hash_domains_are_distinct() {
     }
 }
 
-/// The Merkle inner-node hash is domain-separated by its leading TAG_MERGE=4, so a node image
-/// lives in a domain distinct from a bare 2-input hash and from a leaf commitment. This is the
-/// structural separation the tag buys: an attacker cannot reinterpret an inner-node value as a
-/// leaf commitment (or vice versa) without a Poseidon preimage, and the tag makes that true by
-/// construction rather than as a consequence of arity alone.
+/// The Merkle inner-node hash is domain-separated by TAG_MERGE=4 carried in the sponge CAPACITY,
+/// so a node image lives in a domain distinct from a bare row hash and from a leaf commitment.
+/// This is the structural separation the tag buys: an attacker cannot reinterpret an inner-node
+/// value as a leaf commitment (or vice versa) without a Poseidon preimage, and the tag makes that
+/// true by construction rather than as a consequence of arity alone.
+///
+/// TWO relocations are pinned here. The tag moved from a leading RATE element into the capacity so
+/// a level stopped paying a second permutation; and the tree moved to arity 5 on its own width-6
+/// Poseidon instance. Neither weakens the separation — the capacity enters every round, and the
+/// two instances now have different round constants and a different MDS as well — so this test
+/// asserts what it always did, plus a regression pin on each relocation.
 #[test]
 fn merkle_node_domain_is_tag_separated() {
     let cfg = poseidon_config();
+    let cfg_tree = poseidon_config_tree();
     let mut rng = StdRng::from_seed([0x4e; 32]);
     for _ in 0..32 {
-        let l = F::rand(&mut rng);
-        let r = F::rand(&mut rng);
-        // The tagged node hash differs from the untagged 2-input hash of the same children:
-        // proof the tag actually moved the domain (not a no-op).
+        let row: [F; TREE_ARITY] = core::array::from_fn(|_| F::rand(&mut rng));
+
+        // The tagged node hash differs from the untagged hash of the same children on the same
+        // instance: proof the tag actually moved the domain (not a no-op).
+        let mut untagged = PoseidonSponge::<F>::new(&cfg_tree.0);
+        for c in &row {
+            untagged.absorb(c);
+        }
         assert_ne!(
-            merkle_compress(&cfg, l, r),
-            hash_n(&cfg, &[l, r]),
+            merkle_compress(&cfg_tree, &row),
+            untagged.squeeze_field_elements(1)[0],
             "merge tag did not change the node hash — domain separation is not in effect"
         );
-        // And it equals the tagged sponge over [TAG_MERGE, l, r] — pinning the exact preimage
-        // shape the circuit gadget and the Motoko verifier must reproduce byte-for-byte.
+
+        // And it equals a sponge whose CAPACITY carries the tag while the rate absorbs exactly the
+        // ARITY children — pinning the exact preimage shape the circuit gadget and the Motoko
+        // verifier must reproduce byte-for-byte. Spelled out from the schedule rather than by
+        // calling merkle_compress, so this pins the construction instead of restating it.
+        let mut sponge = PoseidonSponge::<F>::new(&cfg_tree.0);
+        sponge.state[0] = F::from(TAG_MERGE);
+        for c in &row {
+            sponge.absorb(c);
+        }
         assert_eq!(
-            merkle_compress(&cfg, l, r),
-            hash_n(&cfg, &[F::from(TAG_MERGE), l, r]),
-            "merkle_compress must be hash_n([TAG_MERGE, l, r])"
+            merkle_compress(&cfg_tree, &row),
+            sponge.squeeze_field_elements(1)[0],
+            "merkle_compress must be the capacity-tagged sponge over [TAG_MERGE, row..]"
         );
+
+        // The tag must live in the CAPACITY, never back in a rate slot. Absorbed as a leading rate
+        // element it separates the domain just as well but overflows the rate and costs a second
+        // permutation on every Merkle level. Such a regression is silent everywhere else — proofs
+        // still verify, they are simply twice the work — so this assertion is the only notice.
+        let mut rate_absorbed = PoseidonSponge::<F>::new(&cfg_tree.0);
+        rate_absorbed.absorb(&F::from(TAG_MERGE));
+        for c in &row {
+            rate_absorbed.absorb(c);
+        }
+        assert_ne!(
+            merkle_compress(&cfg_tree, &row),
+            rate_absorbed.squeeze_field_elements(1)[0],
+            "the merge tag is being absorbed as a rate element again — the wasted permutation is back"
+        );
+
         // A node image is distinct from a leaf commitment built to mimic it (arity/tag confusion
-        // attempt): H(TAG_MERGE, l, r) != H(TAG_CM, v, pk, rho, rcm).
-        let cm = note_commitment(&cfg, rng.next_u64(), l, r, F::rand(&mut rng));
-        assert_ne!(merkle_compress(&cfg, l, r), cm);
-        // Cross-check: absorbing TAG_CM as the left child of a node does not collide with a leaf.
-        assert_ne!(merkle_compress(&cfg, F::from(TAG_CM), l), cm);
+        // attempt): H_tree(TAG_MERGE, row..) != H_note(TAG_CM, v, pk, rho, rcm).
+        let cm = note_commitment(&cfg, rng.next_u64(), row[0], row[1], F::rand(&mut rng));
+        assert_ne!(merkle_compress(&cfg_tree, &row), cm);
+        // Cross-check: feeding a note-domain tag in as a child does not collide with a leaf.
+        let mut confused = row;
+        confused[0] = F::from(TAG_CM);
+        assert_ne!(merkle_compress(&cfg_tree, &confused), cm);
+
+        // The two instances are genuinely different hashes, not the same permutation at two
+        // widths: the tree instance must not reproduce a note-instance image of the same inputs.
+        assert_ne!(
+            merkle_compress(&cfg_tree, &row),
+            hash_n(&cfg, &[F::from(TAG_MERGE), row[0], row[1]]),
+            "tree and note instances collide — the width-6 config is not actually in use"
+        );
     }
 }

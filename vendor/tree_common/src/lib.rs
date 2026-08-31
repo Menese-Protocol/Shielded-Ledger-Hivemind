@@ -39,27 +39,104 @@ use ark_r1cs_std::{
     boolean::Boolean,
     eq::EqGadget,
     fields::{fp::FpVar, FieldVar},
-    select::CondSelectGadget,
 };
 use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisError};
 
 pub use ark_crypto_primitives::sponge::poseidon::PoseidonConfig as PoseidonCfg;
 
-pub const TREE_DEPTH: usize = 32;
+/// Merkle arity. A 4-ary tree reaches the 2^32 leaf capacity in 16 levels instead of 32, and a
+/// level costs one width-5 permutation instead of one width-3 permutation.
+///
+/// THE TRADE RUNS IN OPPOSITE DIRECTIONS ON THE TWO SIDES, and only one of them had been
+/// measured when the arity was first raised. In-circuit the MDS matrix-vector product is a
+/// linear combination, which R1CS charges nothing for, so a level costs only its S-boxes
+/// (`R_F*t + R_P`) and widening is close to free: 32 levels x 81 = 2,592 S-boxes at t=3
+/// against 16 x 97 = 1,552 at t=5, a 1.67x win. NATIVELY the MDS is t^2 field multiplications
+/// and dominates everything: 65*t^2 + 3*(R_F*t + R_P) is 828 mults at t=3 and 1,916 at t=5, so
+/// an append goes 32 x 828 = 26,496 to 16 x 1,916 = 30,656 — a 1.16x LOSS. The ledger runs the
+/// native side on every append, so that loss is real and is the price of the circuit win.
+///
+/// Arity 4 rather than 5 because 5 is worse on both counts that matter: it costs 37,170 native
+/// mults (1.40x) for only 1,470 in-circuit S-boxes (1.76x), i.e. it buys ~5% more circuit win
+/// for ~21% more on-chain work, and both land in the same 2^14 QAP domain, so the keyset — the
+/// headline cold-start number — is identical either way. Measured with `frontier-oracle bench`.
+pub const TREE_ARITY: usize = 4;
+/// 4^16 = 2^32 EXACTLY, so 16 levels cover the addressable leaf space with nothing wasted and
+/// the walk is `idx >> 2` / `idx & 3` rather than a divide. The ledger caps `next_index` at
+/// 2^32 because a leaf index is a 32-bit wire value; here the tree shape agrees with that cap
+/// instead of overshooting it.
+pub const TREE_LEVELS: usize = 16;
+/// Addressable leaves. Unchanged by the arity switch — this is a wire/interface constant, not a
+/// tree-shape one, and nothing about the 4-ary layout is allowed to move it.
+pub const TREE_CAPACITY: u64 = 1 << 32;
+
+/// The tree shape must cover EXACTLY the addressable capacity — a COMPILE-TIME check, not a
+/// test, because getting it wrong is not a failing assertion somewhere: it is either leaves the
+/// ledger can index but the tree cannot hold (`<`, silent truncation of the top of the index
+/// space) or levels that can never be reached (`>`, wasted work on every single append). At
+/// arity 4 the equality is exact; any future arity change that does not also fix TREE_LEVELS
+/// stops the build here rather than shipping.
+const _: () = assert!(
+    (TREE_ARITY as u64).pow(TREE_LEVELS as u32) == TREE_CAPACITY,
+    "TREE_ARITY ^ TREE_LEVELS must equal TREE_CAPACITY exactly"
+);
 pub const TAG_PK: u64 = 1;
 pub const TAG_NF: u64 = 2;
 pub const TAG_CM: u64 = 3;
-/// Leading tag absorbed by the 2-to-1 Merkle compression, so an inner-node image lives in a
-/// domain distinct from pk/nf/cm and from a bare 2-input hash.
+/// Domain tag carried in the sponge CAPACITY by the 2-to-1 Merkle compression, so an inner-node
+/// image lives in a domain distinct from pk/nf/cm and from a bare 2-input hash.
+///
+/// It used to be absorbed as a leading RATE element, which separated the domain just as well but
+/// cost an entire extra permutation on every Merkle level: the sponge has rate 2, so `[tag, l, r]`
+/// is three absorbs = two permutations where a level needs one. Merkle paths were 86.6% of the
+/// circuit, so that one wasted permutation was most of a transfer proof. Carried in the capacity
+/// the tag is free: it never occupies a rate slot, and it still enters every round of the
+/// permutation, which is what domain separation actually requires.
 pub const TAG_MERGE: u64 = 4;
 
 /// Poseidon over BN254 Fr: rate 2, capacity 1, 8 full + 57 partial rounds, alpha = 5.
 /// Same parameter shape as the verifier-lab measurement so per-hash costs are comparable.
 /// Constants derived with arkworks' Grain-LFSR routine (the Poseidon paper's method).
+///
+/// This is the NOTE instance — pk, nf and cm. The Merkle tree uses `poseidon_config_tree`.
 pub fn poseidon_config() -> PoseidonConfig<F> {
     let (ark, mds) = find_poseidon_ark_and_mds::<F>(F::MODULUS_BIT_SIZE as u64, 2, 8, 57, 0);
     PoseidonConfig::new(8, 57, 5, mds, ark, 2, 1)
 }
+
+/// The TREE instance: width 5 (rate 4, capacity 1), so one permutation absorbs a whole 4-ary row
+/// with the domain tag in the capacity.
+///
+/// `R_F = 8, R_P = 57` is NOT copied from the paper's table — it is what this repository's own
+/// `scripts/poseidon-round-margin.py` derives for t=5 at the 128-bit target: the strict minimum
+/// R_P at R_F = 8 is 50, so the shipped 57 carries a +7 partial-round margin — the SAME margin
+/// the deployed t=3 instance carries, over both BLS12-381 Fr and BN254 Fr.
+///
+/// That script checks BOTH shipped instances on every run. It used to hardcode `t = 3` at module
+/// level, so the tree width could only be checked by editing the script by hand — the very
+/// "documented provenance nobody re-derives" failure the script exists to prevent, reproduced
+/// inside the script itself. Fixed 2026-08-27; a future widening cannot silently skip its own
+/// security argument.
+///
+/// Deriving both instances from the same Grain-LFSR routine at the same security target is what
+/// keeps the two hashes independent: different widths produce different round constants and a
+/// different MDS, so a note commitment and a tree node cannot collide by construction, quite
+/// apart from the domain tag.
+pub fn poseidon_config_tree() -> TreeCfg {
+    let (ark, mds) = find_poseidon_ark_and_mds::<F>(F::MODULUS_BIT_SIZE as u64, TREE_ARITY, 8, 57, 0);
+    TreeCfg(PoseidonConfig::new(8, 57, 5, mds, ark, TREE_ARITY, 1))
+}
+
+/// The tree instance, wrapped so it CANNOT be confused with the note instance at a call site.
+///
+/// Both instances are `PoseidonConfig<F>`. Before this newtype existed, handing the note config
+/// to `DenseTree::root` compiled cleanly and silently computed a different tree — the anchor came
+/// out wrong and the only symptom was an honest witness failing to satisfy the circuit, with
+/// nothing pointing at the cause. That is exactly the class of mistake that must be impossible
+/// rather than merely tested for, because the compiling-but-wrong version of it is a consensus
+/// fork: the ledger and the prover would disagree about what the tree is.
+#[derive(Clone, Debug)]
+pub struct TreeCfg(pub PoseidonConfig<F>);
 
 // ---------- native hashing ----------
 
@@ -80,8 +157,27 @@ pub fn derive_nf(cfg: &PoseidonConfig<F>, nk: F, rho: F) -> F {
 pub fn note_commitment(cfg: &PoseidonConfig<F>, v: u64, pk: F, rho: F, rcm: F) -> F {
     hash_n(cfg, &[F::from(TAG_CM), F::from(v), pk, rho, rcm])
 }
-pub fn merkle_compress(cfg: &PoseidonConfig<F>, l: F, r: F) -> F {
-    hash_n(cfg, &[F::from(TAG_MERGE), l, r])
+/// 5-to-1 Merkle compression: the sponge is initialised with `TAG_MERGE` in the capacity lane and
+/// then absorbs exactly the five children, so the state entering the single permutation is
+/// `[TAG_MERGE, c0, c1, c2, c3, c4]` and lane 0 of the rate is squeezed out.
+///
+/// arkworks lays the state out capacity-first (`absorb_internal` writes at
+/// `state[capacity + i]`) and permutes only when the rate section fills. At rate 5 the five
+/// children fill it exactly, so a whole 5-ary row costs ONE permutation — the same count a
+/// 2-ary row costs at rate 2, over less than half as many levels. That is where the arity win
+/// comes from, and it is why this does not route through `hash_n`: `hash_n` can express neither
+/// a non-zero IV nor the wider instance.
+///
+/// MUST stay in lockstep with `merkle_compress_gadget`, `PoseidonTree.merkleCompress` and the
+/// frontier oracle. Changing one alone does not fail loudly — it silently computes a different
+/// root, and every proof stops verifying against the anchor.
+pub fn merkle_compress(cfg_tree: &TreeCfg, children: &[F; TREE_ARITY]) -> F {
+    let mut sponge = PoseidonSponge::<F>::new(&cfg_tree.0);
+    sponge.state[0] = F::from(TAG_MERGE);
+    for c in children {
+        sponge.absorb(c);
+    }
+    sponge.squeeze_field_elements(1)[0]
 }
 
 // ---------- the note ----------
@@ -108,47 +204,54 @@ impl Note {
 
 // ---------- incremental Merkle tree (append-only, O(depth) state) ----------
 
-/// Cached zero-subtree hashes: zeros[0] = 0 (empty leaf), zeros[i+1] = H(zeros[i], zeros[i]).
-pub fn zero_hashes(cfg: &PoseidonConfig<F>) -> Vec<F> {
+/// Cached zero-subtree hashes: zeros[0] = 0 (empty leaf), zeros[i+1] = H(zeros[i] x ARITY).
+pub fn zero_hashes(cfg_tree: &TreeCfg) -> Vec<F> {
     let mut z = vec![F::from(0u64)];
-    for i in 0..TREE_DEPTH {
-        z.push(merkle_compress(cfg, z[i], z[i]));
+    for i in 0..TREE_LEVELS {
+        z.push(merkle_compress(cfg_tree, &[z[i]; TREE_ARITY]));
     }
     z
 }
 
-/// Append-only incremental tree. Root recomputed per append with depth hash calls.
+/// Append-only incremental tree. Root recomputed per append with one hash call per level.
+///
+/// The frontier caches ARITY-1 left siblings per level instead of one: at level `lvl` the node
+/// under construction already has `idx % ARITY` completed children, and the rest of the row is
+/// the empty-subtree hash for that level.
 pub struct IncrementalTree {
-    pub filled: Vec<F>, // filled[i] = left sibling cached at level i
+    /// filled[lvl][j] = the j-th child already fixed at level `lvl`. Entries at or after the
+    /// current position are stale and must never be read — `append` only reads j < pos.
+    pub filled: Vec<[F; TREE_ARITY]>,
     pub zeros: Vec<F>,
     pub next_index: u64,
     pub root: F,
 }
 
 impl IncrementalTree {
-    pub fn new(cfg: &PoseidonConfig<F>) -> Self {
-        let zeros = zero_hashes(cfg);
+    pub fn new(cfg_tree: &TreeCfg) -> Self {
+        let zeros = zero_hashes(cfg_tree);
         IncrementalTree {
-            filled: zeros[..TREE_DEPTH].to_vec(),
-            root: zeros[TREE_DEPTH],
+            filled: (0..TREE_LEVELS).map(|lvl| [zeros[lvl]; TREE_ARITY]).collect(),
+            root: zeros[TREE_LEVELS],
             zeros,
             next_index: 0,
         }
     }
 
     /// Returns the new root. Panics when full (2^32 leaves — unreachable in the prototype).
-    pub fn append(&mut self, cfg: &PoseidonConfig<F>, leaf: F) -> F {
-        assert!(self.next_index < (1u64 << TREE_DEPTH), "tree full");
+    pub fn append(&mut self, cfg_tree: &TreeCfg, leaf: F) -> F {
+        assert!(self.next_index < TREE_CAPACITY, "tree full");
         let mut idx = self.next_index;
         let mut cur = leaf;
-        for lvl in 0..TREE_DEPTH {
-            if idx % 2 == 0 {
-                self.filled[lvl] = cur;
-                cur = merkle_compress(cfg, cur, self.zeros[lvl]);
-            } else {
-                cur = merkle_compress(cfg, self.filled[lvl], cur);
-            }
-            idx /= 2;
+        for lvl in 0..TREE_LEVELS {
+            let pos = (idx % TREE_ARITY as u64) as usize;
+            self.filled[lvl][pos] = cur;
+            // Children before `pos` are already fixed; `pos` is the node we just carried up;
+            // everything after it is still empty at this level.
+            let mut row = [self.zeros[lvl]; TREE_ARITY];
+            row[..=pos].copy_from_slice(&self.filled[lvl][..=pos]);
+            cur = merkle_compress(cfg_tree, &row);
+            idx /= TREE_ARITY as u64;
         }
         self.next_index += 1;
         self.root = cur;
@@ -163,61 +266,76 @@ pub struct DenseTree {
 }
 
 impl DenseTree {
-    pub fn root(&self, cfg: &PoseidonConfig<F>) -> F {
-        let zeros = zero_hashes(cfg);
+    pub fn root(&self, cfg_tree: &TreeCfg) -> F {
+        let zeros = zero_hashes(cfg_tree);
         let mut level: Vec<F> = self.leaves.clone();
-        for lvl in 0..TREE_DEPTH {
-            let mut next = Vec::with_capacity((level.len() + 1) / 2);
-            for i in 0..level.len().div_ceil(2) {
-                let l = level[2 * i];
-                let r = if 2 * i + 1 < level.len() {
-                    level[2 * i + 1]
-                } else {
-                    zeros[lvl]
-                };
-                next.push(merkle_compress(cfg, l, r));
+        for lvl in 0..TREE_LEVELS {
+            let mut next = Vec::with_capacity(level.len().div_ceil(TREE_ARITY));
+            for i in 0..level.len().div_ceil(TREE_ARITY) {
+                let mut row = [zeros[lvl]; TREE_ARITY];
+                for (j, slot) in row.iter_mut().enumerate() {
+                    if let Some(v) = level.get(TREE_ARITY * i + j) {
+                        *slot = *v;
+                    }
+                }
+                next.push(merkle_compress(cfg_tree, &row));
             }
             if next.is_empty() {
-                next.push(merkle_compress(cfg, zeros[lvl], zeros[lvl]));
+                next.push(merkle_compress(cfg_tree, &[zeros[lvl]; TREE_ARITY]));
             }
             level = next;
         }
         level[0]
     }
 
-    /// (siblings, position bits little-endian from leaf) for leaf `index`.
-    pub fn path(&self, cfg: &PoseidonConfig<F>, index: usize) -> (Vec<F>, Vec<bool>) {
-        let zeros = zero_hashes(cfg);
-        let mut siblings = Vec::with_capacity(TREE_DEPTH);
-        let mut bits = Vec::with_capacity(TREE_DEPTH);
+    /// The authentication path for leaf `index`, as one FULL ROW PER LEVEL plus the
+    /// position the walked node occupies in that row.
+    ///
+    /// Returning the whole row (including the walked node itself) rather than ARITY-1 siblings is
+    /// deliberate: in-circuit the row is what gets hashed, and the membership statement is then
+    /// "the node I carried up equals row[pos]", enforced by a one-hot inner product. The
+    /// alternative — ARITY-1 siblings plus an index — would force the circuit to rotate the
+    /// siblings into position, which costs constraints and is easy to get subtly wrong. This is
+    /// the shape `incrementalquintree` uses for the same reason.
+    pub fn path(
+        &self,
+        cfg_tree: &TreeCfg,
+        index: usize,
+    ) -> (Vec<[F; TREE_ARITY]>, Vec<usize>) {
+        let zeros = zero_hashes(cfg_tree);
+        let mut rows = Vec::with_capacity(TREE_LEVELS);
+        let mut positions = Vec::with_capacity(TREE_LEVELS);
         let mut level: Vec<F> = self.leaves.clone();
         let mut idx = index;
-        for lvl in 0..TREE_DEPTH {
-            let sib_idx = idx ^ 1;
-            let sib = if sib_idx < level.len() {
-                level[sib_idx]
-            } else {
-                zeros[lvl]
-            };
-            siblings.push(sib);
-            bits.push(idx % 2 == 1); // true => current node is the RIGHT child
-            let mut next = Vec::with_capacity((level.len() + 1) / 2);
-            for i in 0..level.len().div_ceil(2) {
-                let l = level[2 * i];
-                let r = if 2 * i + 1 < level.len() {
-                    level[2 * i + 1]
-                } else {
-                    zeros[lvl]
-                };
-                next.push(merkle_compress(cfg, l, r));
+        for lvl in 0..TREE_LEVELS {
+            let pos = idx % TREE_ARITY;
+            let base = idx - pos;
+            let mut row = [zeros[lvl]; TREE_ARITY];
+            for (j, slot) in row.iter_mut().enumerate() {
+                if let Some(v) = level.get(base + j) {
+                    *slot = *v;
+                }
+            }
+            rows.push(row);
+            positions.push(pos);
+
+            let mut next = Vec::with_capacity(level.len().div_ceil(TREE_ARITY));
+            for i in 0..level.len().div_ceil(TREE_ARITY) {
+                let mut r = [zeros[lvl]; TREE_ARITY];
+                for (j, slot) in r.iter_mut().enumerate() {
+                    if let Some(v) = level.get(TREE_ARITY * i + j) {
+                        *slot = *v;
+                    }
+                }
+                next.push(merkle_compress(cfg_tree, &r));
             }
             if next.is_empty() {
-                next.push(merkle_compress(cfg, zeros[lvl], zeros[lvl]));
+                next.push(merkle_compress(cfg_tree, &[zeros[lvl]; TREE_ARITY]));
             }
             level = next;
-            idx /= 2;
+            idx /= TREE_ARITY;
         }
-        (siblings, bits)
+        (rows, positions)
     }
 }
 
@@ -258,20 +376,67 @@ fn enforce_u64_range(
     acc.enforce_equal(v)
 }
 
-/// Fold a Merkle path: cur starts at the leaf; bit=true means cur is the right child.
+/// In-circuit twin of `merkle_compress`: capacity carries `TAG_MERGE`, the rate absorbs exactly
+/// the five children, one permutation. The capacity assignment is a CONSTANT, so it allocates no
+/// witness and adds no constraint — the entire cost of domain separation is zero.
+fn merkle_compress_gadget(
+    cs: ConstraintSystemRef<F>,
+    cfg_tree: &TreeCfg,
+    row: &[FpVar<F>; TREE_ARITY],
+) -> Result<FpVar<F>, SynthesisError> {
+    let mut sponge = PoseidonSpongeVar::<F>::new(cs, &cfg_tree.0);
+    sponge.state[0] = FpVar::constant(F::from(TAG_MERGE));
+    for c in row {
+        sponge.absorb(c)?;
+    }
+    Ok(sponge.squeeze_field_elements(1)?[0].clone())
+}
+
+/// Fold a 5-ary Merkle path.
+///
+/// Per level the prover witnesses the full row of ARITY children and a one-hot selector saying
+/// which slot the node carried up from below occupies. Two things are enforced, and BOTH are
+/// load-bearing:
+///
+///   1. the selector is one-hot — each entry boolean AND the entries summing to exactly one;
+///   2. the inner product `sum_j sel_j * row_j` equals the node carried up.
+///
+/// Drop (1) and the statement collapses: a prover could choose selector entries summing to one
+/// out of non-boolean field values and open the inner product to a value that appears NOWHERE in
+/// the row, proving membership of a note that is not in the tree. Booleanity alone is not enough
+/// either — an all-zero selector would make the inner product zero and (2) would then merely
+/// assert the carried node is zero, which is exactly what an empty leaf hashes from. The pair is
+/// the statement; neither half is decoration. `row05_merkle_path_enforcement` and the
+/// under-constrained detector are what hold this honest.
 fn merkle_root_gadget(
     cs: ConstraintSystemRef<F>,
-    cfg: &PoseidonConfig<F>,
+    cfg_tree: &TreeCfg,
     leaf: &FpVar<F>,
-    siblings: &[FpVar<F>],
-    bits: &[Boolean<F>],
+    rows: &[Vec<FpVar<F>>],
+    selectors: &[Vec<Boolean<F>>],
 ) -> Result<FpVar<F>, SynthesisError> {
     let mut cur = leaf.clone();
-    for (sib, bit) in siblings.iter().zip(bits) {
-        let l = FpVar::conditionally_select(bit, sib, &cur)?;
-        let r = FpVar::conditionally_select(bit, &cur, sib)?;
-        let tag_merge = FpVar::constant(F::from(TAG_MERGE));
-        cur = hash_n_gadget(cs.clone(), cfg, &[tag_merge, l, r])?;
+    for (row, sel) in rows.iter().zip(selectors) {
+        debug_assert_eq!(row.len(), TREE_ARITY);
+        debug_assert_eq!(sel.len(), TREE_ARITY);
+
+        // (1) one-hot: every entry is already a Boolean witness (booleanity enforced at
+        // allocation); require exactly one of them set.
+        let mut sum = FpVar::<F>::zero();
+        for s in sel {
+            sum += FpVar::from(s.clone());
+        }
+        sum.enforce_equal(&FpVar::one())?;
+
+        // (2) the node carried up from below must be the selected entry of this row.
+        let mut selected = FpVar::<F>::zero();
+        for (s, c) in sel.iter().zip(row) {
+            selected += FpVar::from(s.clone()) * c;
+        }
+        selected.enforce_equal(&cur)?;
+
+        let fixed: [FpVar<F>; TREE_ARITY] = core::array::from_fn(|j| row[j].clone());
+        cur = merkle_compress_gadget(cs.clone(), cfg_tree, &fixed)?;
     }
     Ok(cur)
 }
@@ -330,8 +495,12 @@ pub struct TransferCircuit {
     pub in_nk: [Option<F>; 2],
     pub in_rho: [Option<F>; 2],
     pub in_rcm: [Option<F>; 2],
-    pub in_siblings: [Vec<F>; 2],
-    pub in_bits: [Vec<bool>; 2],
+    /// One full ARITY-wide row per level (the walked node included), as returned by
+    /// `DenseTree::path`. Replaces the pre-5-ary `in_siblings`.
+    pub in_rows: [Vec<[F; TREE_ARITY]>; 2],
+    /// The walked node's slot in each row, 0..ARITY. Witnessed in-circuit as a one-hot selector.
+    /// Replaces the pre-5-ary `in_bits`.
+    pub in_pos: [Vec<usize>; 2],
     // witness: outputs (raw field values so witness-level attacks are expressible in tests;
     // honest provers always use F::from(u64))
     pub out_v: [Option<F>; 2],
@@ -356,11 +525,11 @@ impl TransferCircuit {
             in_nk: [None; 2],
             in_rho: [None; 2],
             in_rcm: [None; 2],
-            in_siblings: [
-                vec![F::from(0u64); TREE_DEPTH],
-                vec![F::from(0u64); TREE_DEPTH],
+            in_rows: [
+                vec![[F::from(0u64); TREE_ARITY]; TREE_LEVELS],
+                vec![[F::from(0u64); TREE_ARITY]; TREE_LEVELS],
             ],
-            in_bits: [vec![false; TREE_DEPTH], vec![false; TREE_DEPTH]],
+            in_pos: [vec![0usize; TREE_LEVELS], vec![0usize; TREE_LEVELS]],
             out_v: [None::<F>; 2],
             out_pk: [None; 2],
             out_rcm: [None; 2],
@@ -397,6 +566,10 @@ fn opt<T: Copy>(o: Option<T>) -> Result<T, SynthesisError> {
 impl ConstraintSynthesizer<F> for TransferCircuit {
     fn generate_constraints(self, cs: ConstraintSystemRef<F>) -> Result<(), SynthesisError> {
         let cfg = &self.cfg;
+        // The tree runs on the WIDER instance (rate 5) so a 5-ary row is one permutation. Derived
+        // once per synthesis rather than carried in the struct, so no caller has to thread a
+        // second config through and no caller can pass a mismatched pair.
+        let cfg_tree = poseidon_config_tree();
 
         // public inputs (allocation order = public_inputs() order)
         let anchor = FpVar::new_input(cs.clone(), || opt(self.anchor))?;
@@ -448,13 +621,25 @@ impl ConstraintSynthesizer<F> for TransferCircuit {
             let rho = FpVar::new_witness(cs.clone(), || opt(self.in_rho[i]))?;
             let rcm = FpVar::new_witness(cs.clone(), || opt(self.in_rcm[i]))?;
 
-            let siblings: Vec<FpVar<F>> = self.in_siblings[i]
+            let rows: Vec<Vec<FpVar<F>>> = self.in_rows[i]
                 .iter()
-                .map(|s| FpVar::new_witness(cs.clone(), || Ok(*s)))
+                .map(|row| {
+                    row.iter()
+                        .map(|s| FpVar::new_witness(cs.clone(), || Ok(*s)))
+                        .collect::<Result<Vec<_>, _>>()
+                })
                 .collect::<Result<_, _>>()?;
-            let bits: Vec<Boolean<F>> = self.in_bits[i]
+            // The selector is witnessed one-hot from the position. `Boolean::new_witness` enforces
+            // booleanity per entry; `merkle_root_gadget` enforces that exactly one is set. A
+            // malicious prover choosing a different assignment is constrained by both, not by the
+            // honest derivation here.
+            let selectors: Vec<Vec<Boolean<F>>> = self.in_pos[i]
                 .iter()
-                .map(|b| Boolean::new_witness(cs.clone(), || Ok(*b)))
+                .map(|pos| {
+                    (0..TREE_ARITY)
+                        .map(|j| Boolean::new_witness(cs.clone(), || Ok(j == *pos)))
+                        .collect::<Result<Vec<_>, _>>()
+                })
                 .collect::<Result<_, _>>()?;
 
             let tag_pk = FpVar::constant(F::from(TAG_PK));
@@ -463,7 +648,7 @@ impl ConstraintSynthesizer<F> for TransferCircuit {
 
             let pk = hash_n_gadget(cs.clone(), cfg, &[tag_pk, nk.clone()])?;
             let cm = hash_n_gadget(cs.clone(), cfg, &[tag_cm, v.clone(), pk, rho.clone(), rcm])?;
-            let root = merkle_root_gadget(cs.clone(), cfg, &cm, &siblings, &bits)?;
+            let root = merkle_root_gadget(cs.clone(), &cfg_tree, &cm, &rows, &selectors)?;
             root.enforce_equal(&anchor)?;
 
             let nf = hash_n_gadget(cs.clone(), cfg, &[tag_nf, nk, rho])?;
@@ -516,7 +701,24 @@ impl ConstraintSynthesizer<F> for TransferCircuit {
 // ---------- the deposit circuit ----------
 
 /// Statement: public (cm, v_pub); witness (pk, rho, rcm); cm == H(3, v_pub, pk, rho, rcm).
-/// v_pub arrives as a u64 through candid, so its range is enforced by the interface type.
+///
+/// INTERFACE OBLIGATION (audit F3) — read this before integrating a new caller. There is NO
+/// in-circuit range constraint on `v_pub`: the proof alone does not stop a deposit from
+/// committing a note whose value wraps the field. Deposit soundness rests on two obligations
+/// the VERIFIER'S CALLER must uphold:
+///
+///   1. `v_pub` must be built from a 64-bit integer. The ledger does this by typing the
+///      candid argument `Nat64` and embedding it with `nat64Field` (src/Main.mo `shield`),
+///      so a public input >= 2^64 is unrepresentable at the interface.
+///   2. The transparent leg must bound the real amount: the ledger moves exactly `v_pub`
+///      ICRC-2 tokens into custody before the note finalizes, so an inflated claim has to be
+///      paid for, not merely proven.
+///
+/// Any integration that feeds this statement a `v_pub` from a wider type, or verifies a
+/// deposit without the paid transparent leg, reopens the F1(b)-class over-issuance for
+/// deposits. The ledger-side seam is marked CONSENSUS-CRITICAL and pinned by
+/// scripts/consensus-seam-guard.sh. (If a hardened deposit statement is ever cut, add the
+/// in-circuit u64 range gadget on `v_pub` for symmetry with the hardened transfer statement.)
 #[derive(Clone)]
 pub struct DepositCircuit {
     pub cfg: PoseidonConfig<F>,

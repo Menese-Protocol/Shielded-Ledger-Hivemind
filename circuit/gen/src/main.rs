@@ -142,6 +142,8 @@ fn main() {
     std::fs::create_dir_all(&dir).unwrap();
     let mut out = Out { dir, oracle: String::new() };
     let cfg = poseidon_config();
+    // The tree runs on the wider (rate-5) instance; note hashes stay on the rate-2 one.
+    let cfg_tree = poseidon_config_tree();
     // This RNG exists only to make public oracle witnesses/proofs reproducible. In secure mode it
     // is never passed to Groth16 setup. Browser proofs use WebCrypto-backed randomness instead.
     let mut rng = ark_std::rand::rngs::StdRng::seed_from_u64(INSECURE_TEST_SEED);
@@ -171,15 +173,15 @@ fn main() {
     let n2 = Note { v: 30, nk: alice_nk, rho: F::rand(&mut rng), rcm: F::rand(&mut rng) };
 
     // two independent tree implementations must agree (self-check of the tree code)
-    let mut inc = IncrementalTree::new(&cfg);
-    inc.append(&cfg, n1.cm(&cfg));
-    let anchor = inc.append(&cfg, n2.cm(&cfg));
+    let mut inc = IncrementalTree::new(&cfg_tree);
+    inc.append(&cfg_tree, n1.cm(&cfg));
+    let anchor = inc.append(&cfg_tree, n2.cm(&cfg));
     let dense = DenseTree { leaves: vec![n1.cm(&cfg), n2.cm(&cfg)] };
-    assert_eq!(anchor, dense.root(&cfg), "IncrementalTree and DenseTree disagree on the root");
+    assert_eq!(anchor, dense.root(&cfg_tree), "IncrementalTree and DenseTree disagree on the root");
     out.oracle_line("TREE-XCHECK incremental==dense OK");
 
-    let (sib1, bits1) = dense.path(&cfg, 0);
-    let (sib2, bits2) = dense.path(&cfg, 1);
+    let (rows1, pos1) = dense.path(&cfg_tree, 0);
+    let (rows2, pos2) = dense.path(&cfg_tree, 1);
 
     let nf1 = n1.nf(&cfg);
     let nf2 = n2.nf(&cfg);
@@ -205,8 +207,8 @@ fn main() {
         in_nk: [Some(n1.nk), Some(n2.nk)],
         in_rho: [Some(n1.rho), Some(n2.rho)],
         in_rcm: [Some(n1.rcm), Some(n2.rcm)],
-        in_siblings: [sib1.clone(), sib2.clone()],
-        in_bits: [bits1.clone(), bits2.clone()],
+        in_rows: [rows1.clone(), rows2.clone()],
+        in_pos: [pos1.clone(), pos2.clone()],
         out_v: [Some(F::from(out1.v)), Some(F::from(out2.v))],
         out_pk: [Some(bob_pk), Some(alice_pk)],
         out_rcm: [Some(out1.rcm), Some(out2.rcm)],
@@ -231,13 +233,25 @@ fn main() {
     } else {
         TransferCircuit::blank(&cfg)
     };
-    let (tpk, tvk) = match setup_mode {
-        SetupMode::InsecureDeterministicTest =>
-            Groth16::<Curve>::circuit_specific_setup(transfer_blank(), &mut rng).unwrap(),
-        SetupMode::OsCsprngSingleParty => {
-            let mut setup_rng = OsRng;
-            Groth16::<Curve>::circuit_specific_setup(transfer_blank(), &mut setup_rng).unwrap()
-        },
+    // F7 setup guard: the EXACT instance handed to the setup is checked first, and the run
+    // hard-fails before any key material exists if it is not one of the two reviewed blank
+    // statements (enforce_range=true, canonical Poseidon config, no assignments). The guard
+    // reads the instance and consumes no randomness, so emitted keys are byte-identical to
+    // pre-guard runs.
+    let (tpk, tvk) = {
+        let setup_circuit = transfer_blank();
+        gen::assert_transfer_setup_eligible(&setup_circuit).unwrap_or_else(|e| {
+            eprintln!("SETUP GUARD REFUSAL: {e}");
+            std::process::exit(1)
+        });
+        match setup_mode {
+            SetupMode::InsecureDeterministicTest =>
+                Groth16::<Curve>::circuit_specific_setup(setup_circuit, &mut rng).unwrap(),
+            SetupMode::OsCsprngSingleParty => {
+                let mut setup_rng = OsRng;
+                Groth16::<Curve>::circuit_specific_setup(setup_circuit, &mut setup_rng).unwrap()
+            },
+        }
     };
     let circuit = mk_circuit();
     let publics = circuit.public_inputs();
@@ -272,9 +286,9 @@ fn main() {
     // proves membership in it honestly; only the canister's root-set check can reject it)
     let fake_note = Note { v: 1_000_000, nk: alice_nk, rho: F::rand(&mut rng), rcm: F::rand(&mut rng) };
     let fake_dense = DenseTree { leaves: vec![fake_note.cm(&cfg), n2.cm(&cfg)] };
-    let fake_anchor = fake_dense.root(&cfg);
-    let (fsib1, fbits1) = fake_dense.path(&cfg, 0);
-    let (fsib2, fbits2) = fake_dense.path(&cfg, 1);
+    let fake_anchor = fake_dense.root(&cfg_tree);
+    let (frows1, fpos1) = fake_dense.path(&cfg_tree, 0);
+    let (frows2, fpos2) = fake_dense.path(&cfg_tree, 1);
     let fnf1 = fake_note.nf(&cfg);
     let fout1 = Note { v: 999_995, nk: alice_nk, rho: fnf1, rcm: F::rand(&mut rng) };
     let fout2 = Note { v: n2.v, nk: alice_nk, rho: nf2, rcm: F::rand(&mut rng) };
@@ -292,8 +306,8 @@ fn main() {
         in_nk: [Some(fake_note.nk), Some(n2.nk)],
         in_rho: [Some(fake_note.rho), Some(n2.rho)],
         in_rcm: [Some(fake_note.rcm), Some(n2.rcm)],
-        in_siblings: [fsib1, fsib2],
-        in_bits: [fbits1, fbits2],
+        in_rows: [frows1, frows2],
+        in_pos: [fpos1, fpos2],
         out_v: [Some(F::from(fout1.v)), Some(F::from(fout2.v))],
         out_pk: [Some(alice_pk), Some(alice_pk)],
         out_rcm: [Some(fout1.rcm), Some(fout2.rcm)],
@@ -357,9 +371,9 @@ fn main() {
         let tree2 = DenseTree {
             leaves: vec![n1.cm(&cfg), n2.cm(&cfg), out1.cm(&cfg), out2.cm(&cfg)],
         };
-        let anchor2 = tree2.root(&cfg);
-        let (wsib1, wbits1) = tree2.path(&cfg, 2);
-        let (wsib2, wbits2) = tree2.path(&cfg, 3);
+        let anchor2 = tree2.root(&cfg_tree);
+        let (wrows1, wpos1) = tree2.path(&cfg_tree, 2);
+        let (wrows2, wpos2) = tree2.path(&cfg_tree, 3);
         let wnf1 = out1.nf(&cfg);
         let wnf2 = out2.nf(&cfg);
         let wout1 = Note { v: 0, nk: bob_nk, rho: wnf1, rcm: F::rand(&mut rng) };
@@ -395,8 +409,8 @@ fn main() {
             in_nk: [Some(out1.nk), Some(out2.nk)],
             in_rho: [Some(out1.rho), Some(out2.rho)],
             in_rcm: [Some(out1.rcm), Some(out2.rcm)],
-            in_siblings: [wsib1, wsib2],
-            in_bits: [wbits1, wbits2],
+            in_rows: [wrows1, wrows2],
+            in_pos: [wpos1, wpos2],
             out_v: [Some(F::from(0u64)), Some(F::from(0u64))],
             out_pk: [Some(bob_pk), Some(alice_pk)],
             out_rcm: [Some(wout1.rcm), Some(wout2.rcm)],
@@ -418,13 +432,21 @@ fn main() {
     }
 
     // ---------------- deposit circuit ----------------
-    let (dpk, dvk) = match setup_mode {
-        SetupMode::InsecureDeterministicTest =>
-            Groth16::<Curve>::circuit_specific_setup(DepositCircuit::blank(&cfg), &mut rng).unwrap(),
-        SetupMode::OsCsprngSingleParty => {
-            let mut setup_rng = OsRng;
-            Groth16::<Curve>::circuit_specific_setup(DepositCircuit::blank(&cfg), &mut setup_rng).unwrap()
-        },
+    // F7 setup guard, deposit leg: same refusal-before-any-key-material as the transfer setup.
+    let (dpk, dvk) = {
+        let setup_circuit = DepositCircuit::blank(&cfg);
+        gen::assert_deposit_setup_eligible(&setup_circuit).unwrap_or_else(|e| {
+            eprintln!("SETUP GUARD REFUSAL: {e}");
+            std::process::exit(1)
+        });
+        match setup_mode {
+            SetupMode::InsecureDeterministicTest =>
+                Groth16::<Curve>::circuit_specific_setup(setup_circuit, &mut rng).unwrap(),
+            SetupMode::OsCsprngSingleParty => {
+                let mut setup_rng = OsRng;
+                Groth16::<Curve>::circuit_specific_setup(setup_circuit, &mut setup_rng).unwrap()
+            },
+        }
     };
     let mut dep_vec = Vec::new();
     let mut dep_uncompressed = Vec::new();

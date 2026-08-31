@@ -23,7 +23,7 @@ use ark_crypto_primitives::sponge::{
     constraints::CryptographicSpongeVar,
     poseidon::{constraints::PoseidonSpongeVar, PoseidonConfig},
 };
-use ark_ff::{BigInteger, One, PrimeField, UniformRand};
+use ark_ff::{BigInteger, One, PrimeField, UniformRand, Zero};
 use ark_r1cs_std::{
     alloc::AllocVar,
     boolean::Boolean,
@@ -36,8 +36,9 @@ use ark_relations::r1cs::{
 };
 use ark_std::rand::{rngs::StdRng, RngCore, SeedableRng};
 use common::{
+    poseidon_config_tree, TREE_ARITY,
     derive_nf, derive_pk, note_commitment, poseidon_config, DenseTree, DepositCircuit, Note,
-    PoseidonCfg, ScalarField as F, TransferCircuit, TAG_CM, TAG_NF, TAG_PK,
+    PoseidonCfg, ScalarField as F, TransferCircuit, TAG_CM, TAG_MERGE, TAG_NF, TAG_PK,
 };
 
 // ---------------------------------------------------------------------------
@@ -79,16 +80,47 @@ fn enforce_u64_range(
 
 fn merkle_root_gadget(
     cs: ConstraintSystemRef<F>,
-    cfg: &PoseidonConfig<F>,
+    cfg_tree: &PoseidonConfig<F>,
     leaf: &FpVar<F>,
-    siblings: &[FpVar<F>],
-    bits: &[Boolean<F>],
+    rows: &[Vec<FpVar<F>>],
+    selectors: &[Vec<FpVar<F>>],
+    enforce_onehot: bool,
+    enforce_selection: bool,
 ) -> Result<FpVar<F>, SynthesisError> {
     let mut cur = leaf.clone();
-    for (sib, bit) in siblings.iter().zip(bits) {
-        let l = FpVar::conditionally_select(bit, sib, &cur)?;
-        let r = FpVar::conditionally_select(bit, &cur, sib)?;
-        cur = hash_n_gadget(cs.clone(), cfg, &[l, r])?;
+    for (row, sel) in rows.iter().zip(selectors) {
+        // Mirrors the shipped compression (lib.rs merkle_compress_gadget + merkle_root_gadget):
+        // one-hot selector, inner-product membership, TAG_MERGE in the sponge CAPACITY, and the
+        // rate absorbing the whole ARITY-wide row for one permutation. Reimplemented here rather
+        // than called, because a mirror that calls the code it mirrors proves nothing.
+        //
+        // This is the third time the mirror has had to track the compression — first when the tree
+        // gained the domain tag, then when the tag moved into the capacity, now the arity change.
+        // Each time, a stale mirror does not fail loudly: it fails USELESSLY, passing rows for the
+        // wrong reason because every membership constraint breaks regardless of knockout.
+        // `mirror_is_faithful_to_shipped_circuit` is the only thing that catches that.
+        if enforce_onehot {
+            let mut sum = FpVar::<F>::zero();
+            for s in sel {
+                sum += s.clone();
+            }
+            sum.enforce_equal(&FpVar::one())?;
+        }
+
+        if enforce_selection {
+            let mut selected = FpVar::<F>::zero();
+            for (s, c) in sel.iter().zip(row) {
+                selected += s.clone() * c;
+            }
+            selected.enforce_equal(&cur)?;
+        }
+
+        let mut sponge = PoseidonSpongeVar::<F>::new(cs.clone(), cfg_tree);
+        sponge.state[0] = FpVar::constant(F::from(TAG_MERGE));
+        for c in row {
+            sponge.absorb(c)?;
+        }
+        cur = sponge.squeeze_field_elements(1)?[0].clone();
     }
     Ok(cur)
 }
@@ -115,6 +147,21 @@ struct KnockOut {
     range_fee: bool,             // row 11 — lib.rs:417
     range_v_pub_out: bool,       // row 8 — lib.rs:418
     harden_distinctness: bool,   // input distinctness nf[0] != nf[1] — lib.rs:465
+    // 5-ARY MEMBERSHIP. The binary tree enforced membership with ONE constraint (root == anchor):
+    // a wrong path simply folded to a different root. The 5-ary walk splits the property in three,
+    // and each part is separately load-bearing, so each gets its own knockout rather than hiding
+    // inside `drop_merkle`:
+    //   * per-entry BOOLEANITY of the selector (allocation-time; bypassed via `sel_override`)
+    //   * the selector sums to exactly one          — `drop_path_onehot`
+    //   * the selected entry equals the node walked — `drop_path_selection`
+    // `drop_merkle` is the PROPERTY-level knockout and drops all of it plus root == anchor.
+    drop_path_onehot: bool,
+    drop_path_selection: bool,
+    /// Per-entry booleanity of the selector. In the shipped circuit this is enforced by
+    /// `Boolean::new_witness` at allocation and is therefore invisible as a separate constraint;
+    /// the mirror re-imposes it explicitly on the raw-override path so it can be knocked out and
+    /// proven load-bearing like any other.
+    drop_path_boolean: bool,
 }
 
 impl KnockOut {
@@ -133,6 +180,9 @@ impl KnockOut {
             range_fee: true,
             range_v_pub_out: true,
             harden_distinctness: true,
+            drop_path_onehot: false,
+            drop_path_selection: false,
+            drop_path_boolean: false,
         }
     }
 
@@ -156,6 +206,11 @@ struct MirrorTransfer {
     ko: KnockOut,
     // value assigned to the free pk witness when `drop_pk_binding` (else ignored)
     in_pk_override: [Option<F>; 2],
+    // RAW selector values per input/level. The shipped struct types the path position as a
+    // `usize`, so it can only ever express an honest one-hot selector — a malicious prover works
+    // at the R1CS level and is under no such restriction. When set, the mirror allocates these as
+    // plain field witnesses (NO booleanity), which is exactly the freedom a real attacker has.
+    sel_override: [Option<Vec<Vec<F>>>; 2],
     // value assigned to the free rho_out witness when `drop_rho_chain` (else ignored)
     out_rho_override: [Option<F>; 2],
     // value assigned to the recipient-binding WITNESS mirror (the shipped struct hardwires it to
@@ -177,6 +232,7 @@ impl MirrorTransfer {
             inner,
             ko,
             in_pk_override: [None; 2],
+            sel_override: [None, None],
             out_rho_override: [None; 2],
             recipient_witness_override: None,
             fee_field_override: None,
@@ -249,14 +305,48 @@ impl ConstraintSynthesizer<F> for MirrorTransfer {
             let rho = FpVar::new_witness(cs.clone(), || opt(self.inner.in_rho[i]))?;
             let rcm = FpVar::new_witness(cs.clone(), || opt(self.inner.in_rcm[i]))?;
 
-            let siblings: Vec<FpVar<F>> = self.inner.in_siblings[i]
+            let rows: Vec<Vec<FpVar<F>>> = self.inner.in_rows[i]
                 .iter()
-                .map(|s| FpVar::new_witness(cs.clone(), || Ok(*s)))
+                .map(|row| {
+                    row.iter()
+                        .map(|s| FpVar::new_witness(cs.clone(), || Ok(*s)))
+                        .collect::<Result<Vec<_>, _>>()
+                })
                 .collect::<Result<_, _>>()?;
-            let bits: Vec<Boolean<F>> = self.inner.in_bits[i]
-                .iter()
-                .map(|b| Boolean::new_witness(cs.clone(), || Ok(*b)))
-                .collect::<Result<_, _>>()?;
+            // Honest path: one-hot Booleans, booleanity enforced at allocation, exactly as
+            // shipped. Attack path: raw field witnesses, no booleanity — the freedom a prover
+            // working directly against the R1CS actually has.
+            let selectors: Vec<Vec<FpVar<F>>> = match &self.sel_override[i] {
+                None => self.inner.in_pos[i]
+                    .iter()
+                    .map(|pos| {
+                        (0..TREE_ARITY)
+                            .map(|j| {
+                                Boolean::new_witness(cs.clone(), || Ok(j == *pos))
+                                    .map(FpVar::from)
+                            })
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                    .collect::<Result<_, _>>()?,
+                Some(raw) => raw
+                    .iter()
+                    .map(|lvl| {
+                        lvl.iter()
+                            .map(|v| {
+                                let var = FpVar::new_witness(cs.clone(), || Ok(*v))?;
+                                // v * (v - 1) == 0 — precisely what `Boolean::new_witness`
+                                // imposes in the shipped circuit, restated here so the raw path
+                                // is faithful to shipped UNLESS deliberately knocked out.
+                                if !ko.drop_path_boolean {
+                                    (&var * (&var - FpVar::one()))
+                                        .enforce_equal(&FpVar::zero())?;
+                                }
+                                Ok(var)
+                            })
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                    .collect::<Result<_, _>>()?,
+            };
 
             let tag_pk = FpVar::constant(F::from(TAG_PK));
             let tag_nf = FpVar::constant(F::from(TAG_NF));
@@ -270,7 +360,15 @@ impl ConstraintSynthesizer<F> for MirrorTransfer {
                 hash_n_gadget(cs.clone(), cfg, &[tag_pk, nk.clone()])?
             };
             let cm = hash_n_gadget(cs.clone(), cfg, &[tag_cm, v.clone(), pk, rho.clone(), rcm])?;
-            let root = merkle_root_gadget(cs.clone(), cfg, &cm, &siblings, &bits)?;
+            let root = merkle_root_gadget(
+                cs.clone(),
+                &poseidon_config_tree().0,
+                &cm,
+                &rows,
+                &selectors,
+                !ko.drop_merkle && !ko.drop_path_onehot,
+                !ko.drop_merkle && !ko.drop_path_selection,
+            )?;
             if !ko.drop_merkle {
                 root.enforce_equal(&anchor)?;
             }
@@ -437,9 +535,10 @@ fn build_honest(
         filler().cm(cfg),
     ];
     let tree = DenseTree { leaves };
-    let anchor = tree.root(cfg);
-    let (siblings_1, bits_1) = tree.path(cfg, 1);
-    let (siblings_2, bits_2) = tree.path(cfg, 4);
+    let cfg_tree = poseidon_config_tree();
+    let anchor = tree.root(&cfg_tree);
+    let (rows_1, pos_1) = tree.path(&cfg_tree, 1);
+    let (rows_2, pos_2) = tree.path(&cfg_tree, 4);
     let nullifiers = [inputs[0].nf(cfg), inputs[1].nf(cfg)];
     let out_pk = [derive_pk(cfg, recipient_nk), derive_pk(cfg, owner_nk)];
     let out_rcm = [F::rand(rng), F::rand(rng)];
@@ -463,8 +562,8 @@ fn build_honest(
         in_nk: [Some(inputs[0].nk), Some(inputs[1].nk)],
         in_rho: [Some(inputs[0].rho), Some(inputs[1].rho)],
         in_rcm: [Some(inputs[0].rcm), Some(inputs[1].rcm)],
-        in_siblings: [siblings_1, siblings_2],
-        in_bits: [bits_1, bits_2],
+        in_rows: [rows_1, rows_2],
+        in_pos: [pos_1, pos_2],
         out_v: [Some(F::from(output_values[0])), Some(F::from(output_values[1]))],
         out_pk: [Some(out_pk[0]), Some(out_pk[1])],
         out_rcm: [Some(out_rcm[0]), Some(out_rcm[1])],
@@ -526,7 +625,7 @@ fn mirror_is_faithful_to_shipped_circuit() {
             }
             3 => {
                 // break a Merkle path bit
-                built.circuit.in_bits[0][3] = !built.circuit.in_bits[0][3];
+                built.circuit.in_pos[0][3] = (built.circuit.in_pos[0][3] + 1) % TREE_ARITY;
             }
             _ => {}
         }
@@ -665,9 +764,10 @@ fn row02_range_constraints_field_wrap_mint() {
     let mut filler = || Note { v: 1, nk: F::rand(&mut rng), rho: F::rand(&mut rng), rcm: F::rand(&mut rng) };
     let leaves = vec![filler().cm(&cfg), leaf0, filler().cm(&cfg), filler().cm(&cfg), n1.cm(&cfg), filler().cm(&cfg)];
     let tree = DenseTree { leaves };
-    let anchor = tree.root(&cfg);
-    let (s1, b1) = tree.path(&cfg, 1);
-    let (s2, b2) = tree.path(&cfg, 4);
+    let cfg_tree = poseidon_config_tree();
+    let anchor = tree.root(&cfg_tree);
+    let (rows1, pos1) = tree.path(&cfg_tree, 1);
+    let (rows2, pos2) = tree.path(&cfg_tree, 4);
     let nf0 = derive_nf(&cfg, owner_nk, rho0);
     let nf1 = n1.nf(&cfg);
     // in_sum = 2^64 + 10; outputs both in-range: (2^64-1) + 11.
@@ -694,8 +794,8 @@ fn row02_range_constraints_field_wrap_mint() {
         in_nk: [Some(owner_nk), Some(owner_nk)],
         in_rho: [Some(rho0), Some(n1.rho)],
         in_rcm: [Some(rcm0), Some(n1.rcm)],
-        in_siblings: [s1, s2],
-        in_bits: [b1, b2],
+        in_rows: [rows1, rows2],
+        in_pos: [pos1, pos2],
         out_v: [Some(outv0), Some(outv1)],
         out_pk: [Some(out_pk0), Some(out_pk1)],
         out_rcm: [Some(out_rcm0), Some(out_rcm1)],
@@ -782,11 +882,16 @@ fn row05_merkle_path_enforcement() {
 
         // Flip one position bit on input 0's path => folds to a different root != anchor.
         let mut adv = built.circuit.clone();
-        adv.in_bits[0][level] = !adv.in_bits[0][level];
+        adv.in_pos[0][level] = (adv.in_pos[0][level] + 1) % TREE_ARITY;
         assert_shipped_unsat(&adv, "row5 tampered path bit");
 
+        // `drop_merkle` is the PROPERTY-level knockout: in the 5-ary walk a moved position
+        // violates the in-gadget selection constraint as well as root == anchor, so knocking out
+        // only the latter leaves the witness UNSAT. That is not the battery losing teeth — it is
+        // the property now being enforced in three places, each of which is knocked out
+        // individually by the two tests below.
         let ko = KnockOut { drop_merkle: true, ..KnockOut::none() };
-        assert_kill_flip(MirrorTransfer::new(adv, ko), "row5 root==anchor (446)");
+        assert_kill_flip(MirrorTransfer::new(adv, ko), "row5 membership (position moved)");
 
         // Also: a fabricated anchor is rejected, and dropping merkle accepts it.
         let mut adv2 = built.circuit.clone();
@@ -798,6 +903,94 @@ fn row05_merkle_path_enforcement() {
 }
 
 // ===========================================================================
+// ROW 5b — the 5-ary selector's BOOLEANITY is load-bearing.
+//
+// The attack this proves impossible: with a non-boolean selector a prover can open the row to any
+// AFFINE COMBINATION of its entries. Solving `a0 + a1 = 1` and `a0*c0 + a1*c1 = cm` gives a
+// selector that "proves" membership of a commitment that is NOT in the row — every other
+// constraint, including root == anchor, stays satisfied because the row itself is untouched.
+//
+// The shipped struct types the position as a `usize` and can only ever build an honest one-hot
+// selector, so this witness is expressible ONLY against the mirror. That is the point: a real
+// prover writes the R1CS witness directly and is under no such restriction.
+// `mirror_is_faithful_to_shipped_circuit` is what makes the mirror admissible as evidence here.
+#[test]
+fn row05b_five_ary_selector_booleanity_is_load_bearing() {
+    let cfg = poseidon_config();
+    let mut rng = StdRng::from_seed([0x5b; 32]);
+    let built = build_honest(&mut rng, &cfg, [10_000, 20_000], 1, 0, 15_000);
+    assert_shipped_sat(&built.circuit, "row5b honest");
+
+    // Forge level 0 of input 0: keep the row, replace the one-hot with the affine solution.
+    let row0 = built.circuit.in_rows[0][0];
+    let pos0 = built.circuit.in_pos[0][0];
+    let cur = row0[pos0]; // the honest leaf commitment, i.e. what the selection must reproduce
+    let (i, j) = if pos0 == 0 { (1usize, 2usize) } else { (0usize, if pos0 == 1 { 2 } else { 1 }) };
+    let denom = row0[i] - row0[j];
+    assert!(!denom.is_zero(), "degenerate row for the affine forgery");
+    let ai = (cur - row0[j]) / denom;
+    let aj = F::one() - ai;
+    let mut sel = vec![F::zero(); TREE_ARITY];
+    sel[i] = ai;
+    sel[j] = aj;
+    // The forged selector reproduces the same selected value, so nothing downstream notices.
+    let opened: F = (0..TREE_ARITY).map(|k| sel[k] * row0[k]).sum();
+    assert_eq!(opened, cur, "the forged selector must open to the same node");
+    assert!(
+        sel.iter().any(|v| *v != F::zero() && *v != F::one()),
+        "the forged selector must be non-boolean, else it proves nothing"
+    );
+
+    let mut levels: Vec<Vec<F>> = built
+        .circuit
+        .in_pos[0]
+        .iter()
+        .map(|p| (0..TREE_ARITY).map(|k| if k == *p { F::one() } else { F::zero() }).collect())
+        .collect();
+    levels[0] = sel;
+
+    let mut m = MirrorTransfer::new(built.circuit.clone(), KnockOut::none());
+    m.sel_override[0] = Some(levels);
+    // Booleanity is enforced at ALLOCATION in the honest path, so the mirror with ko=none must
+    // still reject: the sum and selection constraints alone do not save it... and if they DID,
+    // this test would be the thing that noticed.
+    assert!(
+        mirror_rejects(m.clone()),
+        "row5b: a non-boolean selector was ACCEPTED — membership can be forged as an affine \
+         combination of siblings"
+    );
+
+    // And with the one-hot sum knocked out the same witness goes through, which is what makes
+    // the constraint load-bearing rather than decorative.
+    let mut killed = m;
+    killed.ko = KnockOut { drop_path_boolean: true, ..KnockOut::none() };
+    assert!(
+        mirror_satisfied(killed),
+        "MUTATION-KILL FAILED for row5b: the forged selector stayed UNSAT without booleanity — \
+         the constraint may be redundant. Investigate."
+    );
+}
+
+// ROW 5c — the selection constraint (`selected == node walked`) is load-bearing.
+// Without it the row is hashed but never tied to the node carried up from below, so ANY leaf
+// could be walked against any row: membership stops meaning anything at all.
+#[test]
+fn row05c_five_ary_selection_binding_is_load_bearing() {
+    let cfg = poseidon_config();
+    let mut rng = StdRng::from_seed([0x5c; 32]);
+    let built = build_honest(&mut rng, &cfg, [10_000, 20_000], 1, 0, 15_000);
+
+    let mut adv = built.circuit.clone();
+    adv.in_pos[0][0] = (adv.in_pos[0][0] + 1) % TREE_ARITY;
+    assert_shipped_unsat(&adv, "row5c moved position");
+
+    // Dropping ONLY the selection binding must let it through: the row still hashes to the same
+    // parent (the row is unchanged), so root == anchor still holds — the only thing the moved
+    // position violated was the binding of the walked node to its slot.
+    let ko = KnockOut { drop_path_selection: true, ..KnockOut::none() };
+    assert_kill_flip(MirrorTransfer::new(adv, ko), "row5c selection binding");
+}
+
 // ROW 6 — Output commitment formation (lib.rs:481-482) AND rho-chaining (lib.rs:478).
 // Kills: drop_output_commitment; drop_rho_chain.
 // ===========================================================================
@@ -1115,8 +1308,9 @@ fn input_note_distinctness_enforced_and_legacy_gap() {
     let mut filler = || Note { v: 1, nk: F::rand(&mut rng), rho: F::rand(&mut rng), rcm: F::rand(&mut rng) };
     let leaves = vec![filler().cm(&cfg), note.cm(&cfg), filler().cm(&cfg), filler().cm(&cfg)];
     let tree = DenseTree { leaves };
-    let anchor = tree.root(&cfg);
-    let (s, b) = tree.path(&cfg, 1);
+    let cfg_tree = poseidon_config_tree();
+    let anchor = tree.root(&cfg_tree);
+    let (s, b) = tree.path(&cfg_tree, 1);
     let nf = note.nf(&cfg);
 
     // Both inputs are the SAME note; in_value_sum = 200_000 (doubled). Outputs distinct, sum 200_000.
@@ -1143,8 +1337,8 @@ fn input_note_distinctness_enforced_and_legacy_gap() {
         in_nk: [Some(owner_nk), Some(owner_nk)],
         in_rho: [Some(note.rho), Some(note.rho)],
         in_rcm: [Some(note.rcm), Some(note.rcm)],
-        in_siblings: [s.clone(), s],
-        in_bits: [b.clone(), b],
+        in_rows: [s.clone(), s],
+        in_pos: [b.clone(), b],
         out_v: [Some(ov0), Some(ov1)],
         out_pk: [Some(out_pk0), Some(out_pk1)],
         out_rcm: [Some(out_rcm0), Some(out_rcm1)],

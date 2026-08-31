@@ -18,6 +18,7 @@ use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystem};
 use ark_snark::SNARK;
 use ark_std::rand::{rngs::StdRng, RngCore, SeedableRng};
 use common::{
+    poseidon_config_tree, TREE_ARITY,
     derive_pk, note_commitment, poseidon_config, DenseTree, Note, PoseidonCfg, ScalarField as F,
     TransferCircuit, TAG_CM,
 };
@@ -39,9 +40,10 @@ fn honest(rng: &mut StdRng, cfg: &PoseidonCfg<F>) -> TransferCircuit {
         filler(rng).cm(cfg), inputs[1].cm(cfg), filler(rng).cm(cfg),
     ];
     let tree = DenseTree { leaves };
-    let anchor = tree.root(cfg);
-    let (sib0, bits0) = tree.path(cfg, 1);
-    let (sib1, bits1) = tree.path(cfg, 4);
+    let cfg_tree = poseidon_config_tree();
+    let anchor = tree.root(&cfg_tree);
+    let (rows0, pos0) = tree.path(&cfg_tree, 1);
+    let (rows1, pos1) = tree.path(&cfg_tree, 4);
     let nf = [inputs[0].nf(cfg), inputs[1].nf(cfg)];
     let out_pk = [derive_pk(cfg, recipient_nk), derive_pk(cfg, owner_nk)];
     let out_rcm = [F::rand(rng), F::rand(rng)];
@@ -69,8 +71,8 @@ fn honest(rng: &mut StdRng, cfg: &PoseidonCfg<F>) -> TransferCircuit {
         in_nk: [Some(inputs[0].nk), Some(inputs[1].nk)],
         in_rho: [Some(inputs[0].rho), Some(inputs[1].rho)],
         in_rcm: [Some(inputs[0].rcm), Some(inputs[1].rcm)],
-        in_siblings: [sib0, sib1],
-        in_bits: [bits0, bits1],
+        in_rows: [rows0, rows1],
+        in_pos: [pos0, pos1],
         out_v: [Some(F::from(out_v[0])), Some(F::from(out_v[1]))],
         out_pk: [Some(out_pk[0]), Some(out_pk[1])],
         out_rcm: [Some(out_rcm[0]), Some(out_rcm[1])],
@@ -112,8 +114,10 @@ fn every_single_rule_violation_is_unsatisfiable() {
 
         // 2. wrong Merkle path bit.
         let mut m = h.clone();
-        let lvl = (case * 7) % m.in_bits[0].len();
-        m.in_bits[0][lvl] = !m.in_bits[0][lvl];
+        let lvl = (case * 7) % m.in_pos[0].len();
+        // 5-ary: move the claimed slot within the row (was: flip the left/right bit). The one-hot
+        // selector then picks a sibling instead of the node carried up, so membership must fail.
+        m.in_pos[0][lvl] = (m.in_pos[0][lvl] + 1) % TREE_ARITY;
         assert!(!satisfied(&m), "wrong-path satisfied");
         count += 1;
 
@@ -197,8 +201,8 @@ fn every_single_rule_violation_is_unsatisfiable() {
         m.in_rho[1] = m.in_rho[0];
         m.in_rcm[1] = m.in_rcm[0];
         m.in_v[1] = m.in_v[0];
-        m.in_siblings[1] = m.in_siblings[0].clone();
-        m.in_bits[1] = m.in_bits[0].clone();
+        m.in_rows[1] = m.in_rows[0].clone();
+        m.in_pos[1] = m.in_pos[0].clone();
         assert!(!satisfied(&m), "duplicate-input-note satisfied");
         count += 1;
 
@@ -246,7 +250,8 @@ fn violated_witness_fails_proof_generation_or_verification() {
     // ark-groth16-0.5.0/src/prover.rs:193 is a debug_assert!, so the prover PANICS under
     // cargo test (debug-assertions on) and the assertion is compiled OUT under release. The
     // panic unwound past the match, so neither arm was ever reached.
-    // Thresholds: docs/thresholds/THRESHOLDS-prover-negative-path.md.
+    // Both legs below are the pin: the debug-profile assertion here, and the
+    // profile-independent end-to-end leg that follows it.
     assert!(!satisfied(&bad), "{UNSAT_MSG}");
 
     // The end-to-end leg, correct in BOTH profiles. Panic (debug), Err, or a proof that

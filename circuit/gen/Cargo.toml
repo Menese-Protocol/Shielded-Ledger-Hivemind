@@ -24,6 +24,10 @@ merlin = { workspace = true }
 rand = { workspace = true }
 sha2 = { workspace = true }
 
+[dev-dependencies]
+# the setup-guard battery hand-builds a wrong Poseidon config to prove the guard refuses it
+ark-crypto-primitives = { workspace = true }
+
 [features]
 # `common` was given `default = ["bls12-381"]` so its five constraint-system
 # test files stop compiling to nothing. That left THIS crate broken under default features:

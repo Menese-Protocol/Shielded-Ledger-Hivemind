@@ -6,8 +6,8 @@
   "publicly_reproducible_toxic_waste": true,
   "multi_party_ceremony": false,
   "real_value_eligible": false,
-  "transfer_pk_sha256": "b7e525dc384a9021f4fe7e0e4fef448418c367add8cc07cc80f987dd8c2ffe04",
-  "transfer_vk_sha256": "4aa69a06b0a703ebf5cc768b44c4162eb7715104fde8a9e1e86ea7f5e5f87b34",
+  "transfer_pk_sha256": "6ff079738e40be5284bf68d805a5dd8a1a348d3cc16c722aa10159dc4e469258",
+  "transfer_vk_sha256": "d935776558fc9224390f41e8680f31671dac271bcf0ec7d7cf8014fbe20b8efd",
   "deposit_pk_sha256": "a1b7d251b7aacc329d7effe292244c88b341b764222a2c7374d5a8337284b804",
   "deposit_vk_sha256": "cd047620dc693e8ce0f7934dc84c19779892e8a6cac8083ca72c57de3c311e8c",
   "warning": "A production keyset requires a separately verified multi-party ceremony transcript."

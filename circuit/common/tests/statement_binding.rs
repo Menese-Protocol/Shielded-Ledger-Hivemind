@@ -24,6 +24,7 @@ use ark_snark::SNARK;
 use ark_std::rand::rngs::StdRng;
 use ark_std::rand::{RngCore, SeedableRng};
 use common::{
+    poseidon_config_tree, TREE_ARITY,
     derive_pk, note_commitment, poseidon_config, DenseTree, Note, PoseidonCfg, TransferCircuit,
 };
 use std::path::PathBuf;
@@ -126,9 +127,10 @@ fn honest_witness(rng: &mut StdRng, cfg: &PoseidonCfg<F>, legacy_statement: bool
     ];
     let leaves = vec![inputs[0].cm(cfg), inputs[1].cm(cfg)];
     let tree = DenseTree { leaves };
-    let anchor = tree.root(cfg);
-    let (sib0, bits0) = tree.path(cfg, 0);
-    let (sib1, bits1) = tree.path(cfg, 1);
+    let cfg_tree = poseidon_config_tree();
+    let anchor = tree.root(&cfg_tree);
+    let (rows0, pos0) = tree.path(&cfg_tree, 0);
+    let (rows1, pos1) = tree.path(&cfg_tree, 1);
     let nf = [inputs[0].nf(cfg), inputs[1].nf(cfg)];
     let out_pk = [derive_pk(cfg, recipient_nk), derive_pk(cfg, owner_nk)];
     let out_rcm = [F::rand(rng), F::rand(rng)];
@@ -153,8 +155,8 @@ fn honest_witness(rng: &mut StdRng, cfg: &PoseidonCfg<F>, legacy_statement: bool
         in_nk: [Some(inputs[0].nk), Some(inputs[1].nk)],
         in_rho: [Some(inputs[0].rho), Some(inputs[1].rho)],
         in_rcm: [Some(inputs[0].rcm), Some(inputs[1].rcm)],
-        in_siblings: [sib0, sib1],
-        in_bits: [bits0, bits1],
+        in_rows: [rows0, rows1],
+        in_pos: [pos0, pos1],
         out_v: [Some(F::from(out_v[0])), Some(F::from(out_v[1]))],
         out_pk: [Some(out_pk[0]), Some(out_pk[1])],
         out_rcm: [Some(out_rcm[0]), Some(out_rcm[1])],
