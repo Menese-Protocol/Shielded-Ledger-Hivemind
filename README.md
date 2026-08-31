@@ -4,10 +4,12 @@ A shielded token pool that runs entirely on the Internet Computer. Groth16 proof
 inside the canister, in Motoko; notes and keys never leave the user's browser; private lookups
 are answered by a ledger that never learns the question.
 
-**Live demo: https://nl5gm-2aaaa-aaaau-ag27q-cai.icp0.io/**
+**The hosted demo is offline while the pool is redeployed.** It is not linked here rather than
+linked and broken; this section will name the new deployment when it exists.
 
-Two browsers, two users, a private transfer, and a live panel showing exactly what a node
-provider can and cannot see.
+The demo itself runs locally today (`## Running it yourself`): two browsers, two users, a private
+transfer, and a live panel showing exactly what a node provider can and cannot see.
+`node demo-frontend/verify.mjs` drives that whole story headless and screenshots every step.
 
 *Privacy you can watch.*
 
@@ -337,13 +339,37 @@ undetectably. The policy here is explicit:
 ## Running it yourself
 
 Prerequisites: `dfx`, Rust with the `wasm32-unknown-unknown` target, `wasm-pack`, `node`,
-[`mops`](https://mops.one), Python 3.
+[`mops`](https://mops.one), `didc`, Python 3, and a Motoko compiler at
+`/opt/moc-1.4.1/moc` (`e2e.py` invokes that absolute path; adjust to your install).
+
+The conditions the replica suite needs — the replica port, the oracle binaries, a detached
+start, and the host's process ceiling — are in [`TESTING.md`](TESTING.md) §2. Each fails as
+something other than itself if it is not met.
 
 ```bash
 # ledger + tests
 mops install
 sha256sum -c fixtures/SHA256SUMS
-dfx start --clean          # second terminal: dfx deploy && python3 e2e.py
+./scripts/security-gate.sh  # the offline battery: no replica, no installs
+
+# the replica suite expects these binaries to exist; it does not build them
+cargo build -p icrc3_oracle -p cert_oracle --bins
+cargo build --manifest-path nns_adapter/Cargo.toml --bin nns-adapter-oracle
+cargo build --manifest-path nns_adapter/Cargo.toml --lib \
+  --target wasm32-unknown-unknown --release
+
+dfx start --clean --background
+
+# every canister EXCEPT scale_fixture_layout1, whose generated source comes from
+# scripts/build-layout1-fixture.sh and which aborts on its frozen hash pin by design.
+# e2e.py does not reference it.
+for c in $(python3 -c "import json;print(' '.join(k for k in \
+    json.load(open('dfx.json'))['canisters'] if k != 'scale_fixture_layout1'))"); do
+  dfx deploy "$c"
+done
+
+# prints one assertion table; every key must be True
+ZK_LEDGER_REPLICA_URL=http://127.0.0.1:41403 python3 e2e.py
 
 # demo frontend (full walkthrough in demo-frontend/README.md)
 cd demo-frontend
