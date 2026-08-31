@@ -108,7 +108,7 @@ console.log(`  served keyset: ${sizes.join(" ")}`);
 // load and the GREEN leg fails on staging rather than on the property under test. configure() is
 // what populates those fields. Established here rather than out of band: a suite that needs a manual
 // step cannot run unattended, and a suite that is red on staging is one people learn to ignore.
-// Thresholds: docs/thresholds/THRESHOLDS-keyset-pin.md. No assertion below is changed.
+// No assertion below is changed; configure() only populates the anchor fields the GREEN leg reads.
 {
   const pre = readAnchor();
   if (!pre.transfer_vk_hex || !pre.deposit_vk_hex) {

@@ -9,8 +9,17 @@
 //
 // The secret is never touched by this JavaScript and never appears in any request body.
 
-import { Actor, HttpAgent } from "https://esm.sh/@dfinity/agent@2.1.3";
-import { AuthClient } from "https://esm.sh/@dfinity/auth-client@2.1.3";
+// Vendored, not fetched. This page samples the ceremony secret, so a third-party CDN in its
+// import graph would be a party to the trust model: whoever serves esm.sh could replace the agent
+// with one that exfiltrates, and nothing the contributor can inspect would show it. The bundle is
+// built from the versions pinned in package-lock.json with
+//   esbuild <entry re-exporting Actor/HttpAgent/AuthClient> --bundle --format=esm --platform=browser
+// so it is reproducible from the lockfile and reviewable in-tree. Deliberately NOT minified: a
+// contributor asked to trust this page should be able to read the dependency it runs, and the
+// bundle keeps its upstream license attributions where a minified one drops them into noise. This
+// does not make the page trustless — the wasm module is what holds the secret — but it removes a
+// host that had no reason to be trusted at all.
+import { Actor, HttpAgent, AuthClient } from "./vendor/dfinity.js";
 import init, { transform_contribution } from "./pkg/ceremony_contributor_wasm.js";
 
 const CHUNK = 1_800_000; // < 2 MB ingress limit

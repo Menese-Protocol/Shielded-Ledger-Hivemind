@@ -1,6 +1,9 @@
 // Persistent store for the proving keyset (Menese DeFi Team).
 //
-// The keyset is 13,305,362 bytes and is re-fetched from the asset canister on every cold start.
+// The keyset is 8,903,520 bytes (transfer_pk 8,454,480 + deposit_pk 449,040) and is re-fetched
+// from the asset canister on every cold start. This figure tracks the QAP domain and has moved
+// with it twice — 13,305,362 at 2^15, 23,882,592 at 2^16, and 8,903,520 now that the 4-ary tree
+// brought the transfer statement down to 2^14.
 // This caches the BYTES across sessions, keyed by the on-chain verifying-key anchor digest, so a
 // key rotation invalidates the entry automatically: the digest covers both verifying keys, so a
 // rotated key simply produces a different key and the old entry is never looked up again.
@@ -9,7 +12,7 @@
 // recomputes the SHA-256 of the proving keys and compares them against the manifest hashes stored
 // alongside them, exactly as a cold load does. Skipping that would make a writable IndexedDB entry
 // as authoritative as a certified anchor, which is the opposite of what the binding exists for.
-// What the cache actually saves is the 13 MB network round-trip, not the verification.
+// What the cache actually saves is the 8.5 MiB network round-trip, not the verification.
 //
 // The store is injectable so the load path can be measured and tested without a browser.
 

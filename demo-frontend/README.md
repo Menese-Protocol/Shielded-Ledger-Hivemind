@@ -25,9 +25,10 @@ verifier this demo's ledger already uses.
 
 ## Client-side proving
 
-The pool `TransferCircuit` (20,146 constraints) and `DepositCircuit` are compiled to wasm via
-`wasm-pack` (`prover-wasm/`). Measured in-browser: deposit proof ~0.3 s, transfer proof ~5 s;
-feasible, no server-side proving. Proofs are verified in-canister by the Motoko verifier.
+The pool `TransferCircuit` (35,637 constraints hardened; 35,506 legacy) and `DepositCircuit`
+are compiled to wasm via `wasm-pack` (`prover-wasm/`). Proving is a few seconds in-browser for a
+transfer and well under a second for a deposit; feasible, no server-side proving. Proofs are
+verified in-canister by the Motoko verifier.
 
 ## Build & run (local)
 

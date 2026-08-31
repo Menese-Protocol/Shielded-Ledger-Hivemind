@@ -6,9 +6,9 @@
   "publicly_reproducible_toxic_waste": false,
   "multi_party_ceremony": false,
   "real_value_eligible": false,
-  "transfer_pk_sha256": "c78f65a8a032113ad1d405e3a65e15e972c13b5c455bf0768245cabb424eace5",
-  "transfer_vk_sha256": "c5ea9d4ce2fcf033c5e46e3aca784e00941acb779907555c11cf56392e367be1",
-  "deposit_pk_sha256": "2897a455aba5fd4ee3205374f167ce4c7adbc5bb270e0b3ad037f3fe16e2294d",
-  "deposit_vk_sha256": "6db0a81374e73d4166f72f1c4e188e7ca09f394597090cc56151327ddaad6350",
+  "transfer_pk_sha256": "520d49e74b4c581f0dc91db52aeb0c0ba919b951ff9b88b5cdf507134c641fa4",
+  "transfer_vk_sha256": "a3675783dd41e60b0e707f8f875eb5c91164bbdd0a60d97329f1d6d1d45e016e",
+  "deposit_pk_sha256": "edfbd6ec2df1385167ba47fc068a1ed0ab6430d67f6c35b7dcda2202ef6ebe0c",
+  "deposit_vk_sha256": "70b3ad585711f1e43d8597551192c136046820ba0ea6759be142c090686fd8ad",
   "warning": "A production keyset requires a separately verified multi-party ceremony transcript."
 }

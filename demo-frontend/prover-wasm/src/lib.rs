@@ -99,12 +99,13 @@ pub fn note_nullifier_hex(nk_hex: &str, rho_hex: &str) -> Result<String, JsValue
 #[wasm_bindgen]
 pub fn tree_root(leaves_json: &str) -> Result<String, JsValue> {
     let leaves: Vec<String> = serde_json::from_str(leaves_json).map_err(|_| err("bad leaves json"))?;
-    let cfg = poseidon_config();
+    // The tree instance, not the note instance — see the note in prove_transfer.
+    let cfg_tree = poseidon_config_tree();
     let leaves: Vec<F> = leaves
         .iter()
         .map(|h| f_from_hex(h).ok_or_else(|| err("bad leaf hex")))
         .collect::<Result<_, _>>()?;
-    Ok(f_to_hex(&DenseTree { leaves }.root(&cfg)))
+    Ok(f_to_hex(&DenseTree { leaves }.root(&cfg_tree)))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -303,15 +304,20 @@ struct TransferResult {
 pub fn prove_transfer(pk_bytes: &[u8], witness_json: &str) -> Result<String, JsValue> {
     let w: TransferWitness = serde_json::from_str(witness_json).map_err(|_| err("bad witness json"))?;
     let cfg = poseidon_config();
+    // Notes and commitments hash on the rate-2 instance; the Merkle tree hashes on the wider
+    // rate-TREE_ARITY one. Passing `cfg` where a tree config belongs typechecks through a TreeCfg
+    // wrapper and then silently anchors under the wrong permutation, so the two are kept distinct
+    // and named here.
+    let cfg_tree = poseidon_config_tree();
     let leaves: Vec<F> = w
         .leaves
         .iter()
         .map(|h| f_from_hex(h).ok_or_else(|| err("bad leaf hex")))
         .collect::<Result<_, _>>()?;
     let tree = DenseTree { leaves };
-    let anchor = tree.root(&cfg);
+    let anchor = tree.root(&cfg_tree);
 
-    let parse_in = |n: &InNote| -> Result<(Note, Vec<F>, Vec<bool>), JsValue> {
+    let parse_in = |n: &InNote| -> Result<(Note, Vec<[F; TREE_ARITY]>, Vec<usize>), JsValue> {
         let note = Note {
             v: n.v,
             nk: f_from_wire(&n.nk)?,
@@ -322,11 +328,11 @@ pub fn prove_transfer(pk_bytes: &[u8], witness_json: &str) -> Result<String, JsV
         if n.index >= tree.leaves.len() || tree.leaves[n.index] != cm {
             return Err(err("input note commitment not found at claimed index"));
         }
-        let (sib, bits) = tree.path(&cfg, n.index);
-        Ok((note, sib, bits))
+        let (rows, pos) = tree.path(&cfg_tree, n.index);
+        Ok((note, rows, pos))
     };
-    let (in1, sib1, bits1) = parse_in(&w.in1)?;
-    let (in2, sib2, bits2) = parse_in(&w.in2)?;
+    let (in1, rows1, pos1) = parse_in(&w.in1)?;
+    let (in2, rows2, pos2) = parse_in(&w.in2)?;
     let nf1 = in1.nf(&cfg);
     let nf2 = in2.nf(&cfg);
 
@@ -357,8 +363,8 @@ pub fn prove_transfer(pk_bytes: &[u8], witness_json: &str) -> Result<String, JsV
         in_nk: [Some(in1.nk), Some(in2.nk)],
         in_rho: [Some(in1.rho), Some(in2.rho)],
         in_rcm: [Some(in1.rcm), Some(in2.rcm)],
-        in_siblings: [sib1, sib2],
-        in_bits: [bits1, bits2],
+        in_rows: [rows1, rows2],
+        in_pos: [pos1, pos2],
         out_v: [Some(F::from(w.out1.v)), Some(F::from(w.out2.v))],
         out_pk: [Some(out1_pk), Some(out2_pk)],
         out_rcm: [Some(out1_rcm), Some(out2_rcm)],
@@ -517,10 +523,11 @@ pub fn spike_transfer_prove() -> String {
     let alice_pk = derive_pk(&cfg, alice_nk);
     let n1 = Note { v: 70, nk: alice_nk, rho: F::rand(&mut r), rcm: F::rand(&mut r) };
     let n2 = Note { v: 30, nk: alice_nk, rho: F::rand(&mut r), rcm: F::rand(&mut r) };
+    let cfg_tree = poseidon_config_tree();
     let dense = DenseTree { leaves: vec![n1.cm(&cfg), n2.cm(&cfg)] };
-    let anchor = dense.root(&cfg);
-    let (sib1, bits1) = dense.path(&cfg, 0);
-    let (sib2, bits2) = dense.path(&cfg, 1);
+    let anchor = dense.root(&cfg_tree);
+    let (rows1, pos1) = dense.path(&cfg_tree, 0);
+    let (rows2, pos2) = dense.path(&cfg_tree, 1);
     let nf1 = n1.nf(&cfg);
     let nf2 = n2.nf(&cfg);
     let out1 = Note { v: 55, nk: bob_nk, rho: nf1, rcm: F::rand(&mut r) };
@@ -539,8 +546,8 @@ pub fn spike_transfer_prove() -> String {
         in_nk: [Some(n1.nk), Some(n2.nk)],
         in_rho: [Some(n1.rho), Some(n2.rho)],
         in_rcm: [Some(n1.rcm), Some(n2.rcm)],
-        in_siblings: [sib1, sib2],
-        in_bits: [bits1, bits2],
+        in_rows: [rows1, rows2],
+        in_pos: [pos1, pos2],
         out_v: [Some(F::from(out1.v)), Some(F::from(out2.v))],
         out_pk: [Some(bob_pk), Some(alice_pk)],
         out_rcm: [Some(out1.rcm), Some(out2.rcm)],

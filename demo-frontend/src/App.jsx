@@ -994,7 +994,7 @@ export default function App() {
               {poolView === "provider" ? (
                 <>
                   <p className="text-xs text-dim mb-3">
-                    This is the machine's honest view — the operator who physically runs this
+                    This is the machine's honest view — whoever physically runs this
                     canister stores these bytes and can open none of them. No amount, no balance,
                     no sender→recipient link exists anywhere below.
                   </p>
