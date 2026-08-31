@@ -84,7 +84,7 @@ module {
   // whole reclaim drains in far fewer than that (the openWindow force-drain must never
   // fire), while each put's added cost stays a small flat constant.
   let COMPACT_BUDGET : Nat64 = 64;
-  /// Ceiling on one explicit advanceMigration call, so the operator-driven convergence cannot be
+  /// Ceiling on one explicit advanceMigration call, so the administrator-driven convergence cannot be
   /// asked to exceed the per-message instruction limit.
   let MIGRATION_MAX_BUDGET : Nat64 = 65_536;
   /// Counter of forced completions, at the four header bytes between the version and table_offset
@@ -267,7 +267,8 @@ module {
   /// order. And Nat64.fromNat(Nat8.toNat(b)) routed every byte through arbitrary-precision Nat to
   /// widen 8 bits to 64; the two machine widenings do that exactly, since a Nat8 always fits.
   /// `value * 256 + b` on a Nat64 is `(value << 8) | b` for b < 256 by construction. Verified over
-  /// a corpus, and against hashes already cached by the old code, in scripts/hash-parity-battery.sh.
+  /// a corpus, and against hashes already cached by the old code, by `tests/HashParityFixture.mo`
+  /// against a pre-change build produced by `scripts/build-oldhash-fixture.sh`.
   func hashOf(key : Blob) : Nat64 {
     let digest = Sha256.fromBlob(#sha256, key);
     var value : Nat64 = 0;

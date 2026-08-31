@@ -6,9 +6,14 @@ added, precisely so the identity can be asserted:
 
     sha256(tests/layout1/StableBlobSet.mo) == c9195aaeb0e3970a4e530dc5f04837ff4767531256f07c10eb2af9a740038657
 
-`scripts/set-migration-battery.sh` checks that hash before it builds anything, and aborts if it
+`scripts/build-layout1-fixture.sh` checks that hash before it builds anything, and aborts if it
 does not match. A drifted copy would silently turn a cross-version upgrade test into a
 same-version one, which is the failure mode this whole directory exists to prevent.
+
+That build currently aborts for the OTHER reason it is designed to abort for: `tests/ScaleFixture.mo`
+has grown a call to `StableBlobSet.compactStep`, which the frozen module predates, so the generated
+layout-1 source does not compile. The frozen module is deliberately not regenerable — that is the
+point of the hash pin — so closing this means re-deciding the pin, not editing this directory.
 
 ## Why a frozen copy at all
 

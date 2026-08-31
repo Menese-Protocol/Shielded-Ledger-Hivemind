@@ -80,6 +80,11 @@ module {
   };
 
   // ---------------- scalar field (LE, canonical) ----------------
+  // CONSENSUS-CRITICAL (audit F2): parse-don't-validate — a non-canonical (>= r) 32-byte
+  // encoding returns null here and the whole input vector is REJECTED (REJECT:inputs-
+  // deserialize), never reduced mod r. Reduction would let one field element verify under two
+  // byte encodings. Weakening is refused by scripts/consensus-seam-guard.sh and exercised by
+  // scripts/consensus-decode-regression.mjs.
   func frFromLe(b : [Nat8], from : Nat) : ?Nat {
     var x : Nat = 0;
     var i : Nat = 32;

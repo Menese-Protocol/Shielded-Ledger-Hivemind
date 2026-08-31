@@ -503,7 +503,7 @@ persistent actor ZkLedger {
   // PAST-TENSE guarantee: its status query told a reviewer the hooks cannot be used from now on,
   // and told them nothing about whether one had been used an hour earlier. No shipped state
   // could promote it, because nothing recorded an invocation. Build-time exclusion replaces that
-  // unverifiable claim with one anyone can check without trusting the operator: the installed
+  // unverifiable claim with one anyone can check without trusting whoever runs it: the installed
   // module hash equals the hash of a binary whose source provably contains no arming code.
   // CWE-489 catalogues the mitigation at the Build/Distribution phase for exactly this reason.
   //
@@ -534,10 +534,9 @@ persistent actor ZkLedger {
   ///
   /// So the field is reserved rather than removed: one name, one meaning, never reused — the
   /// Protocol Buffers reserved-field discipline: reserve a retired name, never reuse it. What the
-  /// D-3 change buys is the ARMING SURFACE, and that is gone from the interface, which
-  /// `scripts/hook-exclusion-battery.sh` measures directly against the shipped candid and the
-  /// running canister. Removing the declaration is an operator decision with the costs above, not
-  /// a cleanup.
+  /// D-3 change buys is the ARMING SURFACE, and that is gone from the interface — checkable
+  /// directly against the shipped candid, where no method signature exposes it. Removing the
+  /// declaration is an operator decision with the costs above, not a cleanup.
   var test_hooks_sealed : Bool = false;
   var test_fail_after_token_once : Bool = false;
   // While > 0, the PIR fold path traps. In the synchronous wiring the in-message rollback keeps
@@ -605,7 +604,7 @@ persistent actor ZkLedger {
   // `note_root == anchor_before` guard) and is deliberately NOT escalated to the sticky
   // `guard_code` — doing so would block the resume that converges the money, turning a
   // silent per-intent wedge into a funds-availability bug. Instead it is COUNTED here, so
-  // the operator has an observable without the ledger fail-closing. Observable-only; never gates.
+  // a monitoring caller has an observable without the ledger fail-closing. Observable-only; never gates.
   var finalize_frontier_mismatch_count : Nat = 0;
   var finalize_frontier_mismatch_last : ?Blob = null;
   // put counters: exact-count contention detection for the chunked set walks
@@ -1065,7 +1064,7 @@ persistent actor ZkLedger {
         return #err("stable-state:current-root");
       };
       let state = currentTree();
-      if (state.filled.size() != 32 or state.next_index != Nat64.fromNat(noteCount())) {
+      if (state.filled.size() != PoseidonTree.FILLED_LEN or state.next_index != Nat64.fromNat(noteCount())) {
         return #err("stable-state:tree-position");
       };
       switch (hexToBlob(state.root)) {
@@ -1100,7 +1099,7 @@ persistent actor ZkLedger {
         if (pending.base_epoch != epoch or pending.anchor_before != note_root) {
           return #err("stable-state:pending-epoch");
         };
-        if (pending.next_tree.filled.size() != 32 or
+        if (pending.next_tree.filled.size() != PoseidonTree.FILLED_LEN or
             pending.next_tree.next_index != Nat64.fromNat(noteCount() + 1)) {
           return #err("stable-state:pending-tree-position");
         };
@@ -1142,7 +1141,7 @@ persistent actor ZkLedger {
             not StableBlobSet.contains(historical_roots, pending.anchor_before)) {
           return #err("stable-state:pending-unshield-epoch");
         };
-        if (pending.next_tree.filled.size() != 32 or
+        if (pending.next_tree.filled.size() != PoseidonTree.FILLED_LEN or
             pending.next_tree.next_index != Nat64.fromNat(noteCount() + 2)) {
           return #err("stable-state:pending-unshield-tree-position");
         };
@@ -1687,7 +1686,7 @@ persistent actor ZkLedger {
   /// failure count, and re-arms the tick from wherever the cursor stands.
   /// Drive the chunked relocation of the spent-nullifier table. Administrator-only
   /// and never called from a product path — the automatic reclamation in `put` stays bounded to one
-  /// message, and this is the operator-driven route for a table too large for that.
+  /// message, and this is the administrator-driven route for a table too large for that.
   ///
   /// Refused while an audit is running: the audit captures `table_offset` at its start and walks
   /// the set across messages, and its exactness depends on the set being quiescent for the length of
@@ -1706,7 +1705,7 @@ persistent actor ZkLedger {
   /// So the value path keeps a set's own superseded tables reclaimed on its own; this ADMIN entry
   /// exists to reclaim a set that is NOT being written to (a `historical_roots`,
   /// `completed_shield_intents` or `completed_unshield_intents` that has gone quiet keeps its
-  /// superseded tables until something puts to it, and the operator may want them back sooner). Same
+  /// superseded tables until something puts to it, and the administrator may want them back sooner). Same
   /// admin gate and same audit-running refusal as the nullifier entry point; `compact_nullifier_set`
   /// is left in place.
   public shared ({ caller }) func compact_set(target : CompactTarget, budget : Nat64) : async Result<Bool> {
@@ -1895,11 +1894,11 @@ persistent actor ZkLedger {
     };
     if (offenders == 0) return #err("REJECT:pool-not-corrupt");
 
-    if (lanes.size() != PoseidonTree.DEPTH) return #err("REJECT:frontier-length");
+    if (lanes.size() != PoseidonTree.FILLED_LEN) return #err("REJECT:frontier-length");
     if (next_index >= (1 : Nat64) << 32) return #err("REJECT:tree-full");
 
     // Every supplied lane must be canonical, or nothing happens.
-    let parsed = Prim.Array_init<Nat>(PoseidonTree.DEPTH, 0);
+    let parsed = Prim.Array_init<Nat>(PoseidonTree.FILLED_LEN, 0);
     var i = 0;
     for (lane in lanes.vals()) {
       switch (PoseidonTree.hexToNat(lane)) {
@@ -1986,7 +1985,7 @@ persistent actor ZkLedger {
   public shared ({ caller }) func detect_chain_rebuild_resume() : async Result<()> {
     // NOT guardRejection()-gated, and its sibling `detect_chain_rebuild` is not either. A give-up
     // is frequently CAUSED by state the audit guard objects to, so guarding the resume made it
-    // unreachable in precisely the situation it exists for: the operator was left with only the
+    // unreachable in precisely the situation it exists for: the administrator was left with only the
     // entry point that discards progress. Measured — after a give-up at cursor 8000 the resume
     // returned `GUARDED:stable-state-audit-failed:note-codec:magic` while the restart ran.
     if (not isAdministrator(caller)) return #err("REJECT:not-administrator");
@@ -2161,7 +2160,7 @@ persistent actor ZkLedger {
   /// sticky audit guard is set the driver pauses: fail-closed extends to derived state (D17).
   func pir2DriverTick() : async () {
     // A deterministic trap will recur, so stop re-arming instead of burning a chunk every 64s
-    // forever. pir2_reindex clears this, which is the operator's way back.
+    // forever. pir2_reindex clears this, which is the administrator's way back.
     if (pir2_fold_terminal) return;
     if (not pir2_state.enabled) return;
     if (pir2_fold_inflight) return;
@@ -2529,6 +2528,13 @@ persistent actor ZkLedger {
     ?Blob.fromArray(List.toArray(output))
   };
 
+  // CONSENSUS-CRITICAL (audit F1b/F3): this Nat64 -> 32-byte-LE embedding, TOGETHER with the
+  // `Nat64` typing of `fee`/`v_pub_out`/shield `value` in the candid interface, is what bounds
+  // the public conservation terms below 2^64 for the LEGACY transfer statement and for every
+  // deposit. The legacy circuit does NOT range-check these public inputs; a variant of this
+  // function (or of the argument types) that could emit a field element >= 2^64 would reopen
+  // the field-wrap over-issuance. Weakening is refused by scripts/consensus-seam-guard.sh and
+  // exercised end-to-end by scripts/consensus-decode-regression.mjs.
   func nat64Field(valueInput : Nat64) : Blob {
     let output = Prim.Array_init<Nat8>(32, 0);
     var value = valueInput;
@@ -2566,13 +2572,13 @@ persistent actor ZkLedger {
     switch (result.error) { case (?message) return #err(message); case null {} };
     switch (result.state) {
       case (?state) {
-        if (state.filled.size() != 32) return #err("REJECT:tree-frontier-length");
+        if (state.filled.size() != PoseidonTree.FILLED_LEN) return #err("REJECT:tree-frontier-length");
         switch (hexToBlob(state.root)) {
           case (?root) { if (root.size() != 32) return #err("REJECT:tree-root-length") };
           case null return #err("REJECT:tree-root-hex");
         };
         // INTAKE now admits exactly what the read path admits. Both the root and ALL
-        // THIRTY-TWO lanes go through the one smart constructor; the lanes were previously
+        // FILLED_LEN lanes go through the one smart constructor; the lanes were previously
         // COUNT-CHECKED ONLY, so a stored TreeState could carry 32 well-formed but non-canonical
         // lanes that `frontierAppend` would later refuse at `REJECT:frontier-field` — stranding the
         // intent after the money moved. A root-only remedy relocates the strand to that exit.
@@ -2615,14 +2621,14 @@ persistent actor ZkLedger {
   /// (frontier-length / leaf-count / tree-full / frontier-field / root-field /
   /// leaf-field) so a cross-checked oracle can never disagree on the rejection surface.
   func frontierAppend(state : TreeState, leaves : [Text]) : Result<TreeState> {
-    if (state.filled.size() != PoseidonTree.DEPTH) return #err("REJECT:frontier-length");
+    if (state.filled.size() != PoseidonTree.FILLED_LEN) return #err("REJECT:frontier-length");
     if (leaves.size() == 0 or leaves.size() > 2) return #err("REJECT:leaf-count");
     if (state.next_index > ((1 : Nat64) << 32) -% Nat64.fromNat(leaves.size())) {
       return #err("REJECT:tree-full");
     };
-    let filled = Prim.Array_init<Nat>(PoseidonTree.DEPTH, 0);
+    let filled = Prim.Array_init<Nat>(PoseidonTree.FILLED_LEN, 0);
     var level : Nat = 0;
-    while (level < PoseidonTree.DEPTH) {
+    while (level < PoseidonTree.FILLED_LEN) {
       switch (PoseidonTree.hexToNat(state.filled[level])) {
         case (?value) filled[level] := value;
         case null return #err("REJECT:frontier-field");
@@ -2960,7 +2966,7 @@ persistent actor ZkLedger {
     // direction — that is what strands a settled intent — and it stays blocked.
     if (enabled) {
       let state = currentTree();
-      if (state.filled.size() != PoseidonTree.DEPTH) return #err("REJECT:frontier-length");
+      if (state.filled.size() != PoseidonTree.FILLED_LEN) return #err("REJECT:frontier-length");
       for (lane in state.filled.vals()) {
         if (PoseidonTree.hexToNat(lane) == null) return #err("REJECT:frontier-field");
       };
@@ -3062,7 +3068,7 @@ persistent actor ZkLedger {
 
   public query func status() : async LedgerStatus { statusValue() };
 
-  /// Names the values that put this pool in quarantine, so an operator can see
+  /// Names the values that put this pool in quarantine, so a monitoring caller can see
   /// WHAT is wrong rather than only THAT something is. Empty when the pool is clean.
   /// A fourth exposure site, closed. This was an UNAUTHENTICATED query returning the raw offender
   /// list, and that list is not only tree data: `postupgrade`'s quarantine scan puts
@@ -3078,7 +3084,7 @@ persistent actor ZkLedger {
   ///
   /// Redacted on the `finalize_divergence` precedent rather than gated outright, and the split is
   /// the same RFC 6973 6.1 data-minimisation reading: the BOOLEAN stays open to every caller,
-  /// because an operator -- not only the administrator -- must be able to see that a pool is
+  /// because a monitoring caller -- not only the administrator -- must be able to see that a pool is
   /// quarantined, and the flag carries no linkage. The VALUES become administrator-only, because
   /// they do. Gating the flag as well would defeat the observable to buy no privacy; publishing the
   /// values buys an oracle for nothing. A non-administrator gets the count instead, so the
@@ -3175,7 +3181,7 @@ persistent actor ZkLedger {
   public query func atomicity_status() : async AtomicityStatus { atomicityStatusValue() };
 
   // The finalize-frontier divergence observable. Corruption-only and non-blocking (it never
-  // trips the sticky guard, so the resume still converges the money). It lets the operator watch
+  // trips the sticky guard, so the resume still converges the money). It lets a monitoring caller watch
   // `count` for a finalize-time frontier/oracle divergence that leaves an intent pending.
   //
   // `last_intent` USED TO BE THE RAW `intentId` assigned at the two finalize mismatch sites, on an
@@ -3194,7 +3200,7 @@ persistent actor ZkLedger {
   //     unredacted record is an administrator affordance, not a public one.
   //
   // `count` stays open to every caller deliberately. It is an aggregate with no note-to-account
-  // linkage, and it exists so the operator — not only the administrator — can watch it; gating the
+  // linkage, and it exists so any caller — not only the administrator — can watch it; gating the
   // count would defeat the observable to buy no privacy. This is the RFC 6973 §6.1 data-minimisation
   // reading: publish the aggregate, withhold the identifier. Defence in depth over a single control
   // is Saltzer & Schroeder's fail-safe defaults + least privilege (Proc. IEEE 63(9), 1975).
@@ -3433,8 +3439,7 @@ persistent actor ZkLedger {
   // verify every page, and there is no backfill path — so it arms only on an empty log. Additive:
   // flag off leaves append, certification, and every existing endpoint byte-identical to 44692fc.
   // Administrator-only: enabling puts DetectChain.append's unbounded-in-N work back inside the
-  // post-payout commit, which is the precondition docs/thresholds/THRESHOLDS-prepare-commit.md
-  // P-1 relies on. The
+  // post-payout commit, which is the precondition that commit's cost bound relies on. The
   // authorisation check runs FIRST so a caller who is not the administrator learns nothing about
   // the pool's state from the answer.
   public shared ({ caller }) func detect_chain_enable() : async Result<()> {
@@ -3894,7 +3899,7 @@ persistent actor ZkLedger {
     // to the raw handle, leaving the oracle open". That stopped being true at a3b82b3, which made
     // publishedIntentId fail CLOSED — an unseeded salt now returns "" and WITHHOLDS the handle.
     // The seeding therefore buys the OBSERVABLE, not the safety: without it a published handle is
-    // empty and the operator loses the correlation, but nothing raw is ever disclosed. Corrected
+    // empty and a monitoring caller loses the correlation, but nothing raw is ever disclosed. Corrected
     // because the stale wording is not inert — it was read as current behaviour during review and
     // produced the confident, wrong conclusion that salting a query path is a no-op.
     await seedIntentPublishSalt();
@@ -3928,6 +3933,12 @@ persistent actor ZkLedger {
     if (StableBlobSet.contains(completed_shield_intents, intentId)) {
       return mutation("ACCEPT:already-finalized", "ACCEPT");
     };
+    // CONSENSUS-CRITICAL (audit F3): the deposit circuit proves cm == H(3, v_pub, pk, rho,
+    // rcm) with NO in-circuit range on v_pub. That a shield cannot mint a note worth >= 2^64
+    // rests on exactly two facts at THIS seam: `args.value : Nat64` embedded through
+    // `nat64Field` (so the public input can never encode >= 2^64), and the transparent ICRC-2
+    // leg below moving the real `args.value` tokens before the note finalizes. Widening the
+    // type or bypassing nat64Field here reopens F3; scripts/consensus-seam-guard.sh refuses it.
     let inputs = switch (serializePublicInputs([args.commitment, nat64Field(args.value)])) {
       case (?encoded) encoded;
       case null return mutation("REJECT:public-input-encoding", "NOT_CALLED");
@@ -4810,7 +4821,7 @@ persistent actor ZkLedger {
     await prepaidPayout(caller, #balance, { owner = caller; subaccount = null }, amount, createdAt)
   };
 
-  /// Pay collected fee revenue out to an account chosen by the operator. Administrator only; the
+  /// Pay collected fee revenue out to an account the administrator chooses. Administrator only; the
   /// same payout rail as user withdrawals, so revenue is never trapped either.
   public shared ({ caller }) func prepaid_fee_collect(amount : Nat64, to : ICRC2.Account, createdAt : Nat64) : async Result<Nat> {
     switch (guardRejection()) { case (?message) return #err(message); case null {} };
@@ -4903,7 +4914,7 @@ persistent actor ZkLedger {
     // to the raw handle, leaving the oracle open". That stopped being true at a3b82b3, which made
     // publishedIntentId fail CLOSED — an unseeded salt now returns "" and WITHHOLDS the handle.
     // The seeding therefore buys the OBSERVABLE, not the safety: without it a published handle is
-    // empty and the operator loses the correlation, but nothing raw is ever disclosed. Corrected
+    // empty and a monitoring caller loses the correlation, but nothing raw is ever disclosed. Corrected
     // because the stale wording is not inert — it was read as current behaviour during review and
     // produced the confident, wrong conclusion that salting a query path is a no-op.
     await seedIntentPublishSalt();
@@ -4968,6 +4979,12 @@ persistent actor ZkLedger {
     if (not StableBlobSet.contains(historical_roots, args.anchor)) {
       return mutation("REJECT:unknown-anchor", "NOT_CALLED");
     };
+    // CONSENSUS-CRITICAL (audit F1a/F2): the two guards below — nullifier canonicity and
+    // in-transaction nullifier distinctness — are, for a LEGACY verifying key, the ONLY
+    // defenses against the non-canonical-encoding double-spend and the same-note-in-both-slots
+    // value doubling (the legacy circuit enforces neither; the hardened statement enforces
+    // distinctness in-circuit). They must stay ahead of the spent-set membership check and the
+    // spent-set write. Weakening is refused by scripts/consensus-seam-guard.sh.
     // Canonicity co-located with the spent-set write. `fieldSized` only checks the 32-byte length;
     // a non-canonical encoding (nf + k·P, still 32 bytes) reduces to a spent nullifier's field
     // element at the verifier yet is a byte-distinct key in `spent_nullifiers`, so a size-only gate

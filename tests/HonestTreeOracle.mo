@@ -32,14 +32,14 @@ persistent actor HonestTreeOracle {
 
   /// Byte-for-byte the ledger's frontierAppend, including the order of the six rejections.
   func frontierAppend(state : TreeState, leaves : [Text]) : TreeTransition {
-    if (state.filled.size() != PoseidonTree.DEPTH) return { state = null; error = ?"REJECT:frontier-length" };
+    if (state.filled.size() != PoseidonTree.FILLED_LEN) return { state = null; error = ?"REJECT:frontier-length" };
     if (leaves.size() == 0 or leaves.size() > 2) return { state = null; error = ?"REJECT:leaf-count" };
     if (state.next_index > ((1 : Nat64) << 32) -% Nat64.fromNat(leaves.size())) {
       return { state = null; error = ?"REJECT:tree-full" };
     };
-    let filled = Prim.Array_init<Nat>(PoseidonTree.DEPTH, 0);
+    let filled = Prim.Array_init<Nat>(PoseidonTree.FILLED_LEN, 0);
     var level : Nat = 0;
-    while (level < PoseidonTree.DEPTH) {
+    while (level < PoseidonTree.FILLED_LEN) {
       switch (PoseidonTree.hexToNat(state.filled[level])) {
         case (?value) filled[level] := value;
         case null return { state = null; error = ?"REJECT:frontier-field" };
@@ -90,7 +90,7 @@ persistent actor HonestTreeOracle {
     {
       state = ?{
         filled = Array.map<Nat, Text>(f.filled, PoseidonTree.natToHex);
-        root = PoseidonTree.natToHex(z[PoseidonTree.DEPTH]);
+        root = PoseidonTree.natToHex(z[PoseidonTree.LEVELS]);
         next_index = 0;
       };
       error = null;

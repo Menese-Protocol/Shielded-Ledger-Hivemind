@@ -186,7 +186,7 @@ module {
     // entry_count could finish under another -- while the sibling StableBlobSet.countTagsRange has
     // always taken a CAPTURED count. Two validators of the same shape disagreed on which bound is
     // authoritative. The caller now captures the bound and passes it, so the walk is clamped to the
-    // state it began with. Thresholds: docs/thresholds/THRESHOLDS-validateindexrange.md
+    // state it began with, matching the sibling's long-standing captured-count behaviour.
     bound : Nat64,
     // The cost bound is a CALLER-SUPPLIED PREDICATE, not an instruction budget read here:
     // StableLog is a storage module and must not acquire a scheduling dependency on Prim. Main.mo

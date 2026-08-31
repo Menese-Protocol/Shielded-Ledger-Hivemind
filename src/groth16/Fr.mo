@@ -16,6 +16,11 @@ module {
   public let P : Nat =
     0x73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001;
 
+  // CONSENSUS-CRITICAL (audit F2): the verifier's input decode (Groth16Wire.frFromLe) REJECTS
+  // any 32-byte encoding >= P through this predicate. "Optimizing" it (or its caller) to
+  // reduce mod P instead of rejecting would give one field element two byte encodings and
+  // reopen the byte-keyed-set double-spend the decode currently blocks. Weakening is refused
+  // by scripts/consensus-seam-guard.sh and exercised by scripts/consensus-decode-regression.mjs.
   public func isCanonical(a : Nat) : Bool { a < P };
 
   public func add(a : Nat, b : Nat) : Nat { (a + b) % P };

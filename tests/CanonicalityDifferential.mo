@@ -3,7 +3,7 @@
 /// `deserialize_compressed`). Runs as a WASI program (moc -wasi-system-api, wasmtime).
 ///
 /// The corpus and the oracle's verdict for each entry are GENERATED into
-/// `CanonicalityVectors.mo` by `scripts/canonicality-battery.sh`. Nothing here is
+/// `CanonicalityVectors.mo` by `frontier-oracle canonical`. Nothing here is
 /// hand-transcribed, so a divergence cannot be papered over by editing an expectation.
 ///
 /// Traps on the FIRST disagreement with the entry name, the hex, and both verdicts.

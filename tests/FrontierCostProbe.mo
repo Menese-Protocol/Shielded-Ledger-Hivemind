@@ -1,6 +1,6 @@
 /// MEASUREMENT HARNESS — in-canister Poseidon frontier cost :
 /// instructions + allocation for 1 permutation, 1 merkle compress, 1 frontier append
-/// (32 compresses), a 2-leaf append (the transfer shape), and the one-time
+/// (16 compresses), a 2-leaf append (the transfer shape), and the one-time
 /// zeroHashes() init. AuditCostProbe.mo pattern: TEST/HARNESS INFRASTRUCTURE ONLY,
 /// never installed as the ledger. Menese DeFi Team.
 
@@ -43,14 +43,17 @@ persistent actor FrontierCostProbe {
     (i1 - i0, a1 - a0)
   };
 
-  /// `iters` chained 2-to-1 compressions.
+  /// `iters` chained ARITY-to-1 compressions.
   public func measure_compress(iters : Nat) : async (Nat64, Nat) {
     var l : Nat = 1;
     var r : Nat = 2;
     let (i0, a0) = counters();
     var i : Nat = 0;
     while (i < iters) {
-      let out = PoseidonTree.merkleCompress(l, r);
+      // Chain a full row so the probe measures a REAL level, not a degenerate one:
+      // an all-identical row would still cost one permutation, but it is not the shape
+      // `append` actually feeds the sponge.
+      let out = PoseidonTree.merkleCompress([l, r, l, r]);
       l := r;
       r := out;
       i += 1;
@@ -60,7 +63,7 @@ persistent actor FrontierCostProbe {
     (i1 - i0, a1 - a0)
   };
 
-  /// `count` sequential appends from the empty tree (each = 32 compresses + frontier
+  /// `count` sequential appends from the empty tree (each = 16 compresses + frontier
   /// rebuild). Returns (instr, alloc, final nextIndex).
   public func measure_append(count : Nat) : async (Nat64, Nat, Nat) {
     let zeros = PoseidonTree.zeroHashes();
@@ -79,17 +82,17 @@ persistent actor FrontierCostProbe {
     (i1 - i0, a1 - a0, Nat64.toNat(frontier.nextIndex))
   };
 
-  /// One-time zeroHashes() init cost (32 compresses + array build).
+  /// One-time zeroHashes() init cost (LEVELS compresses + array build).
   public func measure_zero_hashes() : async (Nat64, Nat) {
     let (i0, a0) = counters();
     let zeros = PoseidonTree.zeroHashes();
     let (i1, a1) = counters();
-    sink := zeros[32];
+    sink := zeros[PoseidonTree.LEVELS];
     (i1 - i0, a1 - a0)
   };
 
   /// The full transfer-shaped tree step: 2 appends + both wire codec directions
-  /// (hex parse of 32 filled + root, hex emit of 32 filled + root), i.e. everything
+  /// (hex parse of FILLED_LEN filled + root, hex emit of FILLED_LEN filled + root), i.e. everything
   /// the in-canister transition adds to one confidential_transfer message.
   public func measure_transfer_step() : async (Nat64, Nat) {
     let zeros = PoseidonTree.zeroHashes();

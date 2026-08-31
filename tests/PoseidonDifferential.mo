@@ -34,8 +34,9 @@ func checkText(family : Text, index : Nat, got : Text, expected : Text) {
 func runFixture(
   name : Text,
   perm : [(Nat, Nat, Nat, Nat, Nat, Nat)],
+  permTree : [([Nat], [Nat])],
   hashN : [([Nat], Nat)],
-  compress : [(Nat, Nat, Nat)],
+  compress : [([Nat], Nat)],
   zeros : [Nat],
   zerosHex : [Text],
   seqLeaves : [Nat],
@@ -56,6 +57,21 @@ func runFixture(
     i += 1;
   };
 
+  // raw permutation, TREE instance (width ARITY+1). Verified BEFORE compress/zeros/append,
+  // which are all built on it — bottom of the tower first, so a divergence names the
+  // permutation rather than surfacing as a wrong root three layers up.
+  i := 0;
+  for ((inputs, outputs) in permTree.vals()) {
+    let got = P.permuteTree(inputs);
+    if (got.size() != outputs.size()) { Runtime.trap(name # ": permTree width drift") };
+    var lane : Nat = 0;
+    while (lane < outputs.size()) {
+      check(name # ".permTree." # Nat.toText(lane), i, got[lane], outputs[lane]);
+      lane += 1;
+    };
+    i += 1;
+  };
+
   // sponge hash_n
   i := 0;
   for ((inputs, expected) in hashN.vals()) {
@@ -63,10 +79,10 @@ func runFixture(
     i += 1;
   };
 
-  // merkle compress
+  // merkle compress (ARITY children in, one node out)
   i := 0;
-  for ((l, r, expected) in compress.vals()) {
-    check(name # ".compress", i, P.merkleCompress(l, r), expected);
+  for ((children, expected) in compress.vals()) {
+    check(name # ".compress", i, P.merkleCompress(children), expected);
     i += 1;
   };
 
@@ -110,7 +126,7 @@ func runFixture(
       root := r;
     };
     var level : Nat = 0;
-    while (level < 32) {
+    while (level < P.FILLED_LEN) {
       check(name # ".synthFilled." # Nat.toText(level), i, f.filled[level], filledOut[level]);
       level += 1;
     };
@@ -122,7 +138,7 @@ func runFixture(
 
   // hex codec roundtrip + rejection paths on fixture data
   i := 0;
-  for ((_, _, expected) in compress.vals()) {
+  for ((_, expected) in compress.vals()) {
     switch (P.hexToNat(P.natToHex(expected))) {
       case (?back) check(name # ".hexRoundtrip", i, back, expected);
       case null Runtime.trap(name # ": hex roundtrip returned null at " # Nat.toText(i));
@@ -146,12 +162,25 @@ func runFixture(
   Prim.debugPrint(name # ": " # Nat.toText(total - base) # " comparisons green");
 };
 
+// Tree-shape invariants. `ARITY ** LEVELS == CAPACITY` is a compile-time assertion on the
+// Rust side; re-check it here because the two sides are separate codebases and a mismatch
+// is either leaves the ledger can index but the tree cannot hold, or levels that can never
+// be reached. Cheap, and it fails before any 1.2 MB fixture is touched.
+if (P.FILLED_LEN != P.LEVELS * P.ARITY) { Runtime.trap("FILLED_LEN != LEVELS * ARITY") };
+if (P.ARITY ** P.LEVELS != Nat64.toNat(P.CAPACITY)) {
+  Runtime.trap("ARITY ** LEVELS != CAPACITY — tree shape does not cover the index space exactly");
+};
+Prim.debugPrint(
+  "shape: arity=" # Nat.toText(P.ARITY) # " levels=" # Nat.toText(P.LEVELS)
+  # " filled=" # Nat.toText(P.FILLED_LEN) # " capacity=2^32  OK"
+);
+
 runFixture(
-  "seedA", A.perm, A.hashN, A.compress, A.zeros, A.zerosHex,
+  "seedA", A.perm, A.permTree, A.hashN, A.compress, A.zeros, A.zerosHex,
   A.seqLeaves, A.seqRoots, A.seqRootsHex, A.denseCheck, A.synth,
 );
 runFixture(
-  "seedB", B.perm, B.hashN, B.compress, B.zeros, B.zerosHex,
+  "seedB", B.perm, B.permTree, B.hashN, B.compress, B.zeros, B.zerosHex,
   B.seqLeaves, B.seqRoots, B.seqRootsHex, B.denseCheck, B.synth,
 );
 

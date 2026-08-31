@@ -30,9 +30,9 @@ persistent actor MaliciousTreeOracle {
   func zeros() : [Nat] { PoseidonTree.zeroHashes() };
 
   func honestAppend(state : TreeState, leaves : [Text]) : Transition {
-    if (state.filled.size() != PoseidonTree.DEPTH) return { state = null; error = ?"REJECT:frontier-length" };
+    if (state.filled.size() != PoseidonTree.FILLED_LEN) return { state = null; error = ?"REJECT:frontier-length" };
     if (leaves.size() == 0 or leaves.size() > 2) return { state = null; error = ?"REJECT:leaf-count" };
-    let filled = Array.tabulate<Nat>(PoseidonTree.DEPTH, func(i) {
+    let filled = Array.tabulate<Nat>(PoseidonTree.FILLED_LEN, func(i) {
       switch (PoseidonTree.hexToNat(state.filled[i])) { case (?v) v; case null 0 };
     });
     let zs = zeros();
@@ -58,8 +58,8 @@ persistent actor MaliciousTreeOracle {
     let zs = zeros();
     {
       state = ?{
-        filled = Array.tabulate<Text>(PoseidonTree.DEPTH, func(i) { PoseidonTree.natToHex(zs[i]) });
-        root = PoseidonTree.natToHex(zs[PoseidonTree.DEPTH]);
+        filled = Array.tabulate<Text>(PoseidonTree.FILLED_LEN, func(i) { PoseidonTree.natToHex(zs[i / PoseidonTree.ARITY]) });
+        root = PoseidonTree.natToHex(zs[PoseidonTree.LEVELS]);
         next_index = 0;
       };
       error = null;
@@ -83,7 +83,7 @@ persistent actor MaliciousTreeOracle {
               case (#wrong_root) { { state = ?{ good with root = FABRICATED_ROOT }; error = null } };
               case (#truncated) { { state = ?{ good with root = state.root }; error = null } };
               case (#wrong_frontier) {
-                let corrupted = Array.tabulate<Text>(PoseidonTree.DEPTH, func(i) {
+                let corrupted = Array.tabulate<Text>(PoseidonTree.FILLED_LEN, func(i) {
                   if (i == 0) FABRICATED_ROOT else good.filled[i]
                 });
                 { state = ?{ good with filled = corrupted }; error = null }
