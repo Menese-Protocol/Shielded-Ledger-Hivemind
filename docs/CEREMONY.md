@@ -83,11 +83,55 @@ parameters. After the beacon the parameters are frozen.
 
 ## 4. How to contribute
 
-You need a modern browser and an Internet Computer principal (an Internet Identity works).
+You need a modern browser and an Internet Identity.
 
-1. Open the contributor page (`demo-frontend/contributor-client/`). Enter the coordinator canister
-   id and host.
-2. Sign in. Your principal is shown.
+### The live addresses, and their hashes
+
+```
+coordinator canister    osqjo-zyaaa-aaaad-agxua-cai
+  module SHA-256        ce34f578fa583f9ff785f3a9c235d801b7fd36dde50e1db985c7e6cefc6fe616
+  controllers           none
+contributor page        ovrp2-uaaaa-aaaad-agxuq-cai
+  served at             https://ovrp2-uaaaa-aaaad-agxuq-cai.icp0.io
+  module SHA-256        04e565b3425fe7510ee16b02adcfe3f01abc9a2725c82a21cb08969241debd62
+API host                https://icp-api.io
+```
+
+**Check the coordinator id on the page against the one printed here before you contribute.** The
+page carries the id baked in and shows it read-only for exactly this reason: an id you are asked to
+type is an id an attacker can substitute, whether through a look-alike page or a wrong id pasted
+into a chat. These two documents are published independently, so agreement between them is evidence;
+a page whose id disagrees with this line is not the ceremony.
+
+You do not have to take any of the four values above on trust. Each is checkable, and each proves
+something different:
+
+| check | command | what it establishes |
+|---|---|---|
+| the coordinator is this source | `dfx canister info osqjo-zyaaa-aaaad-agxua-cai --network ic` — the module hash must equal `coordinator/BUILD-HASH.txt`, which `coordinator/verify-build.sh` reproduces from source | the canister taking your contribution is the reviewed, reproducibly-built binary and not something else wearing its id |
+| nobody can change it | the same command must print an **empty** `Controllers:` line | the coordinator is blackholed. No key — ours, yours, or a stolen one — can upgrade it, so the transcript cannot be rewritten out from under the contributors after the fact |
+| the page is a stock asset canister | its module hash is dfx 0.32.0's own `assetstorage.wasm.gz`; reproduce by running `dfx deploy` for any asset canister on dfx 0.32.0 and hashing `.dfx/<network>/canisters/<name>/assetstorage.wasm.gz` | the page is served by the standard, audited asset canister, which serves the same certified content to everyone. A bespoke canister could serve one script to an auditor and another to a contributor |
+| the page is this source | `scripts/verify-published-page.py` | every file the site serves matches this repository byte for byte, and — the direction that catches an attack — the site serves **nothing extra** |
+Run the last one from a checkout of the commit you reviewed; it compares against your working tree,
+so it is only as meaningful as the tree you point it at.
+
+There is deliberately **no fifth row** for "the compiled client rebuilds from source to those exact
+bytes", because that check does not hold yet. See section 7.
+
+### The steps
+
+1. Open the contributor page. The coordinator id and host are already filled in and locked.
+2. Sign in with Internet Identity. Your principal is shown. Sign-in is mandatory, not a convenience:
+   every anonymous caller on the Internet Computer shares one principal, so an anonymous contributor
+   cannot be told apart from any other participant, and the count of independent participants is the
+   whole assurance argument of section 3.
+
+   **The sign-in window will show `id.ai`.** That is the current Internet Identity — the page asks
+   for `https://identity.ic0.app`, which redirects there. Before you approve, check that the window
+   names the relying party as `ovrp2-uaaaa-aaaad-agxuq-cai.icp0.io`; that line is what binds the
+   credential to this ceremony page, and a sign-in window naming any other origin is not this
+   ceremony. Your principal is derived per-origin, so it is stable for this page and reveals
+   nothing about your identity elsewhere.
 3. Click "Join the queue". You will see your position.
 4. When it is your turn the page shows "YOUR TURN". Click "Contribute now". The page downloads the
    current parameters, samples and applies your secret in the browser, uploads the result, and
@@ -144,17 +188,19 @@ parameters; the Perpetual Powers of Tau and snarkjs `powersOfTau28_hez` are on t
 BLS12-381; and running our own fresh Phase-1 would rest on a smaller participant set than the
 reviewed Zcash setup and is discouraged by `docs/TRUSTED-SETUP-POLICY.md`. The Zcash Sapling powers
 of tau is the reviewed, curve-correct, Groth16-shaped Phase-1 the policy calls for, and power 21
-comfortably covers our required 15.
+comfortably covers our required 14.
 
 Ingestion is verified, never blind. The tool `ceremony-cli import-ptau` reads the pinned Sapling
-response file, extracts the first 2^15 powers into the arkworks representation this repository uses,
+response file, extracts the powers the target domain needs into the arkworks representation this
+repository uses (target power 14 for the live set, which is 32767 G1 tau powers),
 runs the full pairing consistency check over the extracted string, and REFUSES to proceed on any
 failure. It records the provenance (the upstream URL, the response-file SHA-256, the extracted-SRS
 SHA-256, and the participant attestation set) into a `PROVENANCE.json`. A string is never consumed
 without this structural check, so a wrong file or a wrong sub-format is rejected rather than trusted.
 
 For local testing and the valueless demo, the same Phase-2 machinery runs against a locally generated
-power-15 string that is structurally identical but carries a test-tier provenance label and is never
+string at the same power as the circuit's domain (`ceremony-cli gen-srs <power>`), structurally
+identical but carrying a test-tier provenance label and never
 eligible for a real-value keyset. The Phase-2 code path is byte-identical for both; only the Phase-1
 bytes differ, and swapping in the inherited string is a launch step for whoever runs the ceremony.
 
@@ -167,15 +213,57 @@ trustlessly auditable. The coordinator wasm builds deterministically.
   `coordinator/BUILD-HASH.txt`.
 - Verify a build: `coordinator/verify-build.sh` rebuilds from source and asserts the hash matches.
 - Cross-machine: `coordinator/Dockerfile` pins the toolchain.
-- Toolchain pins: dfx 0.31.0, moc 1.1.0, mops 2.8.0, mops packages core 1.0.0 and sha2 0.1.9. The
-  build invokes the moc shipped with dfx, never a system `moc`.
+- Toolchain pins: dfx 0.32.0, moc 1.4.1 (the moc shipped with that dfx), mops 2.8.0 CLI, mops
+  packages core 1.0.0 and sha2 0.1.9. The build invokes the moc shipped with dfx, never a system
+  `moc` — a system `moc` of the same version number is not the same compiler build. These pins are
+  the ones `coordinator/build.sh` and `coordinator/verify-build.sh` actually assert; if this list and
+  those scripts ever disagree, the scripts are authoritative and this line is the stale one.
 
 Two clean builds on the pinned toolchain produce a byte-identical wasm. The published coordinator
 wasm SHA-256 is recorded in `coordinator/BUILD-HASH.txt`. To confirm a deployed coordinator was built
-from this source, compare the deployed module hash to that value, or run `verify-build.sh`.
+from this source, compare the deployed module hash to that value, or run `verify-build.sh`. The
+live coordinator's deployed module hash is published in section 4 alongside the contributor page's,
+with the command for checking each.
 
-The standalone verifier and the contributor client are Rust and wasm builds pinned by their
-`Cargo.lock` files and the shared `ceremony` crate.
+The contributor page needs verifying in two separate senses, and conflating them leaves a hole.
+
+**The canister.** The page's wasm is not ours — it is dfx's stock asset canister — so what matters
+is not that binary's provenance but the **content it serves**. `scripts/verify-published-page.py`
+compares the SHA-256 the canister publishes for every asset against this repository, in both
+directions, so a page serving one extra script fails rather than passing on a subset match.
+
+**The client itself — an open gap, stated plainly.** The wasm inside that page is where your secret
+is sampled and destroyed, so it is the artifact you have the most reason to check, and it is the one
+we cannot yet let you check to the standard it deserves.
+
+What is fixed: it is built by `demo-frontend/contributor-wasm/build.sh`, which pins rustc
+(`rust-toolchain.toml`), wasm-pack and wasm-opt, and remaps the repository root and `CARGO_HOME` out
+of the binary. That last part mattered — `rustc` bakes absolute source paths into a binary, so
+before this the same source built in two different directories produced entirely different output,
+and no contributor could have matched our build from their own checkout even in principle.
+`demo-frontend/contributor-wasm/Dockerfile` pins the toolchain for building on another machine.
+
+What is not fixed: the build still settles into one of **two** outputs that differ in three bytes.
+Those bytes are `i32.const` immediates pointing into the data section, and the difference is the
+order of three 48-byte constants — the size of a BLS12-381 field element. The behaviour survives
+`codegen-units = 1` and `lto = false`, and neither `wasm-opt` nor wasm-bindgen is the source: each
+is deterministic in isolation. It has the signature of a container ordered by memory address inside
+the compiler, a documented class of Rust reproducibility bug.
+
+Because of that, no byte-level reproducibility is claimed for the client, and nothing in this
+repository asks you to require an exact rebuild match. We are not treating "only three bytes" as
+close enough: those bytes are pointers, and repointing a constant is exactly the shape a malicious
+edit would take, so a checker that tolerated it would be a hole rather than a convenience.
+
+The compiled `pkg/` is deliberately not tracked — a contributor should build the client rather than
+receive a binary from us — and `PKG-HASHES.txt` records what we built and deployed, so
+`verify-published-page.py` can confirm the live page still serves exactly that. Read it as what it
+is: evidence the page has not changed since publication, and our own record of our own build, not a
+proof you can derive independently. Until the build reproduces exactly, the honest basis for
+trusting the client is reading `demo-frontend/contributor-wasm/src/lib.rs`, which is 133 lines.
+
+The standalone verifier is a Rust build pinned by its `Cargo.lock` and the shared `ceremony` crate,
+which is the same contribution code the browser client and the coordinator use.
 
 ## 8. Honest limits
 

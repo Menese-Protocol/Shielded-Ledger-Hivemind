@@ -93,6 +93,10 @@
     "coordinator": {
       "main": "coordinator/src/Main.mo",
       "type": "motoko"
+    },
+    "ceremony_client": {
+      "type": "assets",
+      "source": ["demo-frontend/contributor-client"]
     }
   },
   "networks": {

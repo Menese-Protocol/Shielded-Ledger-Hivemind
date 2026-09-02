@@ -33,3 +33,9 @@ ark-ec = "0.5"
 [profile.release]
 opt-level = 3
 lto = true
+# Reproducibility, not speed. With fat LTO over multiple codegen units the linker's merge order is
+# not stable run to run, and this build produced an intermittently different wasm because of it --
+# which in a ceremony reads as tampering. One codegen unit removes the parallelism that varies.
+# This is the standard reproducible-builds setting for Rust; the build is slower and the output is
+# the same every time, which is the trade this artifact wants.
+codegen-units = 1

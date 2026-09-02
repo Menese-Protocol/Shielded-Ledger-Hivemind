@@ -2,17 +2,28 @@
 //!
 //! Drives the REAL compiled coordinator wasm through a local IC replica and asserts the
 //! canister-level battery items:
-//!   - the coordinator ACCEPTS a valid contribution (on-chain proof-of-knowledge verification), and
-//!   - REJECTS a tampered proof;
+//!   - the coordinator ACCEPTS a valid contribution (on-chain STRUCTURAL check), and
+//!   - REJECTS a structurally-invalid proof (off-curve / non-canonical points);
 //!   - contributions are rejected before start_time and after end_time (window);
 //!   - a stalled contributor times out and the slot advances (queue);
 //!   - finalize mixes the public beacon and freezes further contributions;
 //!   - a full dump of canister state contains NO secret (only public params, proofs, hashes).
 //!
+//! 🔴 THIS BATTERY DOES NOT EXERCISE ON-CHAIN PROOF-OF-KNOWLEDGE VERIFICATION, because the
+//! coordinator does not perform one: `checkOneCircuit` calls `PokVerify.structuralCheck`, never
+//! `verifyPok`. This header previously claimed "on-chain proof-of-knowledge verification" and
+//! labelled the accept case "(on-chain PoK)" — the same false claim that `coordinator.did`'s header
+//! was rewritten to retract, and false in the direction that overstates what the canister enforces.
+//! The soundness-critical subgroup + pairing checks run OFF-CHAIN in the standalone verifier only.
+//! What is byte-identical between here and the verifier is the STRUCTURAL check, not the PoK.
+//!
 //! It uses tiny but REAL delta parameters (delta at the generators, one H and one L point) so the
-//! on-chain PoK path is exercised end to end without uploading 2.5 MB. The full-transcript
-//! correctness (D4 accepts, keys work) is proven separately by the pure-Rust ceremony + the
-//! cross-language PoK equivalence test; the on-chain PoK here is byte-identical to the one D4 runs.
+//! acceptance path is exercised end to end without uploading 2.5 MB. Two consequences worth naming:
+//! the real-size chunked upload and the `finish_init` length check are NOT covered here (they are
+//! rehearsed against a live replica with the actual 2,948,360 B transfer payload, per
+//! `ceremony-launch-p14/LAUNCH-RUNBOOK.md`), and full-transcript correctness (D4 accepts, keys
+//! work) is proven separately by the pure-Rust ceremony plus the cross-language PoK equivalence
+//! test.
 
 use ark_bls12_381::{G1Affine, G2Affine};
 use ark_ec::AffineRepr;
@@ -177,7 +188,7 @@ fn main() {
 
     // ---- window before start test needs a fresh canister; instead test AFTER end below. ----
 
-    println!("\n== valid contribution accepted (on-chain PoK) ==");
+    println!("\n== valid contribution accepted (on-chain STRUCTURAL check, not PoK) ==");
     expect_ok(h.upd(alice, "join_queue", Encode!().unwrap()), "alice join_queue");
     expect_ok(h.upd(alice, "begin_contribution", Encode!().unwrap()), "alice begin_contribution");
     let info = h.info();

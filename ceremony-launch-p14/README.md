@@ -89,18 +89,42 @@ comment exists to prevent.
 
 ## Status
 
-These are PRE-ceremony **opening** parameters. Production verifying keys come only from
-contributions plus the beacon finalize, per `docs/CEREMONY.md`. Nothing here is real-value
-eligible yet and nothing here touches mainnet.
+These are the PRE-ceremony **opening** parameters, and they are now the ones a live coordinator is
+serving. Production verifying keys still come only from contributions plus the beacon finalize, per
+`docs/CEREMONY.md`; nothing here is real-value eligible yet.
 
-**Still required before contributions can be opened:**
+**Launched 2026-09-01.** Full record in `LAUNCH-RUNBOOK.md` section 1a.
 
-1. A deployed coordinator. There is none; the Aug-24 launch did not deploy one either.
-2. The coordinator must serve THESE power-14 opening parameters, not the Aug-24 power-16 set
-   and not the Jul-18 set.
-3. `PHASE1-PIN.md` should gain the power-14 extraction
-   record above. The p15 and p16 artifacts remain valid history.
+```
+coordinator      osqjo-zyaaa-aaaad-agxua-cai   module ce34f578… , no controllers
+contributor page ovrp2-uaaaa-aaaad-agxuq-cai   module 04e565b3… (stock dfx asset canister)
+```
+
+1. ~~A deployed coordinator. There is none.~~ **Done.** Installed from the published wasm with
+   `--wasm` rather than `dfx deploy`, which would have rebuilt and broken the hash equality; the
+   deployed module hash was checked against `BUILD-HASH.txt` *before* `configure` was called, and
+   the canister was then blackholed, so the transcript cannot be rewritten afterwards.
+2. ~~The coordinator must serve THESE power-14 opening parameters.~~ **Confirmed on the live
+   canister**, not merely intended: `get_ceremony_info` reports `power = 14` and
+   `srs_sha256 = 94f26895…`, `get_current_params_meta` reports 2,948,360 / 168,200 bytes, and the
+   opening parameters were pulled back off the chain through the same query path the browser client
+   uses and found **byte-identical** to the artifacts in this directory.
+3. ~~`PHASE1-PIN.md` should gain the power-14 extraction record above.~~ **Withdrawn 2026-09-01:
+   no such file has ever existed in this repository's history.** The Phase-1 pin for the live set is
+   recorded in `PROVENANCE-p14.json` and restated under "Provenance" above; those two are the pin.
+   The p15 and p16 artifacts remain valid history.
 4. These parameters are valid only while `circuit/common` is unchanged. Any further circuit
    edit re-stales them, exactly as happened twice already.
+   **Re-checked 2026-09-01 at launch: still holds.** Correcting an earlier count in this file:
+   there are **two** commits touching `circuit/` since the SRS was extracted at 09:26, not one —
+   `9398de6` (a comment in `circuit/common/tests/violation_matrix.rs`) and `057c624` (a field
+   rename in `circuit/gen/tests/setup_guard.rs`, adapting a test to the 4-ary tree). Both are
+   test-only, so no non-test circuit source has moved and the conclusion is unchanged. A third
+   commit, `0be21b0`, does touch `circuit/common/src/lib.rs` but landed at 09:09, seventeen
+   minutes *before* the extraction, so it is baked into these parameters rather than a divergence
+   from them.
+   `verify-transcript --selfcheck` re-run on this date against the current tree reproduces the
+   recorded opening vk hashes exactly, with `TRANSCRIPT VALID` and `KEYS WORK`. Re-run that check
+   immediately before launching rather than trusting this line.
 
 Menese DeFi Team

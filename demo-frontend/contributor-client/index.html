@@ -5,61 +5,397 @@
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Shielded ledger — Phase-2 trusted-setup contributor</title>
 <style>
-  :root { color-scheme: light dark; }
-  body { font: 15px/1.5 system-ui, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; }
-  h1 { font-size: 1.4rem; }
-  .card { border: 1px solid #8884; border-radius: 10px; padding: 1rem 1.2rem; margin: 1rem 0; }
-  button { font: inherit; padding: .5rem 1rem; border-radius: 8px; border: 1px solid #8886; cursor: pointer; }
-  button:disabled { opacity: .5; cursor: default; }
-  .row { display: flex; gap: .6rem; align-items: center; flex-wrap: wrap; }
-  .mono { font-family: ui-monospace, monospace; font-size: .82rem; word-break: break-all; }
-  .ok { color: #178a3a; } .warn { color: #b26a00; } .err { color: #c02626; }
-  #log { white-space: pre-wrap; }
-  label { display: inline-flex; gap: .4rem; align-items: center; }
-  input { font: inherit; padding: .35rem .5rem; border-radius: 6px; border: 1px solid #8886; }
+  /* ---------------------------------------------------------------------------------------------
+     Deep lapis ground, gold leaf, limestone text. The ceremony produces a sealed public record,
+     so the register is an instrument of attestation rather than a control panel: a serif for the
+     voice, monospace for every value a contributor is expected to check, and gold reserved almost
+     entirely for the chain — the one thing on this page that carries the trust argument.
+
+     Sections are set as a record: a left rail of small-caps labels against a right column of
+     content, the way a certificate or a lab notebook separates what a field IS from what it SAYS.
+
+     No webfonts by design. The Content-Security-Policy on this canister is font-src 'self', and a
+     page that samples a ceremony secret has no business pulling a resource from a third party it
+     cannot vouch for.
+     --------------------------------------------------------------------------------------------- */
+  :root {
+    color-scheme: dark;
+    --ink:        #080f1e;
+    --ink-1:      #0c1730;
+    --ink-2:      #12213f;
+    --lapis:      #1b3563;
+    --hair:       #1d2f52;
+    --gold:       #e0b13c;
+    --gold-dim:   #977930;
+    --limestone:  #ece5d5;
+    --muted:      #8496b4;
+    --verdigris:  #56b394;
+    --carnelian:  #dd6a51;
+
+    --font-display: ui-serif, Georgia, "Iowan Old Style", "Palatino Linotype", Palatino, serif;
+    --font-ui: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --font-data: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+
+    --measure: 58ch;
+    --rail: 150px;
+    --gut: 2.75rem;
+  }
+
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    background: var(--ink);
+    background-image: radial-gradient(115% 58% at 50% -14%, #16294d 0%, rgba(22,41,77,0) 60%);
+    background-repeat: no-repeat;
+    color: var(--limestone);
+    font: 16px/1.62 var(--font-ui);
+  }
+  .shell { max-width: 1040px; margin: 0 auto; padding: 0 clamp(1.1rem, 4vw, 2.5rem); }
+  .measure { max-width: var(--measure); }
+
+  /* --- masthead ------------------------------------------------------------------------------ */
+  header.masthead {
+    display: flex; align-items: center; gap: 1rem; flex-wrap: wrap;
+    padding: 1.35rem 0 1.15rem; border-bottom: 1px solid var(--hair);
+  }
+  .wordmark { display: flex; align-items: center; gap: .6rem; margin-right: auto; flex-wrap: wrap; }
+  .wordmark svg { width: 15px; height: 15px; flex: none; }
+  .wordmark b, .wordmark span {
+    font: 600 .8125rem/1 var(--font-ui); letter-spacing: .19em; text-transform: uppercase;
+  }
+  .wordmark span { font-weight: 400; color: var(--muted); }
+  .pill {
+    display: inline-flex; align-items: center; gap: .5rem;
+    font: 500 .6875rem/1 var(--font-data); letter-spacing: .14em; text-transform: uppercase;
+    padding: .42rem .72rem; border: 1px solid var(--hair); border-radius: 100px; color: var(--muted);
+    white-space: nowrap;
+  }
+  .pill .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; flex: none; }
+  .pill.live { color: var(--verdigris); border-color: #24614e; }
+  .pill.live .dot { box-shadow: 0 0 0 3px rgba(86,179,148,.16); }
+  .pill.sealed { color: var(--gold); border-color: var(--gold-dim); }
+
+  /* --- hero ---------------------------------------------------------------------------------- */
+  .hero { padding: clamp(2.8rem, 8vw, 5rem) 0 clamp(2.2rem, 5vw, 3.2rem); }
+  h1 {
+    font: 400 clamp(2.1rem, 5.4vw, 3.45rem)/1.06 var(--font-display);
+    letter-spacing: -.021em; margin: 0 0 1.5rem; max-width: 15ch;
+  }
+  h1 em { font-style: normal; color: var(--gold); }
+  .lede { color: #c6cee0; margin: 0 0 1.05rem; font-size: 1.0625rem; }
+  .lede strong { color: var(--limestone); font-weight: 600; }
+
+  /* --- record rows: label rail + content ------------------------------------------------------ */
+  section {
+    display: grid; grid-template-columns: var(--rail) minmax(0, 1fr); gap: 0 var(--gut);
+    padding: clamp(1.9rem, 4.4vw, 2.75rem) 0; border-top: 1px solid var(--hair);
+  }
+  .rail { grid-column: 1; }
+  .rail h2 {
+    font: 500 .6875rem/1.5 var(--font-data);
+    letter-spacing: .2em; text-transform: uppercase; color: var(--gold-dim); margin: .15rem 0 0;
+  }
+  .rail p {
+    font: .6875rem/1.6 var(--font-data); color: var(--muted); margin: .6rem 0 0;
+    letter-spacing: .02em;
+  }
+  .body { grid-column: 2; min-width: 0; }
+
+  /* --- the chain: the signature element -------------------------------------------------------
+     Every link is a seal glyph derived, by pure function, from that contribution's own delta hash,
+     with the leading bytes of that hash printed beneath it. Not decoration and not random: it is
+     the value on the receipt and in the published transcript, drawn. That is what lets a
+     contributor point at the chain and recognise their own link. */
+  .chainscroll { overflow-x: auto; padding-bottom: .8rem; }
+  .chain { display: flex; align-items: flex-start; min-width: min-content; }
+  .link { display: flex; flex-direction: column; align-items: center; gap: .6rem; flex: none; width: 92px; }
+  .link .seal {
+    width: 84px; height: 84px; border: 1px solid var(--hair); border-radius: 3px;
+    background: var(--ink-1); padding: 9px;
+  }
+  .link .seal svg { width: 100%; height: 100%; display: block; shape-rendering: crispEdges; }
+  .link.genesis .seal { border-color: var(--gold-dim); background: transparent; }
+  .link.mine .seal { border-color: var(--gold); box-shadow: 0 0 0 3px rgba(224,177,60,.16); }
+  .link.beacon .seal { border-color: var(--verdigris); }
+  .link.slot .seal { border-style: dashed; border-color: var(--lapis); background: transparent; }
+  .link.forging .seal { border-color: var(--gold); border-style: solid; }
+  .link.forging .seal svg { animation: flicker .6s steps(2, end) infinite; }
+  @keyframes flicker { 50% { opacity: .3; } }
+  .link .cap {
+    font: 500 .625rem/1 var(--font-data); letter-spacing: .14em; text-transform: uppercase;
+    color: var(--muted); text-align: center;
+  }
+  .link.mine .cap, .link.genesis .cap { color: var(--gold); }
+  .link .frag { font: .625rem/1 var(--font-data); color: var(--lapis); text-align: center; margin-top: -.25rem; }
+  .connector { flex: none; width: 30px; height: 1px; margin-top: 42px;
+               background: linear-gradient(90deg, var(--hair), var(--lapis)); }
+  .chainscroll::-webkit-scrollbar { height: 7px; }
+  .chainscroll::-webkit-scrollbar-thumb { background: var(--hair); border-radius: 4px; }
+
+  /* --- data ----------------------------------------------------------------------------------- */
+  .vitals { display: grid; grid-template-columns: repeat(auto-fit, minmax(126px, 1fr)); gap: 1px;
+            background: var(--hair); border: 1px solid var(--hair); border-radius: 4px; overflow: hidden; margin: 0; }
+  .vital { background: var(--ink-1); padding: .85rem .95rem; }
+  .vital dt { font: 500 .625rem/1 var(--font-data); letter-spacing: .14em; text-transform: uppercase;
+              color: var(--muted); margin-bottom: .45rem; }
+  .vital dd { margin: 0; font: 400 1.35rem/1.1 var(--font-display); color: var(--limestone); }
+  .vital dd small { font: 400 .6875rem/1 var(--font-data); color: var(--muted); }
+
+  .kv { display: grid; grid-template-columns: minmax(7rem, max-content) minmax(0, 1fr);
+        gap: .5rem 1.4rem; margin: 0; align-items: baseline; }
+  .kv dt { font: 500 .625rem/1.6 var(--font-data); letter-spacing: .12em; text-transform: uppercase; color: var(--muted); }
+  .kv dd { margin: 0; font: .8125rem/1.6 var(--font-data); color: var(--limestone); overflow-wrap: anywhere; }
+  .hash { color: var(--gold); }
+
+  /* --- fields + buttons ------------------------------------------------------------------------ */
+  .field { margin-bottom: .85rem; max-width: 30rem; }
+  .field label { display: block; font: 500 .625rem/1 var(--font-data); letter-spacing: .14em;
+                 text-transform: uppercase; color: var(--muted); margin-bottom: .45rem; }
+  input {
+    font: .875rem/1.4 var(--font-data); width: 100%; padding: .68rem .8rem;
+    background: var(--ink); color: var(--limestone);
+    border: 1px solid var(--hair); border-radius: 4px;
+  }
+  input[readonly] { color: var(--gold); background: rgba(224,177,60,.04); border-color: var(--gold-dim); }
+  input:focus-visible { outline: 2px solid var(--gold); outline-offset: 1px; }
+
+  .actions { display: flex; gap: .6rem; align-items: center; flex-wrap: wrap; }
+  button {
+    font: 500 .875rem/1 var(--font-ui);
+    padding: .72rem 1.15rem; border-radius: 4px; cursor: pointer;
+    border: 1px solid var(--hair); background: var(--ink-2); color: var(--limestone);
+    transition: border-color .15s, background .15s, color .15s;
+  }
+  button:hover:not(:disabled) { border-color: var(--muted); }
+  button:focus-visible { outline: 2px solid var(--gold); outline-offset: 2px; }
+  /* A disabled control reads as an outline, never as a filled button gone muddy — otherwise the
+     unavailable primary action looks heavier than the available secondary one next to it. */
+  button:disabled { cursor: default; background: transparent; color: var(--muted);
+                    border-color: var(--hair); opacity: .55; }
+  button.primary { background: var(--gold); border-color: var(--gold); color: #231903; font-weight: 600; }
+  button.primary:hover:not(:disabled) { background: #efc255; border-color: #efc255; }
+  button.primary:disabled { background: transparent; color: var(--muted); border-color: var(--hair); }
+
+  /* --- banner ---------------------------------------------------------------------------------- */
+  .banner { display: none; align-items: flex-start; gap: .75rem; padding: .85rem 1rem;
+            border-radius: 4px; margin-bottom: 1.15rem; border: 1px solid;
+            font: 500 .875rem/1.5 var(--font-ui); }
+  .banner.show { display: flex; }
+  .banner.turn { color: var(--gold); border-color: var(--gold-dim); background: rgba(224,177,60,.07); }
+  .banner.hold { color: var(--muted); border-color: var(--hair); background: var(--ink-1); }
+  .banner.done { color: var(--verdigris); border-color: #24614e; background: rgba(86,179,148,.07); }
+
+  /* --- the four stages. A real sequence, so it is numbered. ------------------------------------ */
+  #stages { list-style: none; margin: 1.25rem 0 0; padding: 0;
+            display: grid; grid-template-columns: repeat(auto-fit, minmax(152px, 1fr)); gap: 1px;
+            background: var(--hair); border: 1px solid var(--hair); border-radius: 4px; overflow: hidden; }
+  #stages li { background: var(--ink-1); padding: .85rem .95rem; }
+  #stages .n { font: 500 .625rem/1 var(--font-data); letter-spacing: .14em; color: var(--muted); opacity: .6; }
+  #stages .t { font: 500 .8125rem/1.4 var(--font-ui); color: var(--muted); margin-top: .42rem; }
+  #stages .d { font: .6875rem/1.4 var(--font-data); color: var(--gold); margin-top: .35rem; min-height: 1em; }
+  #stages li.active { background: var(--ink-2); }
+  #stages li.active .n { color: var(--gold); opacity: 1; }
+  #stages li.active .t { color: var(--limestone); }
+  #stages li.done .n { color: var(--verdigris); opacity: 1; }
+  #stages li.done .t { color: #bcc7d9; }
+  #stages li.done .d { color: var(--verdigris); }
+
+  #progressWrap { display: none; margin-top: 1.1rem; }
+  #progressWrap.show { display: block; }
+  #progressLabel { font: .75rem/1 var(--font-data); color: var(--muted); margin-bottom: .55rem; }
+  progress { width: 100%; height: 3px; border: 0; background: var(--hair); display: block; }
+  progress::-webkit-progress-bar { background: var(--hair); }
+  progress::-webkit-progress-value { background: var(--gold); }
+  progress::-moz-progress-bar { background: var(--gold); }
+
+  .spinner { width: 12px; height: 12px; border: 2px solid currentColor; border-right-color: transparent;
+             border-radius: 50%; display: inline-block; vertical-align: -2px; margin-right: .15rem;
+             animation: spin .8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  #log { font: .75rem/1.8 var(--font-data); color: var(--muted);
+         background: var(--ink-1); border: 1px solid var(--hair); border-radius: 4px;
+         padding: .8rem 1rem; max-height: 15rem; overflow-y: auto; white-space: pre-wrap; }
+  #log div::before { content: "› "; color: var(--lapis); }
+  #log .ok { color: var(--verdigris); }
+  #log .warn { color: var(--gold); }
+  #log .err { color: var(--carnelian); }
+  #log .empty::before { content: ""; }
+
+  #receipt { display: none; }
+  #receipt.show { display: grid; }
+
+  .note { font: .75rem/1.7 var(--font-data); color: var(--muted); margin: 0 0 1rem; }
+  .note.warn { color: var(--gold); }
+  .note:empty { display: none; }
+
+  footer { border-top: 1px solid var(--hair); padding: 2rem 0 4rem; color: var(--muted); font-size: .875rem; }
+  footer p { max-width: 68ch; }
+  footer code { font-family: var(--font-data); color: #a9b7cd; }
+
+  .rise { animation: rise .7s cubic-bezier(.2,.7,.3,1) both; }
+  .rise-2 { animation-delay: .07s; }
+  .rise-3 { animation-delay: .14s; }
+  @keyframes rise { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
+  @media (prefers-reduced-motion: reduce) {
+    .rise { animation: none; }
+    .link.forging .seal svg { animation: none; opacity: .6; }
+    .spinner { animation-duration: 2.5s; }
+  }
+
+  @media (max-width: 780px) {
+    section { grid-template-columns: 1fr; gap: 0; }
+    .rail, .body { grid-column: 1; }
+    .rail { margin-bottom: 1.15rem; }
+    .rail p { display: none; }   /* the rail note is context, not instruction; drop it when stacked */
+  }
+  @media (max-width: 560px) {
+    .link { width: 72px; } .link .seal { width: 64px; height: 64px; padding: 7px; }
+    .connector { width: 18px; margin-top: 32px; }
+    .kv { grid-template-columns: 1fr; gap: .15rem .8rem; }
+    .kv dd { margin-bottom: .6rem; }
+  }
 </style>
 </head>
 <body>
-  <h1>Phase-2 trusted-setup contributor</h1>
-  <p>
-    You are about to add fresh randomness to the shielded-ledger proving parameters. Your secret is
-    generated, used, and destroyed <strong>in this browser tab</strong>. Only transformed public
-    parameters and a proof of knowledge are uploaded. If even one contributor (you can be that one)
-    destroys their secret honestly, the final parameters are secure.
-  </p>
 
-  <div class="card">
-    <div class="row">
-      <label>Coordinator canister id <input id="canisterId" size="30" placeholder="aaaaa-aa" /></label>
-      <label>Host <input id="host" size="24" value="http://127.0.0.1:4945" /></label>
+<div class="shell">
+
+  <header class="masthead">
+    <div class="wordmark">
+      <svg viewBox="0 0 16 16" aria-hidden="true">
+        <rect x="1" y="1" width="14" height="14" rx="1.5" fill="none" stroke="#e0b13c" stroke-width="1.2"/>
+        <path d="M4.6 8 L8 4.6 L11.4 8 L8 11.4 Z" fill="#e0b13c"/>
+      </svg>
+      <b>Shielded Ledger</b>
+      <span>Phase-2 trusted setup</span>
     </div>
-    <div class="row" style="margin-top:.6rem">
-      <button id="connect">Connect &amp; sign in</button>
-      <span id="whoami" class="mono"></span>
-    </div>
+    <div class="pill" id="phasePill"><span class="dot"></span><span id="phaseText">reading the chain…</span></div>
+  </header>
+
+  <div class="hero rise">
+    <h1>You are about to create a secret, and <em>destroy it</em>.</h1>
+    <p class="lede measure">
+      Your randomness is folded into the shielded ledger's proving parameters right here, in this
+      browser tab. The secret that does it is generated, applied, and discarded before the page
+      finishes its work — only transformed <strong>public</strong> parameters and a proof of
+      knowledge ever leave your machine.
+    </p>
+    <p class="lede measure">
+      The finished parameters are safe if <strong>even one</strong> contributor destroyed their
+      secret honestly. You can be that one. That is the whole of the trust model, and it is why the
+      chain below matters more than any assurance this page could give you.
+    </p>
   </div>
 
-  <div class="card">
-    <h3 style="margin-top:0">Ceremony status</h3>
-    <div id="status" class="mono">not connected</div>
-    <div class="row" style="margin-top:.6rem">
-      <button id="join" disabled>Join the queue</button>
-      <button id="contribute" disabled>Contribute now (my turn)</button>
-      <button id="refresh" disabled>Refresh</button>
+  <!-- ============ the chain ============ -->
+  <section class="rise rise-2">
+    <div class="rail">
+      <h2>The chain</h2>
+      <p id="chainSummary">every link is a seal drawn from that contribution's own hash</p>
     </div>
-  </div>
+    <div class="body">
+      <div class="chainscroll"><div class="chain" id="chain"></div></div>
+      <dl class="kv" style="margin-top:1.1rem">
+        <dt>Running challenge</dt><dd class="hash" id="challengeHex">—</dd>
+      </dl>
+    </div>
+  </section>
 
-  <div class="card">
-    <h3 style="margin-top:0">Activity</h3>
-    <div id="log" class="mono"></div>
-  </div>
+  <!-- ============ vitals ============ -->
+  <section class="rise rise-3">
+    <div class="rail"><h2>Ceremony</h2></div>
+    <div class="body"><dl class="vitals" id="stats"></dl></div>
+  </section>
 
-  <p class="mono" style="opacity:.7">
-    Apply-and-destroy (Bowe-Gabizon-Miers 2017). The secret never leaves this tab: the wasm module
-    exposes only <code>transform_contribution</code>, which returns transformed public parameters and
-    a public proof; there is no export that carries the secret, so no network call can.
-  </p>
+  <!-- ============ coordinator ============ -->
+  <section>
+    <div class="rail">
+      <h2>Coordinator</h2>
+      <p>the canister you are trusting</p>
+    </div>
+    <div class="body">
+      <p class="note" id="pinnedNote"></p>
+      <p class="note warn" id="idWarn"></p>
+      <div class="field">
+        <label for="canisterId">Coordinator canister id</label>
+        <input id="canisterId" placeholder="aaaaa-aa" autocomplete="off" spellcheck="false" />
+      </div>
+      <div class="field">
+        <label for="host">API host</label>
+        <input id="host" autocomplete="off" spellcheck="false"
+               placeholder="https://icp-api.io  (or http://127.0.0.1:4943 locally)" />
+      </div>
+      <div class="actions"><button id="connect" class="primary">Sign in with Internet Identity</button></div>
+      <dl class="kv" style="margin-top:1.15rem"><dt>Signed in as</dt><dd id="whoami">not signed in</dd></dl>
+    </div>
+  </section>
 
-  <script type="module" src="./app.js"></script>
+  <!-- ============ contribute ============ -->
+  <section>
+    <div class="rail">
+      <h2>Your contribution</h2>
+      <p>one click, four stages</p>
+    </div>
+    <div class="body">
+      <div class="banner" id="banner"><span id="bannerText"></span></div>
+      <div class="actions">
+        <button id="join" disabled>Join the queue</button>
+        <button id="contribute" class="primary" disabled>Contribute now</button>
+        <button id="refresh" disabled>Refresh</button>
+      </div>
+      <ol id="stages">
+        <li id="st1"><div class="n">01</div><div class="t">Download parameters</div><div class="d"></div></li>
+        <li id="st2"><div class="n">02</div><div class="t">Sample, apply, discard your secret</div><div class="d"></div></li>
+        <li id="st3"><div class="n">03</div><div class="t">Upload public parameters</div><div class="d"></div></li>
+        <li id="st4"><div class="n">04</div><div class="t">Attest and append</div><div class="d"></div></li>
+      </ol>
+      <div id="progressWrap">
+        <div id="progressLabel"></div>
+        <progress id="progressBar" max="100" value="0"></progress>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ receipt ============ -->
+  <section id="receipt">
+    <div class="rail">
+      <h2>Your receipt</h2>
+      <p>keep this</p>
+    </div>
+    <div class="body">
+      <p class="note">
+        These are the values that let you confirm your own contribution survived into the published
+        transcript. Run the standalone verifier over it and check they appear at your index.
+      </p>
+      <dl class="kv" id="receiptBody"></dl>
+      <div class="actions" style="margin-top:1.15rem"><button id="copyReceipt">Copy receipt</button></div>
+    </div>
+  </section>
+
+  <!-- ============ log ============ -->
+  <section>
+    <div class="rail"><h2>Activity</h2></div>
+    <div class="body"><div id="log"><div class="empty">nothing yet</div></div></div>
+  </section>
+
+  <footer>
+    <p>
+      Apply-and-destroy, after Bowe–Gabizon–Miers (2017). The secret never leaves this tab: the wasm
+      module exposes only <code>transform_contribution</code>, which returns transformed public
+      parameters and a public proof. There is no export that carries the secret, so no network call
+      can.
+    </p>
+    <p>
+      On-chain acceptance runs <strong>structural checks only</strong>. The soundness-critical
+      subgroup and pairing checks run off-chain, in the standalone verifier, over the published
+      transcript — being appended here is not confirmation that your proof checked out.
+    </p>
+  </footer>
+
+</div>
+
+<script type="module" src="./app.js"></script>
 </body>
 </html>

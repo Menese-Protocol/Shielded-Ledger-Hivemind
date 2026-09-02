@@ -272,39 +272,129 @@ fn cmd_export(srs_path: &str, t_path: &str, outdir: &str) {
     write_vk_hex("transfer_vk.hex", &keys.transfer_pk);
     write_vk_hex("deposit_vk.hex", &keys.deposit_pk);
 
-    let is_real = srs.provenance == SrsProvenance::InheritedReviewedPhase1 && rep.honest_contributions >= 1;
+    // A ceremony is only as strong as the number of INDEPENDENT parties who destroyed their
+    // secret, and docs/TRUSTED-SETUP-POLICY.md requires "multiple independent operators on
+    // separately controlled machines". These flags were previously computed as
+    // `honest_contributions >= 1`, which made a ONE-party ceremony describe itself as
+    // `multi_party_ceremony: true`. The floor below makes that prose executable, and it is
+    // deliberately the same number the frontend production gate enforces
+    // (demo-frontend/scripts/verify-keyset.mjs, MIN_HONEST_CONTRIBUTIONS). If the two ever
+    // disagree, the GATE is authoritative: it re-derives the count from the verifier's own
+    // output, whereas this manifest is a hand-editable file that authorises nothing.
+    const MIN_HONEST_CONTRIBUTIONS: usize = 5;
+
+    let multi_party = rep.honest_contributions >= MIN_HONEST_CONTRIBUTIONS;
+    // Real-value eligibility additionally requires the beacon. Without it the last contributor
+    // knew the final parameters before anyone else did.
+    let is_real = srs.provenance == SrsProvenance::InheritedReviewedPhase1
+        && multi_party
+        && rep.finalized;
+
+    let sha256_file = |name: &str| -> String {
+        use sha2::{Digest, Sha256};
+        let bytes = std::fs::read(format!("{outdir}/{name}")).unwrap();
+        hex::encode(Sha256::digest(&bytes))
+    };
+    // NOTE THE TWO DIFFERENT HASHES, because conflating them is a trap that already cost a
+    // silently-unpassable production gate:
+    //
+    //   * `*_sha256` in the manifest is the hash of the FILE ON DISK -- for the vks that is the
+    //     ASCII hex text, not the bytes it encodes. This is what the frontend gate's integrity
+    //     loop recomputes, and what the shipped demo keyset has always used.
+    //   * `ceremony.*_vk_sha256` is `ceremony::session::vk_sha256`, i.e.
+    //     SHA256(vk.serialize_compressed()) -- the hash over the RAW BYTES that the transcript
+    //     verifier prints and that docs/CEREMONY.md publishes.
+    //
+    // They can never be equal, one being the hash of the other's hex encoding. The gate needs
+    // both: the first proves the artifact on disk is intact, the second binds it to a transcript.
+    let transfer_pk_sha256 = sha256_file("transfer_pk.bin");
+    let deposit_pk_sha256 = sha256_file("deposit_pk.bin");
+    let transfer_vk_file_sha256 = sha256_file("transfer_vk.hex");
+    let deposit_vk_file_sha256 = sha256_file("deposit_vk.hex");
+
+    // `format: 1` and the pk hashes are not cosmetic. demo-frontend/scripts/verify-keyset.mjs is
+    // the production gate, and it rejects any other format outright and hashes all FOUR artifacts
+    // against the manifest. This exporter previously emitted `format: 2` with no pk hashes and no
+    // `ceremony` block, so its output could not pass the gate at all: the two halves of the launch
+    // had never been run against each other.
     let manifest = format!(
         concat!(
             "{{\n",
-            "  \"format\": 2,\n",
+            "  \"format\": 1,\n",
             "  \"proof_system\": \"Groth16\",\n",
             "  \"curve\": \"BLS12-381\",\n",
+            "  \"setup_mode\": \"multi-party-phase2-ceremony\",\n",
+            "  \"publicly_reproducible_toxic_waste\": {},\n",
             "  \"phase2_ceremony\": true,\n",
             "  \"phase1_provenance\": \"{}\",\n",
             "  \"srs_sha256\": \"{}\",\n",
             "  \"honest_contributions\": {},\n",
+            "  \"minimum_honest_contributions\": {},\n",
             "  \"finalized_with_beacon\": {},\n",
             "  \"multi_party_ceremony\": {},\n",
             "  \"real_value_eligible\": {},\n",
+            "  \"transfer_pk_sha256\": \"{}\",\n",
             "  \"transfer_vk_sha256\": \"{}\",\n",
+            "  \"deposit_pk_sha256\": \"{}\",\n",
             "  \"deposit_vk_sha256\": \"{}\",\n",
-            "  \"note\": \"real_value_eligible requires an inherited reviewed Phase-1 SRS and an independently verified transcript; a test-tier SRS is never real-value eligible.\"\n",
+            "  \"ceremony\": {{\n",
+            "    \"srs\": \"{}\",\n",
+            "    \"transcript\": \"{}\",\n",
+            "    \"transfer_vk_sha256\": \"{}\",\n",
+            "    \"deposit_vk_sha256\": \"{}\"\n",
+            "  }},\n",
+            "  \"note\": \"real_value_eligible requires an inherited reviewed Phase-1 SRS, at least the minimum honest contributions, and a beacon finalize. It is a LABEL: the production gate re-verifies the transcript and ignores this field.\"\n",
             "}}\n"
         ),
+        srs.provenance == SrsProvenance::TestTierKnownSecret,
         match srs.provenance {
             SrsProvenance::TestTierKnownSecret => "test-tier-known-secret",
             SrsProvenance::InheritedReviewedPhase1 => "inherited-reviewed-phase1",
         },
         srs.sha256_hex(),
         rep.honest_contributions,
+        MIN_HONEST_CONTRIBUTIONS,
         rep.finalized,
-        rep.honest_contributions >= 1,
+        multi_party,
         is_real,
+        transfer_pk_sha256,
+        transfer_vk_file_sha256,
+        deposit_pk_sha256,
+        deposit_vk_file_sha256,
+        std::path::Path::new(srs_path).file_name().unwrap().to_string_lossy(),
+        std::path::Path::new(t_path).file_name().unwrap().to_string_lossy(),
         rep.transfer_vk_sha256,
         rep.deposit_vk_sha256,
     );
     std::fs::write(format!("{outdir}/SETUP-MANIFEST.json"), &manifest).unwrap();
     eprintln!("wrote {outdir}/SETUP-MANIFEST.json");
+
+    // Export still emits keys below the floor, deliberately: the battery (`ceremony-cli run`) and
+    // every local rehearsal produce short ceremonies, and a hard refusal here would break them
+    // while buying nothing. Refusing is the PRODUCTION GATE's job, and it is strictly stronger --
+    // it re-derives the count from the verifier rather than reading the field written here, so
+    // hand-editing this file past the floor does not buy a deployment.
+    if !is_real {
+        eprintln!();
+        eprintln!("*** NOT REAL-VALUE ELIGIBLE — these keys must not secure value ***");
+        if rep.honest_contributions < MIN_HONEST_CONTRIBUTIONS {
+            eprintln!("    honest contributions: {} (minimum {})",
+                      rep.honest_contributions, MIN_HONEST_CONTRIBUTIONS);
+        }
+        if !rep.finalized {
+            eprintln!("    not finalized with a beacon");
+        }
+        if srs.provenance == SrsProvenance::TestTierKnownSecret {
+            eprintln!("    Phase-1 SRS is test-tier: its toxic waste is PUBLICLY KNOWN");
+        }
+    } else {
+        eprintln!();
+        eprintln!("real-value eligible. Before running the production gate, place the SRS and the");
+        eprintln!("transcript alongside the keys, under the names this manifest records:");
+        eprintln!("    cp {srs_path} {outdir}/");
+        eprintln!("    cp {t_path} {outdir}/");
+        eprintln!("    node demo-frontend/scripts/verify-keyset.mjs {outdir} --require-real-value");
+    }
     println!("EXPORT OK: transfer_vk {} deposit_vk {}", rep.transfer_vk_sha256, rep.deposit_vk_sha256);
 }
 

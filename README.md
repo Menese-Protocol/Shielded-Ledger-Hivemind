@@ -4,8 +4,48 @@ A shielded token pool that runs entirely on the Internet Computer. Groth16 proof
 inside the canister, in Motoko; notes and keys never leave the user's browser; private lookups
 are answered by a ledger that never learns the question.
 
-**The hosted demo is offline while the pool is redeployed.** It is not linked here rather than
-linked and broken; this section will name the new deployment when it exists.
+The whole system is **open source under the MIT licence** — the coordinator, the contributor
+client, the circuits, the in-canister verifier, and every gate that checks them.
+
+## The trusted-setup ceremony is live, and it needs contributors
+
+**[ovrp2-uaaaa-aaaad-agxuq-cai.icp0.io](https://ovrp2-uaaaa-aaaad-agxuq-cai.icp0.io)** — about a
+minute in your browser. You sample a secret, it is mixed into the proving parameters, and it is
+destroyed without ever leaving the tab. The final trapdoor is the product of every contributor's
+secret, so recovering it requires every one of them: **a single honest participant makes forgery
+impossible forever.** That property is why the ask is not that you trust us.
+
+Accordingly, nothing here rests on trust that cannot be checked:
+
+- The coordinator receiving contributions is **blackholed** — its controller list is empty, so
+  nobody, us included, can upgrade it and rewrite the transcript afterwards.
+  Check it: `dfx canister info osqjo-zyaaa-aaaad-agxua-cai --network ic`
+- Its binary is **reproducible from this repository**: `coordinator/verify-build.sh` rebuilds it
+  from source and matches the deployed module hash.
+- The page serves exactly this repository, and nothing extra:
+  `scripts/verify-published-page.py` compares every asset the canister publishes against these
+  files, in both directions, so a page with one script added fails rather than passing on a subset.
+
+One thing is **not** yet checkable, and we would rather say so than let you assume otherwise: the
+compiled wasm inside the page — the part that samples and destroys your secret — is toolchain-pinned
+and builds independently of where the repository sits, but it does not yet rebuild to identical
+bytes every time. It settles into one of two outputs that differ in three bytes, the order of three
+constants. That is almost certainly a compiler-ordering quirk rather than anything sinister, but
+"almost certainly" is not the standard this deserves, so no byte-level guarantee is claimed for it
+until it reproduces exactly. Its source is `demo-frontend/contributor-wasm/src/lib.rs` and is short
+enough to read.
+
+Start with [`docs/CEREMONY.md`](docs/CEREMONY.md): the trust model is section 3, the live addresses
+and the four checks are section 4, the reproducible builds are section 7, and what this ceremony
+does *not* give you is section 8, which is worth reading before the rest.
+
+*The ceremony comes before the money.*
+
+## The pool itself
+
+**The hosted pool demo is offline while the pool is redeployed.** It is not linked here rather than
+linked and broken; this section will name the new deployment when it exists. The ceremony above is
+live, and separate from it.
 
 The demo itself runs locally today (`## Running it yourself`): two browsers, two users, a private
 transfer, and a live panel showing exactly what a node provider can and cannot see.
@@ -326,13 +366,51 @@ undetectably. The policy here is explicit:
   that is exactly as far as trust should stretch.
 - A real-value launch requires a **multi-party ceremony**: many independent contributors, each
   mixing in secret randomness and destroying it, so that a single honest participant makes
-  forgery impossible forever. The ceremony tooling ships in this repository (`ceremony/`,
-  `coordinator/`): a coordinator canister that never holds a secret, a contributor client, a
-  reproducible contributor build, and a transcript verifier. What remains is the ceremony
-  itself: independent participants, the public transcript, and on-chain ratification of the
-  final verifying key. The full acceptance checklist a production keyset must pass is in
+  forgery impossible forever. The full acceptance checklist a production keyset must pass is in
   [`docs/TRUSTED-SETUP-POLICY.md`](docs/TRUSTED-SETUP-POLICY.md), and the production key gate
   in this repository intentionally fails until a reviewed ceremony transcript exists.
+
+### That ceremony is now live
+
+The Phase-2 ceremony is open on mainnet at
+**[ovrp2-uaaaa-aaaad-agxuq-cai.icp0.io](https://ovrp2-uaaaa-aaaad-agxuq-cai.icp0.io)**. Read
+[`docs/CEREMONY.md`](docs/CEREMONY.md) first — it is the spec and the trust model, and section 4
+is how to contribute.
+
+```
+coordinator canister    osqjo-zyaaa-aaaad-agxua-cai
+  module SHA-256        ce34f578fa583f9ff785f3a9c235d801b7fd36dde50e1db985c7e6cefc6fe616
+  controllers           none
+contributor page        ovrp2-uaaaa-aaaad-agxuq-cai
+  module SHA-256        04e565b3425fe7510ee16b02adcfe3f01abc9a2725c82a21cb08969241debd62
+API host                https://icp-api.io
+```
+
+Both hashes are published so they can be checked rather than believed, and they establish
+different things. The coordinator's is the reproducible build in `coordinator/BUILD-HASH.txt`, so
+the canister receiving contributions is provably this source; its controller list is **empty**,
+so nobody can upgrade it and rewrite the transcript afterwards. The page's is dfx's stock asset
+canister, so the site cannot serve one script to an auditor and another to a contributor — and
+`scripts/verify-published-page.py` proves the files it serves are exactly this repository, with
+nothing extra. The commands for all four checks are in `docs/CEREMONY.md` section 4.
+
+Neither hash covers the wasm inside the page, which is the code that actually samples and destroys
+your secret. `scripts/verify-published-page.py` confirms the live page serves exactly the bytes
+recorded in `demo-frontend/contributor-wasm/PKG-HASHES.txt`, and the compiled client is
+intentionally not committed — you should build it with
+`demo-frontend/contributor-wasm/build.sh` rather than receive a binary from us.
+
+Be clear about what that does and does not establish. It shows the page has not been changed
+since those hashes were published. It does **not** yet let you derive them from source yourself:
+the build is toolchain-pinned (`rust-toolchain.toml`, `Dockerfile`) and no longer depends on where
+the repository sits, but it currently produces one of two outputs differing in three bytes — the
+order of three constants — so an independent rebuild cannot be required to match exactly. Until
+that is resolved, `PKG-HASHES.txt` is our record of our own build, and it is labelled as such
+rather than dressed up as a proof.
+
+The parameters are still **pre-ceremony opening parameters** until the window closes and the
+beacon is folded in. Nothing here is real-value eligible yet, and the production key gate still
+fails by design.
 
 *The ceremony comes before the money.*
 
@@ -379,6 +457,14 @@ npm install && npm run dev
 
 `node demo-frontend/verify.mjs` drives the entire two-user story headless: faucet, shields,
 private transfer, PIR lookup, recipient-bound withdrawal; it screenshots every step.
+
+The ceremony contributor client is built separately from the pool demo, because its bytes are what
+a participant is trusting:
+
+```bash
+demo-frontend/contributor-wasm/build.sh   # -> demo-frontend/contributor-client/pkg
+scripts/verify-published-page.py          # the live page must serve exactly the recorded bytes
+```
 
 ## Status and boundaries
 
