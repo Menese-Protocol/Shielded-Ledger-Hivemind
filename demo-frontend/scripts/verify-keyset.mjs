@@ -36,16 +36,31 @@ console.log(`KEYSET OK: ${manifest.setup_mode}`);
 // by the very file it is supposed to be checking. It stays as a label; the gate below is the check.
 console.log(`REAL VALUE ELIGIBLE (manifest label, not the gate): ${manifest.real_value_eligible}`);
 
+// The minimum number of honest contributions a production keyset must rest on.
+//
+// docs/TRUSTED-SETUP-POLICY.md requires "contributions from multiple independent operators on
+// separately controlled machines". Until this constant existed that requirement lived only in
+// prose, while the machine-checkable flags were computed as `honest_contributions >= 1` -- so a
+// ONE-party ceremony stamped itself `multi_party_ceremony: true`. A named floor makes the policy
+// executable. Raising it is a governance decision, not a refactor.
+const MIN_HONEST_CONTRIBUTIONS = 5;
+
 if (requireRealValue) {
   // THE GATE: verify the ceremony transcript itself, and bind the shipped keys to it.
   //
-  // Three things have to hold, and each closes a different way of passing without a ceremony:
+  // Five things have to hold, and each closes a different way of passing without a ceremony:
   //   1. the manifest names a transcript and an SRS          -- otherwise there is nothing to check
   //   2. the standalone verifier accepts them                -- the transcript is actually valid
   //   3. the vk hashes the VERIFIER reports equal the ones   -- these keys came from THAT transcript
   //      this manifest pins for the shipped artifacts           rather than from some other one
+  //   4. the verifier reports >= MIN_HONEST_CONTRIBUTIONS    -- one party is not a multi-party ceremony
+  //   5. the verifier reports the beacon finalize            -- without it the ending was predictable
   //
   // Without (3) a valid transcript for an unrelated ceremony would authorise any keyset.
+  //
+  // (4) and (5) are read from the VERIFIER'S OWN OUTPUT, never from the manifest, for the same
+  // reason `real_value_eligible` is only a label here: a number in a hand-editable JSON file
+  // cannot be the thing that authorises a deployment.
   const ceremony = manifest.ceremony;
   if (!ceremony || !ceremony.transcript || !ceremony.srs) {
     throw new Error(
@@ -76,18 +91,58 @@ if (requireRealValue) {
     [...output.matchAll(/^\s*(transfer|deposit)\s+vk SHA-256\s*:\s*([0-9a-f]{64})/gm)]
       .map((m) => [m[1], m[2]])
   );
+  // The binding hash is NOT the top-level `*_vk_sha256`. Those are hashes of the FILES on disk --
+  // for a vk that is the ASCII hex text -- and the integrity loop above already checks them. The
+  // transcript verifier prints a hash over the RAW vk bytes, i.e. SHA256 of what that hex encodes,
+  // so the two can never be equal. Comparing the verifier's value against the file hash is
+  // unsatisfiable, and because this whole block sits behind the "no ceremony transcript recorded"
+  // throw it was never once executed: `--require-real-value` could not have passed for ANY keyset.
+  // The ceremony-derived value therefore lives in its own field.
   for (const [circuit, field] of [["transfer", "transfer_vk_sha256"], ["deposit", "deposit_vk_sha256"]]) {
     if (!reported[circuit]) {
       throw new Error(`production deployment forbidden: the verifier reported no ${circuit} vk hash`);
     }
-    if (reported[circuit] !== manifest[field]) {
+    const bound = ceremony[field];
+    if (!bound) {
+      throw new Error(
+        `production deployment forbidden: SETUP-MANIFEST.json records no ceremony.${field}\n` +
+        "  without it the shipped keys are not bound to any transcript"
+      );
+    }
+    if (reported[circuit] !== bound) {
       throw new Error(
         `production deployment forbidden: the shipped ${circuit} vk is NOT the one this transcript produces\n` +
-        `  transcript: ${reported[circuit]}\n  manifest:   ${manifest[field]}`
+        `  transcript: ${reported[circuit]}\n  manifest:   ${bound}`
       );
     }
   }
+  const honest = output.match(/^\s*honest contributions\s*:\s*(\d+)/m);
+  if (!honest) {
+    throw new Error("production deployment forbidden: the verifier reported no honest contribution count");
+  }
+  if (Number(honest[1]) < MIN_HONEST_CONTRIBUTIONS) {
+    throw new Error(
+      `production deployment forbidden: ${honest[1]} honest contribution(s), ` +
+      `${MIN_HONEST_CONTRIBUTIONS} required\n` +
+      "  a ceremony is only as strong as the number of INDEPENDENT parties who destroyed their\n" +
+      "  secret; one party mixing in its own randomness is a single-party setup wearing a chain"
+    );
+  }
+
+  const finalized = output.match(/^\s*finalized \(beacon\)\s*:\s*(true|false)/m);
+  if (!finalized) {
+    throw new Error("production deployment forbidden: the verifier reported no beacon finalize state");
+  }
+  if (finalized[1] !== "true") {
+    throw new Error(
+      "production deployment forbidden: the transcript is not finalized with a beacon\n" +
+      "  without it the final parameters were predictable to whoever contributed last"
+    );
+  }
+
   console.log(`CEREMONY TRANSCRIPT VERIFIED: ${transcriptPath}`);
+  console.log(`  honest contributions: ${honest[1]} (minimum ${MIN_HONEST_CONTRIBUTIONS})`);
+  console.log("  finalized with beacon: true");
   console.log("REAL VALUE GATE: PASSED — both vks match the verified transcript");
 } else if (!manifest.real_value_eligible) {
   console.log("DEMO ONLY: a verified multi-party ceremony transcript is still required.");

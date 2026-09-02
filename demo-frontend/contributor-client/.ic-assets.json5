@@ -1,0 +1,29 @@
+// Response headers for the published contributor page.
+//
+// Starts from dfx's "standard" policy (X-Content-Type-Options, Referrer-Policy, HSTS,
+// X-Frame-Options, Permissions-Policy) and replaces ONLY its Content-Security-Policy.
+//
+// Why the override: standard ships `script-src 'self'`, and compiling a WebAssembly module counts
+// as script evaluation under CSP. Measured against this very canister before the override, the
+// browser refused the module outright:
+//
+//   CompileError: WebAssembly.compile(): ... violates the following Content Security policy
+//   directive because 'unsafe-eval' is not an allowed source of script in ... "script-src 'self'"
+//
+// which takes out the transform, i.e. the entire point of the page. The narrow fix is
+// 'wasm-unsafe-eval': it permits WebAssembly compilation and nothing else. Do NOT "fix" this by
+// adding 'unsafe-eval', which would also re-enable eval() and new Function() for injected script.
+//
+// The rest is deliberately tight for a page that samples and destroys a ceremony secret in-tab:
+// no third-party script origin at all, object-src 'none', frame-ancestors 'none'. 'unsafe-inline'
+// appears for style only — index.html carries its stylesheet inline and no inline script.
+// connect-src carries just the IC API hosts the agent actually calls.
+[
+  {
+    "match": "**/*",
+    "security_policy": "standard",
+    "headers": {
+      "Content-Security-Policy": "default-src 'self';script-src 'self' 'wasm-unsafe-eval';connect-src 'self' https://icp0.io https://*.icp0.io https://icp-api.io https://identity.ic0.app;img-src 'self' data:;style-src 'self' 'unsafe-inline';style-src-elem 'self' 'unsafe-inline';font-src 'self';object-src 'none';base-uri 'self';frame-ancestors 'none';form-action 'self';upgrade-insecure-requests;"
+    }
+  }
+]

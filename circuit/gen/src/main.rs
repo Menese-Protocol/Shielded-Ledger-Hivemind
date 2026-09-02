@@ -20,7 +20,7 @@ use ark_bn254::{Bn254 as Curve, Fr as F};
 use ark_ff::{One, UniformRand};
 use ark_groth16::Groth16;
 use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystem};
-use ark_serialize::CanonicalSerialize;
+use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_snark::SNARK;
 use ark_std::rand::SeedableRng;
 use common::*;
@@ -37,6 +37,15 @@ enum SetupMode {
     /// Draws setup randomness directly from the operating system CSPRNG. This removes the
     /// published-seed vulnerability, but remains a single-party setup rather than an MPC ceremony.
     OsCsprngSingleParty,
+    /// Runs NO setup. Loads the proving keys produced by a Phase-2 ceremony
+    /// (`ceremony-cli export`) and proves against those.
+    ///
+    /// This mode exists because nothing else could reach the seam it covers. Every other mode
+    /// generates its own keys, so every fixture proof this repository has ever produced was made
+    /// with keys that no ceremony ever touched — which means "the in-canister Motoko verifier
+    /// accepts a proof made with the CEREMONY's keys" had never once been executed. That is the
+    /// claim the whole launch rests on, and it was dark.
+    Phase2Ceremony,
 }
 
 impl SetupMode {
@@ -44,6 +53,7 @@ impl SetupMode {
         match value {
             "insecure-deterministic-test" => Some(Self::InsecureDeterministicTest),
             "os-csprng-single-party" => Some(Self::OsCsprngSingleParty),
+            "phase2-ceremony" => Some(Self::Phase2Ceremony),
             _ => None,
         }
     }
@@ -52,6 +62,7 @@ impl SetupMode {
         match self {
             Self::InsecureDeterministicTest => "insecure-deterministic-test",
             Self::OsCsprngSingleParty => "os-csprng-single-party",
+            Self::Phase2Ceremony => "multi-party-phase2-ceremony",
         }
     }
 
@@ -60,13 +71,30 @@ impl SetupMode {
     }
 }
 
+/// Load a proving key emitted by `ceremony-cli export`. `deserialize_uncompressed` (not the
+/// `_unchecked` variant) is deliberate: it subgroup-checks every point, so a corrupted or
+/// substituted keyset fails here rather than producing proofs that mysteriously do not verify.
+fn load_ceremony_pk(keyset: &str, name: &str) -> ark_groth16::ProvingKey<Curve> {
+    let path = format!("{keyset}/{name}");
+    let bytes = std::fs::read(&path).unwrap_or_else(|e| {
+        eprintln!("cannot read ceremony proving key {path}: {e}");
+        std::process::exit(1)
+    });
+    ark_groth16::ProvingKey::<Curve>::deserialize_uncompressed(&bytes[..]).unwrap_or_else(|e| {
+        eprintln!("ceremony proving key {path} did not deserialize: {e}");
+        std::process::exit(1)
+    })
+}
+
 fn usage() -> ! {
     eprintln!(
-        "usage: gen <output-dir> --setup <insecure-deterministic-test|os-csprng-single-party> \
-[--statement <legacy|hardened>]\n\
+        "usage: gen <output-dir> --setup <insecure-deterministic-test|os-csprng-single-party|phase2-ceremony> \
+[--statement <legacy|hardened>] [--keyset <dir>]\n\
          \n\
          insecure-deterministic-test: reproducible oracle fixtures only; NEVER deploy its keys\n\
          os-csprng-single-party: removes the public-seed flaw; still NOT an MPC ceremony\n\
+         phase2-ceremony: runs NO setup; proves with the keys a ceremony produced\n\
+                     (--keyset <dir> = a `ceremony-cli export` output directory)\n\
          --statement hardened (default): the hardened conservation statement (in-circuit\n\
                      fee/v_pub_out ranges + input-note distinctness) — the shipped statement,\n\
                      own fixture set (pool-vectors-bls12-381-hardened)\n\
@@ -77,7 +105,7 @@ fn usage() -> ! {
     std::process::exit(2)
 }
 
-fn parse_args() -> (String, SetupMode, bool) {
+fn parse_args() -> (String, SetupMode, bool, Option<String>) {
     let mut args = std::env::args().skip(1);
     let dir = args.next().unwrap_or_else(|| usage());
     let flag = args.next().unwrap_or_else(|| usage());
@@ -88,28 +116,37 @@ fn parse_args() -> (String, SetupMode, bool) {
     } else {
         usage()
     };
-    let legacy_statement = match args.next() {
-        None => false, // hardened is the shipped default; pass `--statement legacy` for provenance
-        Some(flag) => {
-            let statement = if flag == "--statement" {
-                args.next().unwrap_or_else(|| usage())
-            } else if let Some(value) = flag.strip_prefix("--statement=") {
-                value.to_owned()
-            } else {
-                usage()
-            };
-            match statement.as_str() {
-                "legacy" => true,
-                "hardened" => false,
-                _ => usage(),
+    // The tail is order-independent so `--keyset` could be added without disturbing the existing
+    // `--statement` call sites, which the security gate invokes verbatim.
+    let mut legacy_statement = false; // hardened is the shipped default
+    let mut keyset: Option<String> = None;
+    while let Some(flag) = args.next() {
+        let (name, inline) = match flag.split_once('=') {
+            Some((n, v)) => (n.to_owned(), Some(v.to_owned())),
+            None => (flag, None),
+        };
+        let take = |args: &mut dyn Iterator<Item = String>| match inline.clone() {
+            Some(v) => v,
+            None => args.next().unwrap_or_else(|| usage()),
+        };
+        match name.as_str() {
+            "--statement" => {
+                legacy_statement = match take(&mut args).as_str() {
+                    "legacy" => true,
+                    "hardened" => false,
+                    _ => usage(),
+                }
             }
+            "--keyset" => keyset = Some(take(&mut args)),
+            _ => usage(),
         }
-    };
-    if args.next().is_some() {
-        usage()
     }
     let mode = SetupMode::parse(&value).unwrap_or_else(|| usage());
-    (dir, mode, legacy_statement)
+    if (mode == SetupMode::Phase2Ceremony) != keyset.is_some() {
+        eprintln!("--setup phase2-ceremony requires --keyset <dir>, and --keyset is meaningless without it");
+        usage()
+    }
+    (dir, mode, legacy_statement, keyset)
 }
 
 fn file_sha256(path: &str) -> String {
@@ -138,7 +175,7 @@ impl Out {
 }
 
 fn main() {
-    let (dir, setup_mode, legacy_statement) = parse_args();
+    let (dir, setup_mode, legacy_statement, keyset_dir) = parse_args();
     std::fs::create_dir_all(&dir).unwrap();
     let mut out = Out { dir, oracle: String::new() };
     let cfg = poseidon_config();
@@ -159,6 +196,9 @@ fn main() {
         ),
         SetupMode::OsCsprngSingleParty => out.oracle_line(
             "SETUP-WARNING OS CSPRNG REMOVES PUBLIC-SEED FLAW; SINGLE-PARTY, NOT MPC-CEREMONY",
+        ),
+        SetupMode::Phase2Ceremony => out.oracle_line(
+            "SETUP multi-party phase-2 ceremony keys, loaded; no setup run here",
         ),
     }
 
@@ -250,6 +290,11 @@ fn main() {
             SetupMode::OsCsprngSingleParty => {
                 let mut setup_rng = OsRng;
                 Groth16::<Curve>::circuit_specific_setup(setup_circuit, &mut setup_rng).unwrap()
+            },
+            SetupMode::Phase2Ceremony => {
+                let pk = load_ceremony_pk(keyset_dir.as_deref().unwrap(), "transfer_pk.bin");
+                let vk = pk.vk.clone();
+                (pk, vk)
             },
         }
     };
@@ -445,6 +490,11 @@ fn main() {
             SetupMode::OsCsprngSingleParty => {
                 let mut setup_rng = OsRng;
                 Groth16::<Curve>::circuit_specific_setup(setup_circuit, &mut setup_rng).unwrap()
+            },
+            SetupMode::Phase2Ceremony => {
+                let pk = load_ceremony_pk(keyset_dir.as_deref().unwrap(), "deposit_pk.bin");
+                let vk = pk.vk.clone();
+                (pk, vk)
             },
         }
     };

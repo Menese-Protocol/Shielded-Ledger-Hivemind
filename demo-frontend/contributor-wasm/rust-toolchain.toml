@@ -1,0 +1,12 @@
+# Pinned toolchain for the browser contributor client.
+#
+# This is not routine hygiene. The wasm built from this crate is where a ceremony participant's
+# secret is sampled and destroyed, so its bytes are load-bearing: a contributor must be able to
+# rebuild them and confirm the page is serving the reviewed source. rustc bakes codegen details
+# and source paths into the binary, so an unpinned compiler yields a different hash from identical
+# source -- which reads as tampering when it is only a version drift. Pinning removes that
+# ambiguity, exactly as coordinator/Dockerfile does for the coordinator.
+[toolchain]
+channel = "1.95.0"
+targets = ["wasm32-unknown-unknown"]
+profile = "minimal"
