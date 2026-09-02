@@ -79,10 +79,10 @@ def main() -> int:
     # like an EXTRA asset and the run failed for everybody. The build records its outputs in
     # PKG-HASHES.txt, so a clone can compare against that instead.
     #
-    # Be honest about the strength of that link. Matching against the record proves the page has
-    # not changed since the record was published; it does NOT prove the record follows from the
-    # source, because the client does not yet rebuild to identical bytes (docs/CEREMONY.md 7).
-    # The output below distinguishes the two cases rather than blurring them into one "match".
+    # Be precise about the strength of that link rather than blurring it into one "match": on its
+    # own, matching the record proves the page is unchanged since publication, not that the record
+    # follows from the source. demo-frontend/contributor-wasm/verify-build.sh is what supplies the
+    # other half, by rebuilding those exact hashes from source in two checkouts at different paths.
     recorded = {}
     if PKG_HASHES.exists():
         for line in PKG_HASHES.read_text().splitlines():
@@ -120,10 +120,10 @@ def main() -> int:
     print(f"\n  matched {ok}   matched against the build record {via_record}   discrepancies {len(bad)}")
     if via_record:
         print("  * those assets are the compiled client, which is not tracked by design. This run")
-        print("    checked them against demo-frontend/contributor-wasm/PKG-HASHES.txt, which is our")
-        print("    record of our own build. It shows the page is unchanged since publication; it is")
-        print("    NOT a derivation from source, because the client does not yet rebuild to")
-        print("    identical bytes. See docs/CEREMONY.md section 7 for exactly what is open.")
+        print("    checked them against demo-frontend/contributor-wasm/PKG-HASHES.txt, which shows")
+        print("    the page is unchanged since publication. To also confirm that record follows")
+        print("    from the source rather than taking it from us, run:")
+        print("      demo-frontend/contributor-wasm/verify-build.sh")
     if bad:
         print("=== FAIL: the published page is not this source ===")
         return 1

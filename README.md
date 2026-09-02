@@ -25,15 +25,16 @@ Accordingly, nothing here rests on trust that cannot be checked:
 - The page serves exactly this repository, and nothing extra:
   `scripts/verify-published-page.py` compares every asset the canister publishes against these
   files, in both directions, so a page with one script added fails rather than passing on a subset.
+- **So is the client that samples your secret**, which is the one that matters most.
+  `demo-frontend/contributor-wasm/verify-build.sh` rebuilds it from source in two checkouts at
+  different paths and requires both to match what the page serves.
 
-One thing is **not** yet checkable, and we would rather say so than let you assume otherwise: the
-compiled wasm inside the page — the part that samples and destroys your secret — is toolchain-pinned
-and builds independently of where the repository sits, but it does not yet rebuild to identical
-bytes every time. It settles into one of two outputs that differ in three bytes, the order of three
-constants. That is almost certainly a compiler-ordering quirk rather than anything sinister, but
-"almost certainly" is not the standard this deserves, so no byte-level guarantee is claimed for it
-until it reproduces exactly. Its source is `demo-frontend/contributor-wasm/src/lib.rs` and is short
-enough to read.
+Every one of those checks, with the exact command and the output you should get, is in
+[`docs/REPRODUCING.md`](docs/REPRODUCING.md). Run them before you contribute, not after.
+
+Worth doing anyway, because it is the claim a hash cannot make for you:
+`demo-frontend/contributor-wasm/src/lib.rs` is 133 lines, and neither of its two exports returns
+your secret. No code on that page can send it anywhere, whatever the surrounding JavaScript does.
 
 Start with [`docs/CEREMONY.md`](docs/CEREMONY.md): the trust model is section 3, the live addresses
 and the four checks are section 4, the reproducible builds are section 7, and what this ceremony
@@ -395,18 +396,20 @@ canister, so the site cannot serve one script to an auditor and another to a con
 nothing extra. The commands for all four checks are in `docs/CEREMONY.md` section 4.
 
 Neither hash covers the wasm inside the page, which is the code that actually samples and destroys
-your secret. `scripts/verify-published-page.py` confirms the live page serves exactly the bytes
-recorded in `demo-frontend/contributor-wasm/PKG-HASHES.txt`, and the compiled client is
-intentionally not committed — you should build it with
-`demo-frontend/contributor-wasm/build.sh` rather than receive a binary from us.
+your secret, so it gets its own pair of checks. The compiled client is intentionally not committed
+— you should build it with `demo-frontend/contributor-wasm/build.sh --canonical` rather than
+receive a binary from us — and its hashes are recorded in
+`demo-frontend/contributor-wasm/PKG-HASHES.txt`.
 
-Be clear about what that does and does not establish. It shows the page has not been changed
-since those hashes were published. It does **not** yet let you derive them from source yourself:
-the build is toolchain-pinned (`rust-toolchain.toml`, `Dockerfile`) and no longer depends on where
-the repository sits, but it currently produces one of two outputs differing in three bytes — the
-order of three constants — so an independent rebuild cannot be required to match exactly. Until
-that is resolved, `PKG-HASHES.txt` is our record of our own build, and it is labelled as such
-rather than dressed up as a proof.
+One detail is worth knowing before you build: the path is part of the hash. Cargo derives each
+crate's `-C metadata`, which seeds every symbol name, from the package's absolute path, so the same
+source compiled in a different directory yields a different binary. `--canonical` stages the
+sources to a fixed location so your result is comparable with everyone else's; the Dockerfile does
+the same thing with a fixed `WORKDIR`.
+
+That establishes the page has not changed since those hashes were published;
+`demo-frontend/contributor-wasm/verify-build.sh` establishes that the hashes follow from the
+source. Run both — neither is sufficient alone. See [`docs/REPRODUCING.md`](docs/REPRODUCING.md).
 
 The parameters are still **pre-ceremony opening parameters** until the window closes and the
 beacon is folded in. Nothing here is real-value eligible yet, and the production key gate still
