@@ -1,15 +1,16 @@
-# SHA-256 of every file demo-frontend/contributor-wasm/build.sh produces.
+# SHA-256 of every file demo-frontend/contributor-wasm/build.sh --canonical produces.
 #
 # The built pkg/ is intentionally NOT tracked -- a ceremony contributor should build the
 # client from source rather than receive a binary from us. These hashes are what makes
-# that stance checkable instead of merely stated: scripts/verify-published-page.py
-# compares the assets the live page serves against this list when the built pkg/ is
-# absent, and verify-build.sh reproduces the list from source. Neither alone is enough;
-# together they close source -> binary -> served page.
+# that stance checkable: verify-build.sh rebuilds them from source, and
+# scripts/verify-published-page.py compares them against what the live page serves.
 #
-# Written only by build.sh --record. rustc 1.95.0 / wasm-pack 0.13.1 / wasm-opt 123
+# Reproduce with:  demo-frontend/contributor-wasm/build.sh --canonical
+# The build path is part of the hash; --canonical fixes it at /src, as the Dockerfile does.
+# Written only by build.sh --record.
+# rustc 1.95.0 / wasm-pack 0.13.1 / wasm-opt 123
 e44ceb45cdaec66ca750e954ea539672487af0e8c4d3f9c5e49594b9a7a33ecd  ceremony_contributor_wasm.d.ts
 237a42ee0117a58c0101b321350343c953a7d9babd63a4f6958d8b61cc81bf0c  ceremony_contributor_wasm.js
-9ca9886b1e241458e9e8ceeaaba5716de1bdd7bc2455520a7ff6f8a9501ddcf1  ceremony_contributor_wasm_bg.wasm
+1467b8d6d7594acd9c8e4aa694d04836eba1f4070ddf1db60513c91a957d2f6c  ceremony_contributor_wasm_bg.wasm
 adf8c729d7b36d2287833bf11930ceb9d21db5e5fad2c448f4f61aa88f05b7df  ceremony_contributor_wasm_bg.wasm.d.ts
 cbd562a7c41927d683018209a46e813d893e78060de750ef82e907ada80c1e2e  package.json

@@ -112,11 +112,13 @@ something different:
 | nobody can change it | the same command must print an **empty** `Controllers:` line | the coordinator is blackholed. No key — ours, yours, or a stolen one — can upgrade it, so the transcript cannot be rewritten out from under the contributors after the fact |
 | the page is a stock asset canister | its module hash is dfx 0.32.0's own `assetstorage.wasm.gz`; reproduce by running `dfx deploy` for any asset canister on dfx 0.32.0 and hashing `.dfx/<network>/canisters/<name>/assetstorage.wasm.gz` | the page is served by the standard, audited asset canister, which serves the same certified content to everyone. A bespoke canister could serve one script to an auditor and another to a contributor |
 | the page is this source | `scripts/verify-published-page.py` | every file the site serves matches this repository byte for byte, and — the direction that catches an attack — the site serves **nothing extra** |
-Run the last one from a checkout of the commit you reviewed; it compares against your working tree,
-so it is only as meaningful as the tree you point it at.
+| the client that samples your secret is this source | `demo-frontend/contributor-wasm/verify-build.sh` | the compiled wasm your browser runs rebuilds, from source, to the hashes the previous row compared against — and it does so from two checkouts at **different paths**, so the result does not depend on where you cloned. Without this row the previous one compares the live page against a binary you were handed rather than one you can produce |
 
-There is deliberately **no fifth row** for "the compiled client rebuilds from source to those exact
-bytes", because that check does not hold yet. See section 7.
+Run the last two from a checkout of the commit you reviewed; they compare against your working
+tree, so they are only as meaningful as the tree you point them at.
+
+[`REPRODUCING.md`](REPRODUCING.md) walks all of these in order, with the expected output of each and
+how to read a result that does not match.
 
 ### The steps
 
@@ -232,35 +234,39 @@ is not that binary's provenance but the **content it serves**. `scripts/verify-p
 compares the SHA-256 the canister publishes for every asset against this repository, in both
 directions, so a page serving one extra script fails rather than passing on a subset match.
 
-**The client itself — an open gap, stated plainly.** The wasm inside that page is where your secret
-is sampled and destroyed, so it is the artifact you have the most reason to check, and it is the one
-we cannot yet let you check to the standard it deserves.
+**The client itself.** The wasm inside that page is where your secret is sampled and destroyed, so
+it is the artifact you have the most reason to check, and checking it took more than a lockfile.
 
-What is fixed: it is built by `demo-frontend/contributor-wasm/build.sh`, which pins rustc
-(`rust-toolchain.toml`), wasm-pack and wasm-opt, and remaps the repository root and `CARGO_HOME` out
-of the binary. That last part mattered — `rustc` bakes absolute source paths into a binary, so
-before this the same source built in two different directories produced entirely different output,
-and no contributor could have matched our build from their own checkout even in principle.
-`demo-frontend/contributor-wasm/Dockerfile` pins the toolchain for building on another machine.
+It is built by `demo-frontend/contributor-wasm/build.sh`, which pins rustc (`rust-toolchain.toml`),
+wasm-pack and wasm-opt, and `verify-build.sh` rebuilds it from two checkouts at different paths and
+requires both to match `PKG-HASHES.txt`. `Dockerfile` pins the toolchain for another machine.
 
-What is not fixed: the build still settles into one of **two** outputs that differ in three bytes.
-Those bytes are `i32.const` immediates pointing into the data section, and the difference is the
-order of three 48-byte constants — the size of a BLS12-381 field element. The behaviour survives
-`codegen-units = 1` and `lto = false`, and neither `wasm-opt` nor wasm-bindgen is the source: each
-is deterministic in isolation. It has the signature of a container ordered by memory address inside
-the compiler, a documented class of Rust reproducibility bug.
+Getting there required fixing two independent path problems, and the second is the one worth
+knowing about because it is not obvious:
 
-Because of that, no byte-level reproducibility is claimed for the client, and nothing in this
-repository asks you to require an exact rebuild match. We are not treating "only three bytes" as
-close enough: those bytes are pointers, and repointing a constant is exactly the shape a malicious
-edit would take, so a checker that tolerated it would be a hole rather than a convenience.
+1. `rustc` records absolute source paths inside the binary. `--remap-path-prefix` rewrites them.
+2. Cargo derives each crate's `-C metadata` — which seeds every symbol hash — from the package's
+   **absolute path**, and `--remap-path-prefix` does not reach it, because it is Cargo's input to
+   rustc rather than something rustc emits. So the same source built from a different directory
+   produced a different binary. Measured: six checkouts at six paths gave six distinct wasm files.
+   wasm-bindgen and wasm-opt then normalised most of that away, leaving two end results that
+   differed in three bytes — which looked like a trivial constant reordering and was in fact this.
+
+The fix is to agree on a build path. `build.sh --canonical` stages the sources to one (`/src` by
+default), the Dockerfile does the same with `WORKDIR /src`, and with that the build reproduces
+exactly. This is why every serious ceremony ships a container build rather than a list of versions.
 
 The compiled `pkg/` is deliberately not tracked — a contributor should build the client rather than
-receive a binary from us — and `PKG-HASHES.txt` records what we built and deployed, so
-`verify-published-page.py` can confirm the live page still serves exactly that. Read it as what it
-is: evidence the page has not changed since publication, and our own record of our own build, not a
-proof you can derive independently. Until the build reproduces exactly, the honest basis for
-trusting the client is reading `demo-frontend/contributor-wasm/src/lib.rs`, which is 133 lines.
+receive a binary from us — and `PKG-HASHES.txt` records what was built and deployed, so
+`verify-published-page.py` can confirm the live page still serves exactly that. The two halves are
+complementary and neither is sufficient alone: the page check shows the deployment is unchanged
+since publication, and `verify-build.sh` shows those hashes follow from this source.
+
+One thing no hash establishes, so read it instead: `src/lib.rs` is 133 lines, and neither of its
+two exports returns a contribution secret. `transform_contribution` returns only public parameters
+and proofs, with the secrets dropped in scope; `random_nonce_hex` is an independent CSPRNG draw for
+the UI. There is no export that carries the secret, so no network request the page makes can carry
+it either.
 
 The standalone verifier is a Rust build pinned by its `Cargo.lock` and the shared `ceremony` crate,
 which is the same contribution code the browser client and the coordinator use.
