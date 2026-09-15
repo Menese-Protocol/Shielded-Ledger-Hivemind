@@ -19,6 +19,7 @@
 //!   export    <srs.bin> <transcript.bin> <outdir>   write final keys, vks, hashes, SETUP-MANIFEST
 //!   emit-initial <transcript.bin> <outdir>          write the upload_initial_chunk wire payloads
 //!   assemble-transcript <srs> <parts> <out>         build a transcript from a LIVE coordinator
+//!   emit-contribution <transcript> <index> <outdir> write one step in the coordinator's wire format
 //!   run       <power> <n> <outdir>                  end-to-end: gen-srs, n contributions, beacon,
 //!                                                    verify, export (the battery one-shot)
 
@@ -153,6 +154,64 @@ fn cmd_emit_initial(t_path: &str, outdir: &str) {
          for power {}",
         t.power
     );
+}
+
+/// Write one transcript step in the coordinator's wire format: the two delta blobs exactly as
+/// `upload_contribution_chunk` concatenates them, and the two proofs of knowledge as the hex the
+/// `PokWire` record carries. This is the inverse of `assemble-transcript` for a single step.
+///
+/// Its purpose is the finalize step: `finalize` computes the beacon contribution locally on the
+/// from-chain transcript, and this command serializes that last step so an uploader can stage it
+/// and call `submit_beacon`. The CLI carries no IC agent; the upload is `finalize.py`'s job.
+fn cmd_emit_contribution(t_path: &str, index: &str, outdir: &str) {
+    use ceremony::transcript::{delta_to_wire, g1_be, g2_be, Pok};
+
+    let t: Transcript = read_obj(t_path);
+    let i: usize = index.parse().unwrap_or_else(|_| die("index must be a number"));
+    let c = t
+        .contributions
+        .get(i)
+        .unwrap_or_else(|| die(&format!("transcript has {} contribution(s); no index {i}", t.contributions.len())));
+    std::fs::create_dir_all(outdir).unwrap();
+
+    let write = |name: &str, bytes: &[u8]| {
+        std::fs::write(format!("{outdir}/{name}"), bytes).unwrap();
+        eprintln!("wrote {outdir}/{name} ({} bytes)", bytes.len());
+    };
+    write(&format!("c{i}_transfer.wire"), &delta_to_wire(&c.transfer.delta));
+    write(&format!("c{i}_deposit.wire"), &delta_to_wire(&c.deposit.delta));
+
+    let pok_json = |p: &Pok| -> String {
+        format!(
+            "{{\"s_g1\": \"{}\", \"s_delta_g1\": \"{}\", \"r_delta_g2\": \"{}\"}}",
+            hex::encode(g1_be(&p.s_g1)),
+            hex::encode(g1_be(&p.s_delta_g1)),
+            hex::encode(g2_be(&p.r_delta_g2)),
+        )
+    };
+    let meta = format!(
+        "{{\n  \"index\": {i},\n  \"is_beacon\": {},\n  \"beacon_hex\": \"{}\",\n  \"contributor_hex\": \"{}\",\n  \
+         \"transfer_pok\": {},\n  \"deposit_pok\": {},\n  \"transfer_delta_sha256\": \"{}\",\n  \"deposit_delta_sha256\": \"{}\"\n}}\n",
+        c.is_beacon,
+        hex::encode(&c.beacon),
+        hex::encode(&c.contributor),
+        pok_json(&c.transfer.pok),
+        pok_json(&c.deposit.pok),
+        sha256_hex(&delta_to_wire(&c.transfer.delta)),
+        sha256_hex(&delta_to_wire(&c.deposit.delta)),
+    );
+    write(&format!("c{i}_meta.json"), meta.as_bytes());
+    eprintln!(
+        "step {i}: is_beacon={} transfer {} B, deposit {} B",
+        c.is_beacon,
+        delta_to_wire(&c.transfer.delta).len(),
+        delta_to_wire(&c.deposit.delta).len()
+    );
+}
+
+fn sha256_hex(b: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(b))
 }
 
 /// Assemble a verifiable transcript from a LIVE coordinator's exported parts.
@@ -440,7 +499,7 @@ fn main() {
     let a: Vec<String> = std::env::args().collect();
     if a.len() < 2 {
         eprintln!(
-            "usage:\n  ceremony-cli gen-srs <power> <out.srs.bin>\n  ceremony-cli init <srs> <out.transcript>\n  ceremony-cli contribute <srs> <transcript> <id-hex>\n  ceremony-cli finalize <srs> <transcript> <beacon>\n  ceremony-cli verify <srs> <transcript>\n  ceremony-cli export <srs> <transcript> <outdir>\n  ceremony-cli emit-initial <transcript> <outdir>\n  ceremony-cli assemble-transcript <srs> <parts-dir> <out.transcript>\n  ceremony-cli run <power> <n> <outdir>"
+            "usage:\n  ceremony-cli gen-srs <power> <out.srs.bin>\n  ceremony-cli init <srs> <out.transcript>\n  ceremony-cli contribute <srs> <transcript> <id-hex>\n  ceremony-cli finalize <srs> <transcript> <beacon>\n  ceremony-cli verify <srs> <transcript>\n  ceremony-cli export <srs> <transcript> <outdir>\n  ceremony-cli emit-initial <transcript> <outdir>\n  ceremony-cli assemble-transcript <srs> <parts-dir> <out.transcript>\n  ceremony-cli emit-contribution <transcript> <index> <outdir>\n  ceremony-cli run <power> <n> <outdir>"
         );
         exit(2);
     }
@@ -453,6 +512,7 @@ fn main() {
         "export" if a.len() == 5 => cmd_export(&a[2], &a[3], &a[4]),
         "emit-initial" if a.len() == 4 => cmd_emit_initial(&a[2], &a[3]),
         "assemble-transcript" if a.len() == 5 => cmd_assemble_transcript(&a[2], &a[3], &a[4]),
+        "emit-contribution" if a.len() == 5 => cmd_emit_contribution(&a[2], &a[3], &a[4]),
         "run" if a.len() == 5 => cmd_run(
             a[2].parse().unwrap_or_else(|_| die("bad power")),
             a[3].parse().unwrap_or_else(|_| die("bad n")),
