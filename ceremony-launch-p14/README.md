@@ -93,7 +93,7 @@ These are the PRE-ceremony **opening** parameters, and they are now the ones a l
 serving. Production verifying keys still come only from contributions plus the beacon finalize, per
 `docs/CEREMONY.md`; nothing here is real-value eligible yet.
 
-**Launched 2026-09-01.** Full record in `LAUNCH-RUNBOOK.md` section 1a.
+**Launched 2026-09-01.** Full record in `LAUNCH-RUNBOOK.md` section 1a. **Beacon named 2026-09-15**, before the window closed: `BEACON.md`.
 
 ```
 coordinator      osqjo-zyaaa-aaaad-agxua-cai   module ce34f578… , no controllers
