@@ -275,6 +275,32 @@ while a contributor holds an open staging slot discards their in-flight upload. 
 is unaffected, but the contributor's turn is lost. Treat the coordinator as immutable for the
 duration of the window.
 
+## 6a. Finalize
+
+The Rust CLI carries no IC agent, so the beacon step reaches the coordinator through
+`finalize.py` in this directory (python3 + ic-py; the authority identity is dfx's `default`):
+
+```
+python3 ceremony-launch-p14/icp-beacon.py resolve 2026-09-16T12:00:00Z     # after T; prints the beacon string
+python3 ceremony-launch-p14/finalize.py run 'icp-ledger-block:<index>:<hex>' <workdir>
+```
+
+`run` exports the transcript from the coordinator (every blob checked against the hash the
+coordinator recorded for it), assembles and verifies it, applies the beacon step locally with
+`ceremony-cli finalize`, verifies again, serializes that step with `ceremony-cli emit-contribution`,
+and only then talks to the coordinator: it refuses unless the caller is the authority, the window
+has closed or the queue is empty, the coordinator's contribution count equals the index of the
+emitted step, and `icp-beacon.py verify` accepts the beacon string. It then calls
+`begin_beacon_staging`, uploads both circuits in chunks under the ingress limit, and calls
+`submit_beacon` with the exact beacon bytes; on any refusal it aborts the staging slot. After the
+call it re-exports the finalized transcript from the coordinator, runs `verify-transcript
+--selfcheck` on it, and requires the from-chain verifying-key hashes to equal the local ones. The
+transcript it writes as `<workdir>/final.transcript.bin` is the one to publish.
+
+The state before finalize was exported and verified on 2026-09-15 (25 contributions,
+`TRANSCRIPT VALID`, 25 honest, `finalized (beacon) : false`), and the whole procedure was
+rehearsed the same day on a local replica running the published module (see `BEACON.md`).
+
 ## 7. After finalize
 
 The keys are not trustworthy because the coordinator accepted them. On-chain acceptance is structural

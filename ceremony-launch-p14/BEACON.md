@@ -89,11 +89,23 @@ which failed as it must.
 
 1. 2026-09-15 17:20:20 UTC: the window closes; the coordinator refuses further contributions.
 2. 2026-09-16 12:00:00 UTC: T passes; the beacon block exists and `resolve` names it.
-3. The authority applies the beacon step off-chain to the assembled transcript
-   (`ceremony-cli finalize`), uploads the resulting parameters and proof, and calls
-   `submit_beacon` with the exact beacon bytes.
+3. The authority runs `finalize.py run '<beacon>' <workdir>` (this directory). It exports the
+   transcript from the coordinator, verifies it, applies the beacon step off-chain
+   (`ceremony-cli finalize`), verifies again, serializes the step
+   (`ceremony-cli emit-contribution`), refuses to continue unless `icp-beacon.py verify`
+   accepts the beacon string, then stages the parameters and proof and calls
+   `submit_beacon` with the exact beacon bytes. It finishes by re-exporting the finalized
+   transcript from the coordinator and running `verify-transcript --selfcheck` on it, and
+   requires the verifying-key hashes of that from-chain transcript to equal those of the
+   locally finalized one.
 4. Anyone runs `verify-transcript ... --selfcheck` on the published transcript and
    `icp-beacon.py verify` on the recorded beacon. Only then are the keys production
    candidates, per `docs/CEREMONY.md` and `docs/TRUSTED-SETUP-POLICY.md`.
+
+Step 3 was rehearsed on 2026-09-15 against the published coordinator module (`ce34f578…`) on a
+local replica configured with the power-14 parameters and a closed window: `submit_beacon`
+returned `FINALIZED: beacon contribution 1 accepted`, the re-exported transcript passed
+`--selfcheck`, and it differed from the locally finalized transcript in exactly the eight bytes
+of the beacon record's timestamp, which the coordinator stamps itself.
 
 Menese DeFi Team
