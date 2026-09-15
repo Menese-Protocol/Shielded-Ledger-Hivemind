@@ -148,12 +148,13 @@ authority principal rather than on controllership, so `submit_beacon` and finali
 The published wasm carries no `candid:service` metadata, so tools cannot introspect the interface
 from the canister; `coordinator/coordinator.did` in this repository is the published interface.
 
-### Owed before the window closes
+### The beacon (settled 2026-09-15, before the window closed)
 
-**The beacon.** Decided in kind — a named future Bitcoin block height — but the specific height is
-not yet chosen or published. It must be named publicly *before* the window closes (end_time above,
-2026-09-15), or it contributes no unpredictability. Nothing in the canister blocks on it until
-finalize.
+**Named in `BEACON.md`:** the ICP ledger block with the smallest index whose timestamp is at or
+after 2026-09-16 12:00:00 UTC, folded in as `icp-ledger-block:<index>:<sha256>`. The original
+intent was a named future Bitcoin block height; it was replaced by an ICP-native source, and by a
+timestamp rather than an index so that a burst in the ledger's block rate could not pull the beacon
+block ahead of the close. `icp-beacon.py` resolves and verifies it.
 
 ## 2. Values `configure` takes
 
@@ -242,7 +243,7 @@ Query `get_ceremony_info` and confirm `configured = true`, `init_done = true`, `
 ## 5. Decisions that must be made before contributions open
 
 These are governance choices, not engineering ones, and each is irreversible or publicly binding.
-**All but the beacon were decided at launch; see section 1a for what was chosen.**
+**All were decided at launch except the beacon, settled 2026-09-15; see section 1a and `BEACON.md`.**
 
 1. **Authority identity.** Permanent, per section 4. Settled: `4jzjr-ob6oo-…`, this box's `default`
    identity. Note what that means — it is a plaintext `identity.pem` on a shared build host, not a
@@ -253,8 +254,9 @@ These are governance choices, not engineering ones, and each is irreversible or 
    ceremony-integrity risk, not a soundness break. Protect the file accordingly.
 2. **The beacon.** `docs/CEREMONY.md` §2 requires a public random beacon folded in as the final step.
    Its source must be *specified publicly before the window closes* — a named future Bitcoin block
-   height, or a named drand round — or it provides no unpredictability. Choosing it afterward
-   defeats its only purpose.
+   height, a named drand round, or as chosen here a named future ICP ledger timestamp — or it
+   provides no unpredictability. Choosing it afterward defeats its only purpose. Settled: see
+   `BEACON.md`.
 3. **The window.** `start_time`, `end_time`, `turn_timeout`. `turn_timeout` is what reclaims a slot
    from a participant who joins the queue and then disappears; too long and one absent contributor
    stalls the queue.
