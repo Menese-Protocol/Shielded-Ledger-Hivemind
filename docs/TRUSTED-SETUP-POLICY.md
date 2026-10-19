@@ -1,5 +1,9 @@
 # Groth16 trusted-setup policy
 
+**Status:** the live mainnet ledger's keyset is a multi-party ceremony keyset (25 honest
+contributions, beacon-finalized); its record and verification steps are in
+[`ceremony-launch-p14/final/`](../ceremony-launch-p14/final/).
+
 The pool uses circuit-specific Groth16 over BLS12-381. A setup keyset is part of the protocol's
 soundness boundary, not an ordinary build artifact.
 

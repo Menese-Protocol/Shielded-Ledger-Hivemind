@@ -65,11 +65,12 @@ does *not* give you is section 8, which is worth reading before the rest.
 
 *The ceremony comes before the money.*
 
-## The demo
+## Try it locally
 
-The demo runs locally (`## Running it yourself`): two browsers, two users, a private
-transfer, and a live panel showing exactly what a node provider can and cannot see.
-`node demo-frontend/verify.mjs` drives that whole story headless and screenshots every step.
+The repository also runs end to end on a local replica with a test token (`## Running it
+yourself`): two browsers, two users, a private transfer, and a live panel showing exactly what a
+node provider can and cannot see. `node demo-frontend/verify.mjs` drives that whole story
+headless and screenshots every step.
 
 *Privacy you can watch.*
 
@@ -94,8 +95,8 @@ never written at all.
 Building this on the Internet Computer carries one constraint most chains do not have: there is
 no native pairing precompile. A zero-knowledge verifier has to be written in the canister
 language itself, and a full verification has to fit inside a single message's instruction
-ceiling. This repository is that verifier, the ledger built around it, and the demo that lets
-anyone watch it work.
+ceiling. This repository is that verifier, the ledger built around it, the client that proves in
+the browser, and a local demo that lets anyone watch it work.
 
 ## What is in this repository
 
@@ -112,7 +113,7 @@ anyone watch it work.
   test-vector generator, and the frozen public fixtures.
 - **`verifier-lab/`**: the verifier's independent test batteries; differential tests against a
   pure-`Nat` reference implementation, pinned arkworks oracle vectors, and forgery batteries.
-- **`demo-frontend/`**: the public demo. All privacy-critical cryptography runs client-side in
+- **`demo-frontend/`**: the reference client and the local demo. All privacy-critical cryptography runs client-side in
   WebAssembly: note secrets, commitment and nullifier derivation, the Merkle tree rebuilt from
   the public commitment log, Groth16 proving, and the PIR client. Shielded keys derive from
   Internet Identity through vetKeys and live only in memory.
@@ -261,7 +262,8 @@ kill-and-resume) is measured in [`docs/RESTORE-BENCHMARKS.md`](docs/RESTORE-BENC
 
 Most ledgers answer this question with a privacy policy. This one answers it with a panel.
 
-Open the demo and watch the raw canister state: commitments, nullifiers, opaque ciphertext.
+Query the live ledger's state yourself, or open the local demo and watch it change:
+commitments, nullifiers, opaque ciphertext.
 There is no amount field, no balance table, no sender and no recipient anywhere in state. After
 a private transfer the demo stamps the public record plainly: nothing was written here.
 
@@ -373,29 +375,40 @@ directory), and the Motoko unit tests. What each one asserts and how to run it, 
 soak tiers and how to change the seed or scale, is mapped in [`TESTING.md`](TESTING.md). The soak's results, including the full 10,000-account /
 100,000-operation run, are in [`docs/SOAK-RESULT.md`](docs/SOAK-RESULT.md).
 
-## Trusted setup; read this before you trust it
+## Trusted setup
 
-Groth16 requires a trusted setup, and this repository refuses to hide that behind small print.
+Groth16 requires a trusted setup, and this repository does not hide that behind small print.
 A setup produces toxic waste: whoever holds it can forge proofs and mint value out of thin air,
-undetectably. The policy here is explicit:
+undetectably. Three kinds of keyset exist here, and only one of them is live:
 
-- The checked-in fixtures use a **deterministic test setup with public randomness**; loudly
-  labeled, deployment-forbidden, rejected by the frontend.
-- The live demo uses a **single-party OS-CSPRNG setup**. Its manifest states what it is:
-  `real_value_eligible: false`. You are trusting one machine, and for a valueless demo token
-  that is exactly as far as trust should stretch.
-- A real-value launch requires a **multi-party ceremony**: many independent contributors, each
-  mixing in secret randomness and destroying it, so that a single honest participant makes
-  forgery impossible forever. The full acceptance checklist a production keyset must pass is in
-  [`docs/TRUSTED-SETUP-POLICY.md`](docs/TRUSTED-SETUP-POLICY.md), and the production key gate
-  in this repository intentionally fails until a reviewed ceremony transcript exists.
+- The checked-in fixtures use a **deterministic test setup with public randomness**: labelled,
+  deployment-forbidden, rejected by the frontend.
+- The earlier public demo used a **single-party OS-CSPRNG setup** with a valueless DEMO token; its
+  manifest says `real_value_eligible: false`.
+- **The live ledger uses the keys from the multi-party ceremony**: 25 honest contributions,
+  finalized with a beacon named in public before the window closed. The ledger's verifying keys
+  are frozen to them, so a single honest participant makes forgery impossible forever. The
+  acceptance checklist the keyset had to meet is in
+  [`docs/TRUSTED-SETUP-POLICY.md`](docs/TRUSTED-SETUP-POLICY.md).
 
-### That ceremony is now live
+### Check the live keys yourself
 
-The Phase-2 ceremony is open on mainnet at
-**[ovrp2-uaaaa-aaaad-agxuq-cai.icp0.io](https://ovrp2-uaaaa-aaaad-agxuq-cai.icp0.io)**. Read
-[`docs/CEREMONY.md`](docs/CEREMONY.md) first — it is the spec and the trust model, and section 4
-is how to contribute.
+The whole ceremony record is in [`ceremony-launch-p14/final/`](ceremony-launch-p14/final/), and
+its README walks through four checks anyone can run: the checksums, the transcript (it reports
+25 honest contributions), the mainnet ledger serving exactly these verifying keys, and the
+beacon. The repository's production key gate verifies the transcript itself and binds the keys
+to it; it passes on the published keyset:
+
+```bash
+(cd ceremony && cargo build --release --bin verify-transcript)
+node demo-frontend/scripts/verify-keyset.mjs ceremony-launch-p14/final --require-real-value
+```
+
+### The ceremony
+
+The Phase-2 ceremony ran on mainnet at
+**[ovrp2-uaaaa-aaaad-agxuq-cai.icp0.io](https://ovrp2-uaaaa-aaaad-agxuq-cai.icp0.io)**.
+[`docs/CEREMONY.md`](docs/CEREMONY.md) is the spec and the trust model.
 
 ```
 coordinator canister    osqjo-zyaaa-aaaad-agxua-cai
@@ -429,10 +442,6 @@ the same thing with a fixed `WORKDIR`.
 That establishes the page has not changed since those hashes were published;
 `demo-frontend/contributor-wasm/verify-build.sh` establishes that the hashes follow from the
 source. Run both — neither is sufficient alone. See [`docs/REPRODUCING.md`](docs/REPRODUCING.md).
-
-The parameters are still **pre-ceremony opening parameters** until the window closes and the
-beacon is folded in. Nothing here is real-value eligible yet, and the production key gate still
-fails by design.
 
 *The ceremony comes before the money.*
 
@@ -488,16 +497,14 @@ demo-frontend/contributor-wasm/build.sh   # -> demo-frontend/contributor-client/
 scripts/verify-published-page.py          # the live page must serve exactly the recorded bytes
 ```
 
-## Status and boundaries
+## Status
 
-This is a working system and a valueless demo, and the difference is stated precisely. The DEMO
-token has no value; its faucet is open by design. The keyset is single-party. The demo ledger
-keeps an administrator-only fault-injection hook so the payout-failure recovery path stays
-provable; that surface belongs to the demo classification and must not exist in a real-value
-deployment. Before real value: the ceremony above, plus independent review of the circuit, the
-verifier, the ledger integration, browser randomness, stable-state upgrades, and key rotation.
+The shielded ledger is live on Internet Computer mainnet and holds real ICP. Its verifying keys
+come from the completed multi-party ceremony and are frozen; the ceremony record and the commands
+to check it are published in this repository. The local demo and its test token remain for
+anyone who wants to run the whole system on their own machine.
 
-*We built the machinery first. The pool holds real value only after the setup deserves it.*
+*The machinery came first, then the ceremony, then the money.*
 
 ## License
 
