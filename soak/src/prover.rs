@@ -18,13 +18,43 @@ use ark_bls12_381::{Bls12_381, Fr as F};
 use ark_groth16::Groth16;
 use ark_serialize::CanonicalSerialize;
 use ark_snark::SNARK;
-use common::{derive_nf, note_commitment, DepositCircuit, PoseidonCfg, TransferCircuit};
+use common::{derive_nf, note_commitment, DepositCircuit, PoseidonCfg, TransferCircuit, TREE_ARITY};
 use rand_chacha::rand_core::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 use sha2::{Digest, Sha256};
 
 pub const NOTE_PAYLOAD_LEN: usize = 104; // v(8) || rho(32) || rcm(32) || pk(32)
 pub const NOTE_TAG_LEN: usize = 8;
+
+/// The fixed output shape (ephemeral-key length, note-ciphertext length) this process seals
+/// notes to, once set; unset = the compact form (16-byte key, tag + payload). The ledger's
+/// set_note_shape refuses any output of another size, so a run under a note shape sets this
+/// to the same pair before preparing anything.
+static NOTE_SHAPE: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+
+pub fn set_note_shape(ephemeral_key_len: usize, note_ciphertext_len: usize) {
+    assert!(ephemeral_key_len >= 16, "note shape: ephemeral key shorter than 16 bytes");
+    assert!(note_ciphertext_len >= NOTE_TAG_LEN + NOTE_PAYLOAD_LEN, "note shape: ciphertext shorter than tag + payload");
+    let want = (ephemeral_key_len, note_ciphertext_len);
+    let got = *NOTE_SHAPE.get_or_init(|| want);
+    assert_eq!(got, want, "note shape already set to a different size in this process");
+}
+
+pub fn note_shape() -> Option<(usize, usize)> {
+    NOTE_SHAPE.get().copied()
+}
+
+/// The `recipient_binding` a private transfer carrying `envelope` proves (src/Main.mo
+/// claimBinding): SHA-256("picp-claim-envelope/v1" ‖ pool principal ‖ envelope), byte 31 cleared.
+pub fn claim_envelope_binding(pool: &candid::Principal, envelope: &[u8]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(b"picp-claim-envelope/v1");
+    h.update(pool.as_slice());
+    h.update(envelope);
+    let mut out: [u8; 32] = h.finalize().into();
+    out[31] = 0;
+    out
+}
 
 fn compressed_hex<T: CanonicalSerialize>(x: &T) -> String {
     let mut b = Vec::new();
@@ -77,14 +107,20 @@ pub fn encrypt_note(
     rng: &mut ChaCha20Rng,
 ) -> (Vec<u8>, Vec<u8>) {
     use rand_chacha::rand_core::RngCore;
-    let mut eph = vec![0u8; 16];
+    let (eph_len, body_len) = match note_shape() {
+        Some((eph_len, ct_len)) => (eph_len, ct_len - NOTE_TAG_LEN),
+        None => (16, NOTE_PAYLOAD_LEN),
+    };
+    let mut eph = vec![0u8; eph_len];
     rng.fill_bytes(&mut eph);
-    let mut payload = Vec::with_capacity(NOTE_PAYLOAD_LEN);
+    let mut payload = Vec::with_capacity(body_len);
     payload.extend_from_slice(&v.to_le_bytes());
     payload.extend_from_slice(&f_bytes(rho));
     payload.extend_from_slice(&f_bytes(rcm));
     payload.extend_from_slice(&f_bytes(&recipient.pk));
-    let stream = keystream(&recipient.scan_key, &eph, NOTE_PAYLOAD_LEN);
+    // padding to the fixed shape is encrypted under the same keystream, so it is uniform on chain
+    payload.resize(body_len, 0);
+    let stream = keystream(&recipient.scan_key, &eph, body_len);
     let mut body: Vec<u8> = payload.iter().zip(stream.iter()).map(|(p, s)| p ^ s).collect();
     let mut ciphertext = recognition_tag(&recipient.scan_key, &eph).to_vec();
     ciphertext.append(&mut body);
@@ -97,18 +133,23 @@ pub fn try_decrypt_note(
     eph: &[u8],
     ciphertext: &[u8],
 ) -> Option<(u64, [u8; 32], [u8; 32], [u8; 32])> {
-    if ciphertext.len() != NOTE_TAG_LEN + NOTE_PAYLOAD_LEN {
+    // the compact form, or a fixed shape whose padding must decrypt to zeros
+    if ciphertext.len() < NOTE_TAG_LEN + NOTE_PAYLOAD_LEN {
         return None;
     }
     if ciphertext[..NOTE_TAG_LEN] != recognition_tag(scan_key, eph) {
         return None;
     }
-    let stream = keystream(scan_key, eph, NOTE_PAYLOAD_LEN);
+    let body_len = ciphertext.len() - NOTE_TAG_LEN;
+    let stream = keystream(scan_key, eph, body_len);
     let plain: Vec<u8> = ciphertext[NOTE_TAG_LEN..]
         .iter()
         .zip(stream.iter())
         .map(|(c, s)| c ^ s)
         .collect();
+    if plain[NOTE_PAYLOAD_LEN..].iter().any(|&b| b != 0) {
+        return None;
+    }
     let v = u64::from_le_bytes(plain[0..8].try_into().unwrap());
     Some((
         v,
@@ -191,8 +232,9 @@ pub struct TransferPlanInput {
 /// finalization requires the current root, not merely a historical one).
 pub struct TransferCrypto {
     pub anchor: F,
-    pub path1: (Vec<F>, Vec<bool>),
-    pub path2: (Vec<F>, Vec<bool>),
+    /// (one full row per level, the walked node's slot in each row) — `DenseTree::path` shape
+    pub path1: (Vec<[F; TREE_ARITY]>, Vec<usize>),
+    pub path2: (Vec<[F; TREE_ARITY]>, Vec<usize>),
     pub out_rcm1: F,
     pub out_rcm2: F,
 }
@@ -229,8 +271,8 @@ pub fn prepare_transfer(
     let mut rng = op_rng(seed, op_index, "transfer");
     let (in1, in2) = inputs;
     let anchor_f = crypto.anchor;
-    let (sib1, bits1) = crypto.path1.clone();
-    let (sib2, bits2) = crypto.path2.clone();
+    let (rows1, pos1) = crypto.path1.clone();
+    let (rows2, pos2) = crypto.path2.clone();
     let nf1 = derive_nf(cfg, in1.nk, in1.rho);
     let nf2 = derive_nf(cfg, in2.nk, in2.rho);
     let out_rcm1 = crypto.out_rcm1;
@@ -255,8 +297,8 @@ pub fn prepare_transfer(
         in_nk: [Some(in1.nk), Some(in2.nk)],
         in_rho: [Some(in1.rho), Some(in2.rho)],
         in_rcm: [Some(in1.rcm), Some(in2.rcm)],
-        in_siblings: [sib1, sib2],
-        in_bits: [bits1, bits2],
+        in_rows: [rows1, rows2],
+        in_pos: [pos1, pos2],
         out_v: [Some(F::from(out_values.0)), Some(F::from(out_values.1))],
         out_pk: [Some(out_owners.0.pk), Some(out_owners.1.pk)],
         out_rcm: [Some(out_rcm1), Some(out_rcm2)],
@@ -291,6 +333,7 @@ pub fn prepare_transfer(
             recipient,
             created_at_time: None, // stamped at submission for unshields
             proof_hex: compressed_hex(&proof),
+            claim_envelope: None,
         },
         in_notes: (in1.note_index, in2.note_index),
         outs: [

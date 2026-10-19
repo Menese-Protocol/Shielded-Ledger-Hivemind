@@ -33,6 +33,10 @@ module {
     // rotation as an epoch change. None while unconfigured ⇒ the label is ABSENT and the tree
     // (and its digest) stays byte-identical to the pre-feature one.
     vk_anchor : ?Blob;
+    // the vk anchor leaf as it stood when freeze_verifying_keys ran — present ONLY once the keys
+    // are frozen, so every unfrozen tree is byte-identical to the pre-feature one. A frozen
+    // ledger whose `vk` leaf differs from `vk_frozen` is broken by construction.
+    vk_frozen : ?Blob;
   };
 
   public type HashTree = {
@@ -49,17 +53,22 @@ module {
 
   func zkTree(tuple : Tuple) : HashTree {
     // labels stay alphabetical: archive_manifest < audit < detect_stream < encoding_version <
-    // note_count < note_root < pir2_boundary < vk. Each optional leaf folds in ONLY when Some, so
-    // the all-None (flag-off) tree is byte-identical to the pre-feature five-leaf tree.
+    // note_count < note_root < pir2_boundary < vk < vk_frozen. Each optional leaf folds in ONLY
+    // when Some, so the all-None (flag-off) tree is byte-identical to the pre-feature five-leaf
+    // tree. The present optional leaves nest to the right after note_root:
+    //   one ⇒ fork(note_root, a); two ⇒ fork(note_root, fork(a, b)); three ⇒ fork(note_root, fork(a, fork(b, c))),
+    // which is exactly the shape the two-leaf version produced for every pre-freeze tree.
     let noteRootLeaf = labeledLeaf("note_root", tuple.note_root);
-    let tail : HashTree = switch (tuple.pir2_boundary, tuple.vk_anchor) {
-      case (null, null) noteRootLeaf;
-      case (?boundary, null) #fork(noteRootLeaf, labeledLeaf("pir2_boundary", boundary));
-      case (null, ?anchor) #fork(noteRootLeaf, labeledLeaf("vk", anchor));
-      case (?boundary, ?anchor) #fork(
-        noteRootLeaf,
-        #fork(labeledLeaf("pir2_boundary", boundary), labeledLeaf("vk", anchor)),
-      );
+    let optional : [HashTree] = Array.flatten<HashTree>([
+      switch (tuple.pir2_boundary) { case (?boundary) [labeledLeaf("pir2_boundary", boundary)]; case null [] },
+      switch (tuple.vk_anchor) { case (?anchor) [labeledLeaf("vk", anchor)]; case null [] },
+      switch (tuple.vk_frozen) { case (?frozen) [labeledLeaf("vk_frozen", frozen)]; case null [] },
+    ]);
+    let tail : HashTree = if (optional.size() == 0) noteRootLeaf else {
+      var rest : HashTree = optional[optional.size() - 1];
+      var k = optional.size() - 1;
+      while (k > 0) { k -= 1; rest := #fork(optional[k], rest) };
+      #fork(noteRootLeaf, rest)
     };
     let auditNode : HashTree = switch (tuple.detect_stream) {
       case null labeledLeaf("audit", tuple.audit_digest);

@@ -78,6 +78,38 @@ pub struct ExpectedBlock {
     pub output_note: usize,
 }
 
+/// The protocol-fee side of the ledger (src/Main.mo set_protocol_fee / protocol_fee_sweep), as the
+/// harness expects it. All zero under a zero schedule, where every rule below reduces to the
+/// fee-free pool: custody == pool_value.
+#[derive(Clone, Copy, Default, Debug, serde::Serialize, serde::Deserialize)]
+pub struct FeeLedger {
+    /// flat fee on every private transfer (the statement's public `fee`)
+    pub send_fee: u64,
+    /// unshield share in basis points, rounded up: ceil(v_pub_out * bps / 10_000)
+    pub unshield_bps: u64,
+    /// earned and not yet swept; held in the pool account beside pool_value
+    pub revenue: u128,
+    /// the ledger's treasury balance
+    pub treasury: u128,
+    /// expected token balance of the ledger's treasury subaccount
+    pub treasury_custody: u128,
+    /// everything ever earned (send fees + unshield shares)
+    pub earned_total: u128,
+    /// everything sweeps took out of revenue, token fees included
+    pub swept_total: u128,
+    pub sweeps: u64,
+    /// claim envelopes the ledger must have logged (one per accepted enveloped private transfer)
+    pub claim_log: u64,
+    /// proof verifications that must have failed (forgeries that reach the verifier)
+    pub verifier_failures: u64,
+}
+
+impl FeeLedger {
+    pub fn unshield_share(&self, v_pub_out: u64) -> u64 {
+        ((v_pub_out as u128 * self.unshield_bps as u128 + 9_999) / 10_000) as u64
+    }
+}
+
 /// GROUND TRUTH for the B11 amount-correlation audit: a public value event (shield-in or
 /// unshield-out), with the block index and timestamp-bearing position it occurred at.
 #[derive(Clone, Debug)]
@@ -111,12 +143,13 @@ pub struct Model {
     pub shield_events: Vec<PublicAmountEvent>,
     /// B11 ground truth: public unshield-out value events (v_pub_out is public on the token ledger)
     pub unshield_events: Vec<PublicAmountEvent>,
+    pub fees: FeeLedger,
 }
 
 impl Model {
     pub fn new(n_accounts: usize, initial_balance: u128, token_fee: u64) -> Self {
         let cfg = poseidon_config();
-        let mirror = MerkleMirror::new(&cfg);
+        let mirror = MerkleMirror::new();
         let mut historical_roots = HashSet::new();
         historical_roots.insert(f_bytes(&mirror.root()));
         Model {
@@ -137,7 +170,29 @@ impl Model {
             cumulative_unshield_out: 0,
             shield_events: Vec::new(),
             unshield_events: Vec::new(),
+            fees: FeeLedger::default(),
         }
+    }
+
+    /// The fee a transfer must carry under the schedule (src/Main.mo requiredTransferFee).
+    pub fn required_fee(&self, v_pub_out: u64) -> u64 {
+        if v_pub_out == 0 {
+            self.fees.send_fee
+        } else {
+            self.token_fee + self.fees.unshield_share(v_pub_out)
+        }
+    }
+
+    /// Record an accepted sweep of `amount` from revenue into the treasury: the pool account pays
+    /// `amount` plus the token fee, revenue gives up the same, the treasury gains `amount`.
+    pub fn apply_sweep(&mut self, amount: u64) {
+        let out = amount as u128 + self.token_fee as u128;
+        self.fees.revenue = self.fees.revenue.checked_sub(out).expect("model: sweep beyond revenue");
+        self.pool_custody = self.pool_custody.checked_sub(out).expect("model: sweep overdraws pool custody");
+        self.fees.treasury += amount as u128;
+        self.fees.treasury_custody += amount as u128;
+        self.fees.swept_total += out;
+        self.fees.sweeps += 1;
     }
 
     /// Record an accepted shield: one appended commitment, no nullifiers.
@@ -150,7 +205,7 @@ impl Model {
     ) {
         let anchor_before = f_bytes(&self.mirror.root());
         let cm = note_commitment(&self.cfg, v, acct.pk, rho, rcm);
-        let leaf_index = self.mirror.append(&self.cfg, cm);
+        let leaf_index = self.mirror.append(cm);
         let root_after = f_bytes(&self.mirror.root());
         let nf = derive_nf(&self.cfg, acct.nk, rho);
         let idx = self.notes.len();
@@ -209,7 +264,7 @@ impl Model {
         for (j, (owner, v, rcm)) in outs.iter().enumerate() {
             let pk = accounts[*owner].pk;
             let cm = note_commitment(&self.cfg, *v, pk, rhos[j], *rcm);
-            let leaf_index = self.mirror.append(&self.cfg, cm);
+            let leaf_index = self.mirror.append(cm);
             roots_after[j] = self.mirror.root();
             let nf = derive_nf(&self.cfg, accounts[*owner].nk, rhos[j]);
             let idx = self.notes.len();
@@ -249,7 +304,10 @@ impl Model {
         if v_pub_out > 0 {
             let recipient = recipient_acct.expect("unshield needs recipient");
             self.unshield_events.push(PublicAmountEvent { value: v_pub_out, block_index: self.blocks.len() - 2 });
-            // pool pays v_pub_out to the recipient plus the transparent fee.
+            // pool pays v_pub_out to the recipient plus the transparent fee; the protocol share
+            // leaves pool_value for revenue and stays in the pool account until swept.
+            let share = self.fees.unshield_share(v_pub_out) as u128;
+            assert_eq!(fee, self.required_fee(v_pub_out), "harness policy: unshield fee == token fee + protocol share");
             let debit = v_pub_out as u128 + self.token_fee as u128;
             self.pool_custody = self
                 .pool_custody
@@ -257,16 +315,21 @@ impl Model {
                 .expect("model: unshield overdraws pool custody");
             self.pool_value = self
                 .pool_value
-                .checked_sub(debit)
+                .checked_sub(debit + share)
                 .expect("model: unshield overdraws pool value");
             self.cumulative_unshield_out += debit;
+            self.fees.revenue += share;
+            self.fees.earned_total += share;
             self.token_balances[recipient] += v_pub_out as u128;
-            // The harness sets the shielded public `fee` == transparent token fee, so shielded
-            // value destroyed (fee + v_pub_out) equals the pool debit and the invariant
-            // pool_value == Σ unspent notes is preserved exactly.
-            assert_eq!(fee, self.token_fee, "harness policy: unshield fee == transparent fee");
         } else {
-            assert_eq!(fee, 0, "harness policy: private transfers carry fee 0");
+            // the flat send fee leaves the notes and pool_value for revenue; custody is unchanged
+            assert_eq!(fee, self.fees.send_fee, "harness policy: private transfers carry exactly the send fee");
+            self.pool_value = self
+                .pool_value
+                .checked_sub(fee as u128)
+                .expect("model: send fee overdraws pool value");
+            self.fees.revenue += fee as u128;
+            self.fees.earned_total += fee as u128;
         }
         self.epoch += 1;
     }
@@ -312,6 +375,15 @@ impl Model {
         h.update(self.pool_value.to_le_bytes());
         h.update(self.pool_custody.to_le_bytes());
         h.update(self.epoch.to_le_bytes());
+        // the fee side joins the hash only under a fee schedule, so a zero-schedule run keeps
+        // the digest every earlier run recorded
+        if self.fees.send_fee > 0 || self.fees.unshield_bps > 0 {
+            h.update(b"fees");
+            for n in [self.fees.revenue, self.fees.treasury, self.fees.earned_total, self.fees.swept_total] {
+                h.update(n.to_le_bytes());
+            }
+            h.update(self.fees.claim_log.to_le_bytes());
+        }
         h.update(last_block_hash);
         hex::encode(h.finalize())
     }

@@ -12,7 +12,10 @@ import Principal "mo:core/Principal";
 import Result "mo:core/Result";
 import Text "mo:core/Text";
 
-persistent actor DemoDirectory {
+/// `vetkd_key_name`: the threshold vetKD key this directory derives from, fixed at install.
+/// Mainnet real value must use `key_1`; local dfx/PocketIC replicas expose `key_1` (dfx 0.32) or
+/// `test_key_1` (older). Absent (empty install args, as the upgrade probes send) = `test_key_1`.
+persistent actor class DemoDirectory(vetkd_key_name : ?Text) = self {
   public type Entry = { shielded_pk : Text; enc_pk : Text };
 
   type VetKdKeyId = { curve : { #bls12_381_g2 }; name : Text };
@@ -36,7 +39,12 @@ persistent actor DemoDirectory {
   // table from its state.
   let birthdays = Map.empty<Principal, Blob>();
   let vetkd : VetKdSystemApi = actor ("aaaaa-aa");
-  let key_id : VetKdKeyId = { curve = #bls12_381_g2; name = "test_key_1" };
+  // Stable, so an upgrade keeps the key chosen at install: a different key would derive every
+  // user's shielded account anew and strand their notes.
+  let key_id : VetKdKeyId = {
+    curve = #bls12_381_g2;
+    name = switch (vetkd_key_name) { case (?name) name; case null "test_key_1" };
+  };
   let key_context : Blob = Text.encodeUtf8("picp-shielded-account/v1");
   let VETKD_DERIVE_CYCLES : Nat = 26_153_846_153;
 
@@ -44,7 +52,7 @@ persistent actor DemoDirectory {
   /// with its principal input while verifying the encrypted key response.
   public shared func vetkey_public_key() : async Blob {
     let reply = await vetkd.vetkd_public_key({
-      canister_id = ?Principal.fromActor(DemoDirectory);
+      canister_id = ?Principal.fromActor(self);
       context = key_context;
       key_id;
     });

@@ -1029,6 +1029,16 @@ def main() -> None:
         f'(principal "{token_canister}", principal "{adapter_canister}", null)',
     )
     assert "ok" in token_configured, token_configured
+    # The fixture transfer proofs carry fee = 5 (fee.txt). The ledger requires a proof's fee to
+    # equal the protocol schedule exactly, so this suite runs with a flat send fee of 5 and Z0
+    # checks that the 5 is earned (pool_value -5, revenue +5) instead of left untracked.
+    fixture_send_fee = int(read("fee.txt"))
+    fee_schedule = call(
+        "zk_ledger",
+        "set_protocol_fee",
+        f"(record {{ send_fee = {fixture_send_fee} : nat64; unshield_bps = 0 : nat; recipient = null }})",
+    )
+    assert "ok" in fee_schedule, fee_schedule
 
     # Exercise the ICRC-1 method surface and canonical 1xfer schema independently of Gate 4.
     probe_owner = "2vxsx-fae"
@@ -1843,6 +1853,7 @@ def main() -> None:
         transfer_argument(anchor, nf1, nf2, cm1, cm2, fee, v_pub_out, read("transfer_proof.hex")),
     )
     after_valid = call("zk_ledger", "status", query=True)
+    after_valid_fees = call("zk_ledger", "protocol_fee_status", query=True)
     private_transfer_token_length_after = as_int(call(
         ICP_LEDGER_CANISTER, "icrc3_get_blocks", "(vec { record { start = 0; length = 0 } })", query=True
     )["log_length"])
@@ -1960,7 +1971,9 @@ def main() -> None:
         and valid["verifier_outcome"] == "ACCEPT"
         and as_int(after_valid["note_count"]) == 4
         and as_int(after_valid["nullifier_count"]) == 2
-        and as_int(after_valid["pool_value"]) == 100
+        and as_int(after_valid["pool_value"]) == 100 - fixture_send_fee
+        and as_int(after_valid_fees["revenue"]) == fixture_send_fee
+        and as_int(after_valid_fees["pool_custody_at_rest"]) == 100
         and as_int(after_valid["epoch"]) == 3
         and as_int(blocks["log_length"]) == 4
         and block_ids == [0, 1, 2, 3, 1, 2]

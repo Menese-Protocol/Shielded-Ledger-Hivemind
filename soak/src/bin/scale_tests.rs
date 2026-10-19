@@ -753,6 +753,7 @@ fn t3() -> bool {
                 recipient: None,
                 created_at_time: None,
                 proof_hex: "00".into(),
+                claim_envelope: None,
             },))
             .unwrap(),
         );

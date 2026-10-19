@@ -16,7 +16,7 @@ use crate::pic_env::Env;
 use crate::prover::try_decrypt_note;
 use ark_bls12_381::Fr as F;
 use ark_ff::PrimeField;
-use common::{derive_nf, note_commitment, poseidon_config, IncrementalTree};
+use common::{derive_nf, note_commitment, poseidon_config, poseidon_config_tree, IncrementalTree};
 use std::collections::{HashMap, HashSet};
 
 pub struct RawBlock {
@@ -146,7 +146,8 @@ pub struct ReplayResult {
 /// compute per-account balances from ciphertext recognition.
 pub fn replay(blocks: &[RawBlock], accounts: &[AccountKeys]) -> ReplayResult {
     let cfg = poseidon_config();
-    let mut tree = IncrementalTree::new(&cfg);
+    let cfg_tree = poseidon_config_tree();
+    let mut tree = IncrementalTree::new(&cfg_tree);
     let mut known_roots: HashSet<[u8; 32]> = HashSet::new();
     known_roots.insert(crate::crypto::f_bytes(&tree.root));
     let mut spent: HashSet<[u8; 32]> = HashSet::new();
@@ -177,7 +178,7 @@ pub fn replay(blocks: &[RawBlock], accounts: &[AccountKeys]) -> ReplayResult {
                     b.commitment,
                     "shield block {i}: non-canonical commitment"
                 );
-                tree.append(&cfg, leaf);
+                tree.append(&cfg_tree, leaf);
                 assert_eq!(
                     b.note_root_after,
                     crate::crypto::f_bytes(&tree.root),
@@ -213,7 +214,7 @@ pub fn replay(blocks: &[RawBlock], accounts: &[AccountKeys]) -> ReplayResult {
                         blk.commitment,
                         "transfer block: non-canonical commitment"
                     );
-                    tree.append(&cfg, leaf);
+                    tree.append(&cfg_tree, leaf);
                 }
                 let root_now = crate::crypto::f_bytes(&tree.root);
                 assert_eq!(b.note_root_after, root_now, "transfer root_after mismatch at {i}");

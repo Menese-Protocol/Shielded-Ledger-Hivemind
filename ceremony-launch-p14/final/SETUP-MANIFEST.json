@@ -1,0 +1,26 @@
+{
+  "format": 1,
+  "proof_system": "Groth16",
+  "curve": "BLS12-381",
+  "setup_mode": "multi-party-phase2-ceremony",
+  "publicly_reproducible_toxic_waste": false,
+  "phase2_ceremony": true,
+  "phase1_provenance": "inherited-reviewed-phase1",
+  "srs_sha256": "94f268950305fd23b50fa77dec3d540e2742d3472d7416160cce627566ae39e8",
+  "honest_contributions": 25,
+  "minimum_honest_contributions": 5,
+  "finalized_with_beacon": true,
+  "multi_party_ceremony": true,
+  "real_value_eligible": true,
+  "transfer_pk_sha256": "31dd9e584b7425e41ddf6cbb6fb3148c15028f4325e9722cfa42a5eb30193e36",
+  "transfer_vk_sha256": "aad6a728c477e1d3cc69d839a949597497e90b310b0aedc995b17e24e6704155",
+  "deposit_pk_sha256": "cad7fbacd849dc94fa30b6e1ba2a7e36e02ec93e0a8aa26c36fbfd9ca08f4b56",
+  "deposit_vk_sha256": "4a7bfd81419fa779511f5aeb1207787b69af49b37cb43ae37c45f09a5770478d",
+  "ceremony": {
+    "srs": "sapling-phase1-p14.srs.bin",
+    "transcript": "final.transcript.bin",
+    "transfer_vk_sha256": "f409d18f8149ccae11d9319f95c80fde72f3a9b13834d1c3410050e190116514",
+    "deposit_vk_sha256": "b0afc42ad1b764b9fc2c435c41b328bc822c2ac70937211df1bcd9af23112224"
+  },
+  "note": "real_value_eligible requires an inherited reviewed Phase-1 SRS, at least the minimum honest contributions, and a beacon finalize. It is a LABEL: the production gate re-verifies the transcript and ignores this field."
+}

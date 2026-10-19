@@ -28,12 +28,52 @@ pub struct ExpectedTuple {
     /// only when the detect chain is enabled (flag-off runs pass None and the canonical
     /// tree is byte-identical to the pre-feature one)
     pub detect_stream: Option<Vec<u8>>,
+    /// certified verifying-key anchor leaf sha256("zk-ledger/vk-anchor/v1" ‖ transfer_vk_hex ‖
+    /// deposit_vk_hex) ‖ vk_epoch (8B BE) — present whenever the pool is configured
+    pub vk_anchor: Option<Vec<u8>>,
+    /// certified frozen-key leaf: the vk anchor as it stood at freeze_verifying_keys — present
+    /// only once the keys are frozen (unfrozen runs pass None; the tree is then unchanged)
+    pub vk_frozen: Option<Vec<u8>>,
+}
+
+/// The vk anchor the ledger must certify, computed independently from the keyset the harness
+/// configured it with (src/Main.mo vkAnchorLeaf).
+pub fn expected_vk_anchor(transfer_vk_hex: &str, deposit_vk_hex: &str, vk_epoch: u64) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"zk-ledger/vk-anchor/v1");
+    h.update(transfer_vk_hex.as_bytes());
+    h.update(deposit_vk_hex.as_bytes());
+    let mut out = h.finalize().to_vec();
+    out.extend_from_slice(&vk_epoch.to_be_bytes());
+    out
 }
 
 fn leb128(value: u64) -> Vec<u8> {
     let mut output = Vec::new();
     leb128::write::unsigned(&mut output, value).expect("Vec write cannot fail");
     output
+}
+
+/// zkTree's tail (src/CertifiedTuple.mo): note_root, then the optional leaves that are present
+/// (pir2_boundary, vk, vk_frozen, alphabetical) nested to the right:
+/// one => fork(note_root, a); two => fork(note_root, fork(a, b)); three => fork(note_root, fork(a, fork(b, c))).
+fn note_root_tail(note_root: Vec<u8>, pir2_boundary: &Option<Vec<u8>>, vk_anchor: &Option<Vec<u8>>, vk_frozen: &Option<Vec<u8>>) -> HashTree {
+    let mut optional: Vec<HashTree> = Vec::new();
+    if let Some(b) = pir2_boundary {
+        optional.push(labeled("pir2_boundary", leaf(b.clone())));
+    }
+    if let Some(a) = vk_anchor {
+        optional.push(labeled("vk", leaf(a.clone())));
+    }
+    if let Some(f) = vk_frozen {
+        optional.push(labeled("vk_frozen", leaf(f.clone())));
+    }
+    let mut rest = optional.into_iter().rev();
+    match rest.next() {
+        None => labeled("note_root", leaf(note_root)),
+        Some(last) => fork(labeled("note_root", leaf(note_root)), rest.fold(last, |acc, node| fork(node, acc))),
+    }
 }
 
 fn canonical_tree(t: &ExpectedTuple, tip_index_leaf: Vec<u8>, note_root: Vec<u8>) -> HashTree {
@@ -61,13 +101,7 @@ fn canonical_tree(t: &ExpectedTuple, tip_index_leaf: Vec<u8>, note_root: Vec<u8>
                         labeled("encoding_version", leaf(leb128(t.encoding_version))),
                         fork(
                             labeled("note_count", leaf(leb128(t.note_count))),
-                            match &t.pir2_boundary {
-                                Some(b) => fork(
-                                    labeled("note_root", leaf(note_root)),
-                                    labeled("pir2_boundary", leaf(b.clone())),
-                                ),
-                                None => labeled("note_root", leaf(note_root)),
-                            },
+                            note_root_tail(note_root, &t.pir2_boundary, &t.vk_anchor, &t.vk_frozen),
                         ),
                     ),
                 ),

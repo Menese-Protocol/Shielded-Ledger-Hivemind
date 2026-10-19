@@ -227,6 +227,15 @@
   /// Force the next payout to fail AFTER the token transfer and before the finalize commit.
   /// Refused while an intent is in flight, which is why the batteries stage the flag from the
   /// fixture side instead of calling this.
+  /// Treat the next shield's token call as rejected (the ledger unreachable or refusing the call):
+  /// the intent stays pending and no token moves.
+  public shared ({ caller }) func test_arm_reject_token_call_once() : async Result<()> {
+    if (not isAdministrator(caller)) return #err("REJECT:not-administrator");
+    if (pending_shield != null or pending_unshield != null) return #err("REJECT:pending-token-mutation");
+    test_reject_token_call_once := true;
+    #ok(())
+  };
+
   public shared ({ caller }) func test_arm_fail_after_token_once() : async Result<()> {
     switch (guardRejection()) { case (?message) return #err(message); case null {} };
     if (not isAdministrator(caller)) return #err("REJECT:not-administrator");

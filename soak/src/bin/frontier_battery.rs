@@ -123,8 +123,10 @@ impl Harness {
 fn main() {
     let root = repo_root();
     let keyset_for = || {
-        let manifest = std::fs::read_to_string(root.join("fixtures/pool-vectors-bls12-381/SETUP-MANIFEST.json")).unwrap();
-        keys::regenerate_and_verify(&manifest, true).expect("keyset")
+        // the soak's statement selector (default: the shipped hardened statement)
+        let (legacy, dir) = keys::statement_from_env();
+        let manifest = std::fs::read_to_string(root.join(dir).join("SETUP-MANIFEST.json")).unwrap();
+        keys::regenerate_and_verify(&manifest, legacy).expect("keyset")
     };
     println!("[battery] building wasms (ledger + token + honest oracle)...");
     let wasms = pic_env::build_wasms(&root, &root.join("soak/target/wasms"));

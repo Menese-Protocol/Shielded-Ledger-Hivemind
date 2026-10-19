@@ -10,7 +10,7 @@
 //! stored.
 
 use crate::crypto::{f_bytes, f_from_bytes, MerkleMirror};
-use crate::model::{ExpectedBlock, Model, NoteRecord, PublicAmountEvent};
+use crate::model::{ExpectedBlock, FeeLedger, Model, NoteRecord, PublicAmountEvent};
 use ark_bls12_381::Fr as F;
 use rand_chacha::ChaCha20Rng;
 use serde::{Deserialize, Serialize};
@@ -98,6 +98,7 @@ pub struct Checkpoint {
     cumulative_unshield_out: u128,
     shield_events: Vec<AmountEvCp>,
     unshield_events: Vec<AmountEvCp>,
+    pub fees: FeeLedger,
 }
 
 impl Checkpoint {
@@ -147,6 +148,7 @@ impl Checkpoint {
                 .iter()
                 .map(|e| AmountEvCp { value: e.value, block_index: e.block_index })
                 .collect(),
+            fees: model.fees,
         }
     }
 
@@ -159,9 +161,9 @@ impl Checkpoint {
         // rebuild the Merkle mirror by appending commitments in leaf-index order
         let mut ordered: Vec<(u64, [u8; 32])> = self.notes.iter().map(|n| (n.leaf_index, n.cm)).collect();
         ordered.sort_by_key(|(li, _)| *li);
-        let mut mirror = MerkleMirror::new(cfg);
+        let mut mirror = MerkleMirror::new();
         for (li, cm) in &ordered {
-            let appended = mirror.append(cfg, f_from_bytes(cm).expect("cm bytes"));
+            let appended = mirror.append(f_from_bytes(cm).expect("cm bytes"));
             assert_eq!(appended, *li, "checkpoint: leaf index mismatch on mirror rebuild");
         }
         for (idx, n) in self.notes.iter().enumerate() {
@@ -222,6 +224,7 @@ impl Checkpoint {
                 .iter()
                 .map(|e| PublicAmountEvent { value: e.value, block_index: e.block_index })
                 .collect(),
+            fees: self.fees,
         }
     }
 }
@@ -239,6 +242,7 @@ pub struct ModelPart {
     pub cumulative_unshield_out: u128,
     pub shield_events: Vec<AmountEvCp>,
     pub unshield_events: Vec<AmountEvCp>,
+    pub fees: FeeLedger,
 }
 
 impl ModelPart {
@@ -295,6 +299,7 @@ impl ModelPart {
             cumulative_unshield_out: self.cumulative_unshield_out,
             shield_events: self.shield_events,
             unshield_events: self.unshield_events,
+            fees: self.fees,
         }
     }
 }

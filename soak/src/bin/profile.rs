@@ -449,11 +449,12 @@ fn main() {
     }
 
     // B1a gate: the keys the environment is configured with are the proven pinned setup.
+    // the soak's statement selector (default: the shipped hardened statement)
+    let (legacy, dir) = keys::statement_from_env();
     let manifest_json =
-        std::fs::read_to_string(root.join("fixtures/pool-vectors-bls12-381/SETUP-MANIFEST.json"))
-            .expect("read SETUP-MANIFEST.json");
+        std::fs::read_to_string(root.join(dir).join("SETUP-MANIFEST.json")).expect("read SETUP-MANIFEST.json");
     println!("[B1a] regenerating keyset (seed 20260712)...");
-    let keyset = keys::regenerate_and_verify(&manifest_json, true).expect("B1a keyset gate");
+    let keyset = keys::regenerate_and_verify(&manifest_json, legacy).expect("B1a keyset gate");
     println!("[B1a] PASS");
     keys::verify_frozen_fixtures(&root.join("fixtures/pool-vectors-bls12-381"), &keyset)
         .expect("B1b frozen fixtures");
@@ -481,7 +482,7 @@ fn main() {
     println!("[env] 3 accounts funded");
 
     // ---------------- end-to-end per-entry-point deltas ----------------
-    let mut mirror = MerkleMirror::new(&cfg);
+    let mut mirror = MerkleMirror::new();
     let mut notes: Vec<LocalNote> = Vec::new();
     let mut stats: Vec<OpStat> = Vec::new();
     let mut op_index: u64 = 0;
@@ -511,7 +512,7 @@ fn main() {
         let after = env.ledger_rts();
         stats.push(rts("shield", &before, &after));
         let cm = common::note_commitment(&cfg, v, accounts[0].pk, rho, rcm);
-        let leaf = mirror.append(&cfg, cm);
+        let leaf = mirror.append(cm);
         assert_eq!(
             f_bytes(&mirror.root()).to_vec(),
             m.note_root.to_vec(),
@@ -606,8 +607,8 @@ fn main() {
             let nf2 = common::derive_nf(&cfg, accounts[0].nk, n2.rho);
             let cm1 = common::note_commitment(&cfg, out_v1, accounts[0].pk, nf1, crypto.out_rcm1);
             let cm2 = common::note_commitment(&cfg, out_v2, accounts[0].pk, nf2, crypto.out_rcm2);
-            let l1 = mirror.append(&cfg, cm1);
-            let l2 = mirror.append(&cfg, cm2);
+            let l1 = mirror.append(cm1);
+            let l2 = mirror.append(cm2);
             assert_eq!(
                 f_bytes(&mirror.root()).to_vec(),
                 m.note_root.to_vec(),

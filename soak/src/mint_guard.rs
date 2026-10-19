@@ -21,7 +21,7 @@ use ark_bls12_381::Fr as F;
 use ark_ff::UniformRand;
 use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystem};
 use ark_std::rand::SeedableRng;
-use common::{poseidon_config, DenseTree, Note, TransferCircuit};
+use common::{poseidon_config, poseidon_config_tree, DenseTree, Note, TransferCircuit};
 
 pub struct MintGuardReport {
     pub imbalance_unsatisfiable: bool,
@@ -39,10 +39,11 @@ pub fn native_counterfeit_check() -> MintGuardReport {
 
     let n1 = Note { v: 70, nk, rho: F::rand(&mut rng), rcm: F::rand(&mut rng) };
     let n2 = Note { v: 30, nk, rho: F::rand(&mut rng), rcm: F::rand(&mut rng) };
+    let cfg_tree = poseidon_config_tree();
     let tree = DenseTree { leaves: vec![n1.cm(&cfg), n2.cm(&cfg)] };
-    let anchor = tree.root(&cfg);
-    let (sib1, bits1) = tree.path(&cfg, 0);
-    let (sib2, bits2) = tree.path(&cfg, 1);
+    let anchor = tree.root(&cfg_tree);
+    let (rows1, pos1) = tree.path(&cfg_tree, 0);
+    let (rows2, pos2) = tree.path(&cfg_tree, 1);
     let nf1 = n1.nf(&cfg);
     let nf2 = n2.nf(&cfg);
 
@@ -63,8 +64,8 @@ pub fn native_counterfeit_check() -> MintGuardReport {
         in_nk: [Some(nk), Some(nk)],
         in_rho: [Some(n1.rho), Some(n2.rho)],
         in_rcm: [Some(n1.rcm), Some(n2.rcm)],
-        in_siblings: [sib1.clone(), sib2.clone()],
-        in_bits: [bits1.clone(), bits2.clone()],
+        in_rows: [rows1.clone(), rows2.clone()],
+        in_pos: [pos1.clone(), pos2.clone()],
         out_v: [Some(out_v[0]), Some(out_v[1])],
         out_pk: [Some(pk), Some(pk)],
         out_rcm: [Some(F::rand(&mut rng.clone())), Some(F::rand(&mut rng.clone()))],

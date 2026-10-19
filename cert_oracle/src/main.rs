@@ -33,6 +33,9 @@ struct ExpectedTuple {
     /// optional verifying-key anchor leaf (digest(32) ‖ epoch 8B BE) — present as soon as
     /// the ledger is configured with verifying keys; label "vk" in the certified tuple
     vk_anchor: Option<Vec<u8>>,
+    /// optional frozen-key leaf (the vk anchor as it stood at freeze_verifying_keys) — present
+    /// only once the keys are frozen; label "vk_frozen" in the certified tuple
+    vk_frozen: Option<Vec<u8>>,
     /// optional detect-chain stream leaf — present only while detect_chain is enabled
     detect_stream: Option<Vec<u8>>,
     minimum_tip: u64,
@@ -68,6 +71,28 @@ struct Report {
     envelope: Envelope,
 }
 
+
+/// zkTree's tail (src/CertifiedTuple.mo): note_root, then the optional leaves that are present
+/// (pir2_boundary, vk, vk_frozen, alphabetical) nested to the right:
+/// one => fork(note_root, a); two => fork(note_root, fork(a, b)); three => fork(note_root, fork(a, fork(b, c))).
+fn note_root_tail(note_root: Vec<u8>, pir2_boundary: &Option<Vec<u8>>, vk_anchor: &Option<Vec<u8>>, vk_frozen: &Option<Vec<u8>>) -> HashTree {
+    let mut optional: Vec<HashTree> = Vec::new();
+    if let Some(b) = pir2_boundary {
+        optional.push(labeled("pir2_boundary", leaf(b.clone())));
+    }
+    if let Some(a) = vk_anchor {
+        optional.push(labeled("vk", leaf(a.clone())));
+    }
+    if let Some(f) = vk_frozen {
+        optional.push(labeled("vk_frozen", leaf(f.clone())));
+    }
+    let mut rest = optional.into_iter().rev();
+    match rest.next() {
+        None => labeled("note_root", leaf(note_root)),
+        Some(last) => fork(labeled("note_root", leaf(note_root)), rest.fold(last, |acc, node| fork(node, acc))),
+    }
+}
+
 fn argument(args: &[String], name: &str) -> Result<String, String> {
     let position = args
         .iter()
@@ -100,6 +125,13 @@ fn expected(args: &[String]) -> Result<ExpectedTuple, String> {
         vk_anchor: match args.iter().position(|value| value == "--vk-anchor") {
             Some(position) => Some(
                 hex::decode(args.get(position + 1).ok_or("missing value for --vk-anchor")?)
+                    .map_err(|e| e.to_string())?,
+            ),
+            None => None,
+        },
+        vk_frozen: match args.iter().position(|value| value == "--vk-frozen") {
+            Some(position) => Some(
+                hex::decode(args.get(position + 1).ok_or("missing value for --vk-frozen")?)
                     .map_err(|e| e.to_string())?,
             ),
             None => None,
@@ -150,26 +182,7 @@ fn canonical_tree(tuple: &ExpectedTuple, tip_index_leaf: Vec<u8>, note_root: Vec
                         labeled("encoding_version", leaf(leb128(tuple.encoding_version))),
                         fork(
                             labeled("note_count", leaf(leb128(tuple.note_count))),
-                            // mirrors zkTree's tail: note_root folds with the optional
-                            // pir2_boundary and vk-anchor leaves, labels alphabetical
-                            match (&tuple.pir2_boundary, &tuple.vk_anchor) {
-                                (None, None) => labeled("note_root", leaf(note_root)),
-                                (Some(boundary), None) => fork(
-                                    labeled("note_root", leaf(note_root)),
-                                    labeled("pir2_boundary", leaf(boundary.clone())),
-                                ),
-                                (None, Some(anchor)) => fork(
-                                    labeled("note_root", leaf(note_root)),
-                                    labeled("vk", leaf(anchor.clone())),
-                                ),
-                                (Some(boundary), Some(anchor)) => fork(
-                                    labeled("note_root", leaf(note_root)),
-                                    fork(
-                                        labeled("pir2_boundary", leaf(boundary.clone())),
-                                        labeled("vk", leaf(anchor.clone())),
-                                    ),
-                                ),
-                            },
+                            note_root_tail(note_root, &tuple.pir2_boundary, &tuple.vk_anchor, &tuple.vk_frozen),
                         ),
                     ),
                 ),

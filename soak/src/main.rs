@@ -61,13 +61,39 @@ fn main() {
             println!("[A2] PASS: counterfeit witnesses UNSATISFIABLE; range check shown load-bearing");
 
             println!("[build] compiling canisters and hashing wasms...");
-            let wasms = pic_env::build_wasms(&root, &root.join("soak/target/wasms"));
+            let mut wasms = pic_env::build_wasms(&root, &root.join("soak/target/wasms"));
             println!("[build] moc {} ({})", wasms.moc_version, wasms.moc_path);
-            println!("[build] zk_ledger.wasm          sha256 {}", wasms.ledger_sha256);
-            println!("[build] icp_ledger_fixture.wasm sha256 {}", wasms.token_sha256);
+            println!("[build] zk_ledger.wasm          sha256 {} (shipped source)", wasms.ledger_sha256);
+            // The soak injects faults (`test_arm_fail_after_token_once`), which only the hook build
+            // carries; run the hook build unless a pre-built ledger was supplied explicitly.
+            if std::env::var("SOAK_LEDGER_WASM").is_err() {
+                use sha2::Digest;
+                wasms.ledger = pic_env::build_hook_ledger(&root, &root.join("soak/target/wasms"));
+                wasms.ledger_sha256 = hex::encode(sha2::Sha256::digest(&wasms.ledger));
+                println!("[build] zk_ledger (+test hooks)  sha256 {} (the wasm this run installs)", wasms.ledger_sha256);
+            }
+            let tier = runner::TierConfig::from_env();
+            let token_ledger = match &tier.icp {
+                None => {
+                    println!("[build] icp_ledger_fixture.wasm sha256 {}", wasms.token_sha256);
+                    "icrc3-fixture"
+                }
+                Some(icp) => {
+                    let bytes = std::fs::read(&icp.wasm)
+                        .unwrap_or_else(|e| panic!("read ICP_LEDGER_WASM {}: {e}", icp.wasm.display()));
+                    wasms.token_sha256 = pic_env::sha_hex(&bytes);
+                    println!(
+                        "[build] NNS ICP ledger wasm   sha256 {} ({}; archive after {} blocks, every {} crash resumed late)",
+                        wasms.token_sha256,
+                        icp.wasm.display(),
+                        icp.archive_trigger,
+                        if icp.late_resume_every == 0 { "no".to_string() } else { format!("{}th", icp.late_resume_every) }
+                    );
+                    "nns-icp-ledger"
+                }
+            };
             println!("[build] tree_oracle_bls.wasm    sha256 {}", wasms.tree_oracle_sha256);
 
-            let tier = runner::TierConfig::from_env();
             println!(
                 "[tier] label={} accounts={} ops={} seed={} upgrades>={} batch={}",
                 tier.label, tier.accounts, tier.ops, tier.seed, tier.upgrades, tier.batch
@@ -110,10 +136,14 @@ fn main() {
                 state_hash: state_hash.clone(),
                 wall_clock_seconds: started.elapsed().as_secs_f64(),
                 ledger_wasm_sha256: wasms.ledger_sha256.clone(),
+                token_ledger: token_ledger.to_string(),
                 token_wasm_sha256: wasms.token_sha256.clone(),
+                icp_late_resumes: r.late_resumes(),
+                pool_cycles_added: r.pool_cycles_added,
                 tree_oracle_wasm_sha256: wasms.tree_oracle_sha256.clone(),
                 moc_version: wasms.moc_version.clone(),
                 battery,
+                mainnet_fees: tier.mainnet.then_some(r.model.fees),
             };
             let out_dir = root.join("soak/results");
             std::fs::create_dir_all(&out_dir).expect("create results dir");
@@ -132,6 +162,7 @@ fn main() {
 
             println!("=== SOAK COMPLETE ===");
             println!("tier        : {} ({} accounts / {} ops)", tier.label, tier.accounts, executed);
+            println!("token       : {token_ledger}");
             println!("SEED        : {}", tier.seed);
             println!("STATE-HASH  : {state_hash}");
             println!("wall clock  : {:.1}s", started.elapsed().as_secs_f64());

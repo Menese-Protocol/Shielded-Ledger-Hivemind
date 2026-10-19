@@ -168,6 +168,8 @@ pub struct TransferArgs {
     pub recipient: Option<Account>,
     pub created_at_time: Option<u64>,
     pub proof_hex: String,
+    /// claimable-payment envelope; None on every legacy path
+    pub claim_envelope: Option<Blob>,
 }
 
 // ---- ICRC-3 block reading (ledger) ----
@@ -234,4 +236,57 @@ pub struct ApproveArgs {
     pub fee: Option<Nat>,
     pub memo: Option<Blob>,
     pub created_at_time: Option<u64>,
+}
+
+// ---- the mainnet settings surface (set_protocol_fee, set_claim_envelopes_required,
+// ---- set_note_shape, set_forged_proof_guard) ----
+
+#[derive(CandidType, Deserialize, Clone, Debug)]
+pub struct ProtocolFeeConfig {
+    pub send_fee: u64,
+    pub unshield_bps: Nat,
+    pub recipient: Option<Account>,
+}
+
+#[derive(CandidType, Deserialize, Clone, Debug)]
+pub struct ProtocolFeeStatus {
+    pub send_fee: Nat,
+    pub unshield_bps: Nat,
+    pub recipient: Option<Account>,
+    pub revenue: Nat,
+    pub transparent_ledger_fee: Nat,
+    pub pool_custody_at_rest: Nat,
+    pub treasury: Nat,
+    pub treasury_account: Account,
+}
+
+#[derive(CandidType, Deserialize, Clone, Debug)]
+pub struct ClaimStatus {
+    pub required: bool,
+    pub envelope_len: Nat,
+    pub total: Nat,
+}
+
+#[derive(CandidType, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct NoteShape {
+    pub ephemeral_key_len: Nat,
+    pub note_ciphertext_len: Nat,
+}
+
+#[derive(CandidType, Deserialize, Clone, Debug)]
+pub struct ForgedProofGuardConfig {
+    pub threshold: Nat,
+    pub window_seconds: Nat,
+    pub cooldown_seconds: Nat,
+}
+
+#[derive(CandidType, Deserialize, Clone, Debug)]
+pub struct ForgedProofGuardStatus {
+    pub config: ForgedProofGuardConfig,
+    pub cooling_down: bool,
+    pub cooldown_until: candid::Int,
+    pub failures_in_window: Nat,
+    pub window_started_at: candid::Int,
+    pub trips: Nat,
+    pub failures_total: Nat,
 }

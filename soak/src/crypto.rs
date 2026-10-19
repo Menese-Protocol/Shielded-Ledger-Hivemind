@@ -2,14 +2,16 @@
 //!
 //! The circuit, Poseidon parameters, note/nullifier derivations, and reference trees are reused
 //! verbatim from `circuit/common` (the exact code the deployed verifying keys were generated
-//! against). This module adds only: wire encoding helpers and an O(depth) incremental Merkle
+//! against). This module adds only: wire encoding helpers and an O(levels) incremental Merkle
 //! mirror whose root must equal the canister tree oracle's root after every append. If the mirror
 //! and the canister ever disagree, that is a reported finding, not something the harness papers
 //! over.
 
 use ark_bls12_381::Fr as F;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
-use common::{merkle_compress, zero_hashes, PoseidonCfg, TREE_DEPTH};
+use common::{
+    merkle_compress, poseidon_config_tree, zero_hashes, TreeCfg, TREE_ARITY, TREE_CAPACITY, TREE_LEVELS,
+};
 use std::collections::HashMap;
 
 /// 32-byte little-endian canonical compressed Fr — the exact wire form the ledger and prover use.
@@ -37,12 +39,17 @@ pub fn nat64_field_bytes(value: u64) -> [u8; 32] {
     out
 }
 
-/// Append-only incremental Merkle tree, depth 32, Poseidon 2-to-1 compression — the same shape
-/// as `common::IncrementalTree` and the tree-oracle canister, but with a stored-node map so a
-/// membership path is O(depth) instead of O(n). Node values at internal levels are updated in
-/// place as right children arrive, exactly matching the canister's `filled`/append semantics.
+/// Append-only incremental Merkle tree — 4-ary, 16 levels, Poseidon ARITY-to-1 compression under
+/// the TREE instance (`common::poseidon_config_tree`) — the same shape as `common::IncrementalTree`
+/// and the ledger's in-canister frontier, but with a stored-node map so a membership path is
+/// O(levels) instead of O(n). Node values at internal levels are updated in place as later
+/// children of their row arrive, exactly matching the canister's `filled`/append semantics.
+///
+/// The mirror owns its tree config: the note instance and the tree instance are different
+/// Poseidon widths, and handing the wrong one to a tree is a silent fork (see `common::TreeCfg`).
 #[derive(Clone)]
 pub struct MerkleMirror {
+    cfg_tree: TreeCfg,
     zeros: Vec<F>,
     // nodes[level] : populated node index -> current hash at that level
     nodes: Vec<HashMap<u64, F>>,
@@ -50,12 +57,19 @@ pub struct MerkleMirror {
     root: F,
 }
 
+impl Default for MerkleMirror {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MerkleMirror {
-    pub fn new(cfg: &PoseidonCfg<F>) -> Self {
-        let zeros = zero_hashes(cfg);
-        let nodes = (0..=TREE_DEPTH).map(|_| HashMap::new()).collect();
-        let root = zeros[TREE_DEPTH];
-        MerkleMirror { zeros, nodes, next_index: 0, root }
+    pub fn new() -> Self {
+        let cfg_tree = poseidon_config_tree();
+        let zeros = zero_hashes(&cfg_tree);
+        let nodes = (0..=TREE_LEVELS).map(|_| HashMap::new()).collect();
+        let root = zeros[TREE_LEVELS];
+        MerkleMirror { cfg_tree, zeros, nodes, next_index: 0, root }
     }
 
     pub fn leaf_count(&self) -> u64 {
@@ -66,22 +80,30 @@ impl MerkleMirror {
         self.root
     }
 
+    /// The row of `ARITY` nodes at `lvl` containing node `idx`, empty slots filled with the
+    /// level's zero hash.
+    fn row(&self, lvl: usize, idx: u64) -> [F; TREE_ARITY] {
+        let base = idx - idx % TREE_ARITY as u64;
+        let mut row = [self.zeros[lvl]; TREE_ARITY];
+        for (j, slot) in row.iter_mut().enumerate() {
+            if let Some(v) = self.nodes[lvl].get(&(base + j as u64)) {
+                *slot = *v;
+            }
+        }
+        row
+    }
+
     /// Append one leaf; returns its leaf index. Updates every touched internal node so subsequent
     /// path queries reflect the current tree.
-    pub fn append(&mut self, cfg: &PoseidonCfg<F>, leaf: F) -> u64 {
-        assert!(self.next_index < (1u64 << TREE_DEPTH), "tree full");
+    pub fn append(&mut self, leaf: F) -> u64 {
+        assert!(self.next_index < TREE_CAPACITY, "tree full");
         let leaf_index = self.next_index;
         let mut idx = leaf_index;
         let mut cur = leaf;
         self.nodes[0].insert(idx, cur);
-        for lvl in 0..TREE_DEPTH {
-            if idx % 2 == 0 {
-                cur = merkle_compress(cfg, cur, self.zeros[lvl]);
-            } else {
-                let left = *self.nodes[lvl].get(&(idx - 1)).expect("left sibling must exist");
-                cur = merkle_compress(cfg, left, cur);
-            }
-            idx /= 2;
+        for lvl in 0..TREE_LEVELS {
+            cur = merkle_compress(&self.cfg_tree, &self.row(lvl, idx));
+            idx /= TREE_ARITY as u64;
             self.nodes[lvl + 1].insert(idx, cur);
         }
         self.next_index += 1;
@@ -89,19 +111,18 @@ impl MerkleMirror {
         leaf_index
     }
 
-    /// (siblings, position bits little-endian) for `index`, against the CURRENT tree.
-    pub fn path(&self, index: u64) -> (Vec<F>, Vec<bool>) {
-        let mut siblings = Vec::with_capacity(TREE_DEPTH);
-        let mut bits = Vec::with_capacity(TREE_DEPTH);
+    /// (one full row per level, the walked node's slot in each row) for `index`, against the
+    /// CURRENT tree — the shape `common::DenseTree::path` returns and the circuit consumes.
+    pub fn path(&self, index: u64) -> (Vec<[F; TREE_ARITY]>, Vec<usize>) {
+        let mut rows = Vec::with_capacity(TREE_LEVELS);
+        let mut positions = Vec::with_capacity(TREE_LEVELS);
         let mut idx = index;
-        for lvl in 0..TREE_DEPTH {
-            let sib_idx = idx ^ 1;
-            let sib = self.nodes[lvl].get(&sib_idx).copied().unwrap_or(self.zeros[lvl]);
-            siblings.push(sib);
-            bits.push(idx % 2 == 1);
-            idx /= 2;
+        for lvl in 0..TREE_LEVELS {
+            rows.push(self.row(lvl, idx));
+            positions.push((idx % TREE_ARITY as u64) as usize);
+            idx /= TREE_ARITY as u64;
         }
-        (siblings, bits)
+        (rows, positions)
     }
 }
 
@@ -115,29 +136,33 @@ mod tests {
     #[test]
     fn mirror_matches_reference_trees() {
         let cfg = poseidon_config();
+        let cfg_tree = poseidon_config_tree();
         let mut rng = ark_std::rand::rngs::StdRng::seed_from_u64(1);
-        let mut mirror = MerkleMirror::new(&cfg);
-        let mut inc = IncrementalTree::new(&cfg);
+        let mut mirror = MerkleMirror::new();
+        let mut inc = IncrementalTree::new(&cfg_tree);
         let mut leaves: Vec<F> = Vec::new();
         for i in 0..200u64 {
             let note = Note { v: i, nk: F::rand(&mut rng), rho: F::rand(&mut rng), rcm: F::rand(&mut rng) };
             let cm = note.cm(&cfg);
             leaves.push(cm);
-            let inc_root = inc.append(&cfg, cm);
+            let inc_root = inc.append(&cfg_tree, cm);
             let mir_root = {
-                mirror.append(&cfg, cm);
+                mirror.append(cm);
                 mirror.root()
             };
             assert_eq!(inc_root, mir_root, "mirror vs IncrementalTree diverged at leaf {i}");
-            let dense_root = DenseTree { leaves: leaves.clone() }.root(&cfg);
-            assert_eq!(dense_root, mir_root, "mirror vs DenseTree diverged at leaf {i}");
+            let dense = DenseTree { leaves: leaves.clone() };
+            assert_eq!(dense.root(&cfg_tree), mir_root, "mirror vs DenseTree diverged at leaf {i}");
         }
-        // membership paths must fold back to the current root under the same gadget rule.
-        for &idx in &[0u64, 1, 2, 7, 42, 199] {
-            let (sibs, bits) = mirror.path(idx);
+        // membership paths must equal the reference path and fold back to the current root.
+        let dense = DenseTree { leaves: leaves.clone() };
+        for &idx in &[0u64, 1, 2, 3, 4, 7, 42, 199] {
+            let (rows, positions) = mirror.path(idx);
+            assert_eq!((rows.clone(), positions.clone()), dense.path(&cfg_tree, idx as usize), "path mismatch at {idx}");
             let mut cur = leaves[idx as usize];
-            for (sib, bit) in sibs.iter().zip(bits.iter()) {
-                cur = if *bit { merkle_compress(&cfg, *sib, cur) } else { merkle_compress(&cfg, cur, *sib) };
+            for (row, pos) in rows.iter().zip(positions.iter()) {
+                assert_eq!(row[*pos], cur, "walked node not in its row at {idx}");
+                cur = merkle_compress(&cfg_tree, row);
             }
             assert_eq!(cur, mirror.root(), "path fold mismatch at {idx}");
         }

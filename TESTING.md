@@ -138,6 +138,24 @@ Other knobs: `SOAK_UPGRADES` (minimum mid-run upgrades, default 3), `SOAK_BATCH`
 parallel batch, default 46), `SOAK_CHECK_INTERVAL` (ops between cheap invariant sweeps, default
 1000). The proving benchmark alone: `... -- bench`.
 
+`SOAK_PROFILE=mainnet` runs the same corpus under the settings a mainnet ledger runs with, applied
+at genesis and read back after every upgrade: the launch fee schedule (0.1 token per private
+transfer, 0.3% of every unshield, rounded up) with no fee recipient, so protocol money stays in
+the ledger's own treasury subaccount and every payout is refused; a claim envelope required on
+every private transfer (a random decoy of the fixed 216 bytes, bound to the proof); every output
+at the fixed note shape (32-byte ephemeral key, 584-byte ciphertext); the forged-proof cool-down
+armed at its threshold cap, so every failed verification is counted and none pauses the run; and the tree
+oracle detached, so the in-canister Poseidon frontier computes every root alone. Notes
+are sized so two cover the send fee, every injected attack carries the fee, envelope and sizes it
+needs to reach the guard it targets, and revenue is swept into the treasury every third batch,
+alternate sweeps crashed after the token leg and resumed. On top of the default battery, every
+check interval asserts against the token ledger's real balances: pool account == `pool_value` +
+unswept revenue, treasury account == treasury balance, revenue == earned − swept, the claim log's
+length == accepted enveloped transfers, and the ledger's failed-verification count == the
+forgeries that reached the verifier. The end-of-run battery adds `B13-mainnet-settings`, including
+every output in the block log at the note shape. With the default profile every draw and every
+value is unchanged, so earlier seeds reproduce.
+
 Every run prints its `SEED` and a final `STATE-HASH`, and writes a JSON report to
 `soak/results/<label>-seed<seed>.json` with the wasm SHA-256s, toolchain pins, operation and
 rejection counts, and the battery verdicts. Re-running with the same seed must reproduce the
@@ -342,11 +360,122 @@ transfer, withdraw the remainder; default OFF behind `set_prepaid_fee`) is prove
   solvency (`fee-subaccount custody == Σ balances + revenue`), and trap-after-token crash
   recovery resumed PAST the token dedup window via the memo reconcile.
 
+## 3d-ii. The protocol-fee battery: teeth-first, on PocketIC
+
+The protocol fee is a flat amount on every private transfer plus a basis-point share of every
+unshield. Both ride the transfer statement's public `fee`, which the circuit already binds
+(`in_1 + in_2 == out_1 + out_2 + fee + v_pub_out`), so neither needs a circuit change or a new
+trusted setup. The ledger requires `fee` to equal the schedule exactly and moves the protocol share
+from `pool_value` into `protocol_fee_revenue` in the same commit as the nullifiers. The
+administrator sweeps revenue in batches from the pool account into the ledger's own treasury
+subaccount (`protocol_fee_sweep`) and withdraws from the treasury to the recipient fixed by
+`set_protocol_fee` (`protocol_treasury_withdraw`). With no recipient set, protocol money stays in
+the treasury and every withdrawal is refused. The schedule defaults to zero. Proven by
+`POCKET_IC_BIN=… cargo run --release --manifest-path soak/Cargo.toml --bin protocol_fee_battery`:
+
+- **Teeth first**: nine planted-defect ledger variants, compiled from a patched source copy (send
+  fee not earned; private fee check removed; unshield share rounded down; share not earned at
+  finalize; sweep paid from the wrong account; schedule made transient; send-fee cap removed;
+  sweep never credited to the treasury; a recipient owned by the ledger itself accepted).
+  Each check listed in the binary's header must go RED on its assigned variant before any green
+  is trusted.
+- **Then green**, against the shipped wasm with real Groth16 proofs: zero schedule inert; flat send
+  fee earned exactly once; wrong send fee (below, zero, above) rejected before the verifier with
+  zero state mutation; unshield share `ceil(v·bps/10000)` earned at finalize; wrong unshield fee
+  rejected cleanly; sweep pool→treasury and withdraw treasury→recipient with clean refusals
+  (non-admin, over-sweep, over-withdraw, unset recipient); schedule, revenue and treasury survive
+  an upgrade; caps and the admin gate, and no recipient the ledger itself owns (its default, pool
+  or treasury account: a payout there would land outside `pool_value` and the treasury balance); a private transfer submitted by the anonymous principal is
+  accepted and charged; crash after the unshield payout, the sweep and the withdraw, each resumed
+  exactly once. Every check also asserts both custody identities at rest:
+  pool-account balance == `pool_value` + `protocol_fee_revenue`, and treasury-account balance ==
+  `protocol_treasury_balance`.
+
 The statement-level batteries for the hardened transfer circuit live in the circuit crate and
 run inside the security gate: `semantic_audit` (twelve rows, UNSAT + mutation-kill, both
 statements), `statement_dims` (R1CS shape pins backing the wallet prover's key-statement
 inference), and `statement_binding` (fixture and matched-publics proofs cross-rejected under
 the swapped verifying keys).
+
+## 3d-iii. The forged-proof cool-down battery: teeth-first, on PocketIC
+
+The cool-down (`set_forged_proof_guard`, administrator only, default off) counts failed verifications
+from `shield` and `confidential_transfer` in one window; at the threshold, both refuse every new
+proof before the verifier (`REJECT:forged-proof-cooldown`, verifier `NOT_CALLED`) until the
+cool-down ends or the administrator ends it (`clear_forged_proof_cooldown`, or threshold 0).
+Finalize and resume paths never verify a proof and are never refused. Proven by
+`POCKET_IC_BIN=… cargo run --release --manifest-path soak/Cargo.toml --bin forged_proof_guard_battery`:
+
+- **Teeth first**: eight planted-defect ledger variants (transfer failures not counted; shield
+  failures not counted; transfer ignores the cool-down; shield ignores the cool-down; cool-down
+  end made transient; window never restarts; configuration not admin-gated; cool-down never
+  expires). Each check listed in the binary's header must go RED on its assigned variant before
+  any green is trusted.
+- **Then green**, against the shipped wasm with real Groth16 proofs, where every forgery is a
+  genuine proof sent with altered public inputs (so it reaches `REJECT:pairing-check`, the
+  expensive path): off by default (forgeries counted, nothing refused); admin gate and bounds;
+  shield and transfer forgeries share one count, and in a cool-down a forged transfer, an honest
+  transfer and an honest shield are all refused before the verifier with zero state mutation and
+  no further count; refused one minute before the end, accepted after it; failures from an expired
+  window do not count; clear and threshold 0 each end a cool-down; a running cool-down and its
+  configuration survive an upgrade; a refused forgery costs under a quarter of a verified one
+  (measured 0.4%: 3.7 ms against 873 ms of wall clock, since PocketIC's system subnet does not
+  charge cycles).
+
+## 3d-iv. The verifying-key freeze battery: teeth-first, on PocketIC
+
+Until frozen, the administrator can replace the verifying keys (`rotate_verifying_keys_v2`), and
+keys of the administrator's choosing would accept forged proofs. `freeze_verifying_keys` takes
+the exact current 40-byte anchor (`verifying_key_anchor` digest ‖ epoch, the certified `vk` leaf)
+and latches it for good: rotation is refused (`REJECT:vk-frozen`), the anchor is certified under
+`vk_frozen` (absent while unfrozen, so every unfrozen tree is unchanged), `verifying_key_anchor`
+reports `frozen = true`, and the post-upgrade self-check refuses an upgrade whose keys differ
+from the frozen anchor (`stable-state:vk-frozen-mismatch`). After a freeze the keys can change
+only through a code upgrade by the controller. Proven by
+`POCKET_IC_BIN=… cargo run --release --manifest-path soak/Cargo.toml --bin vk_freeze_battery`:
+
+- **Teeth first**: six planted-defect ledger variants (rotation ignores the freeze; freeze not
+  admin-gated; expected anchor ignored; latch made transient; frozen leaf not certified; freeze
+  does not refresh the certificate), seven assigned reds. The rotation variant is caught twice:
+  by the refused-rotation check, and by the self-check refusing the next upgrade.
+- **Then green**, against the shipped wasm with real proofs: off by default with rotation
+  working; an outsider, a wrong digest and a stale epoch are all refused; the administrator's
+  freeze takes, rotation and a second freeze are then refused with keys and epoch unchanged, and
+  honest transfers still go through; the certificate, verified against the PocketIC root key,
+  carries `zk/vk_frozen` equal to `zk/vk` right after the freeze; the freeze, the refusal and the
+  certified leaf survive an upgrade.
+
+`scripts/mainnet-setup.py` configures a freshly installed ledger and refuses to report success
+unless the ceremony keys (re-verified by `verify-keyset.mjs --require-real-value`) are the keys
+on the ledger at epoch 1 and are frozen, the tree oracle is detached, and every launch setting
+reads back.
+
+## 3d-v. The ICP token leg: the pool on the real NNS ICP ledger, teeth-first
+
+The mainnet ICP ledger serves no ICRC-3 log. `configure_icp_token_ledger` binds the pool to it
+directly: every token block is read from the ICP ledger's own `query_blocks` history (archives
+followed) and matched field by field against what the pool sent (`src/IcpBlock.mo`: operation,
+account identifiers computed in-canister, amount, fee, ICRC-1 memo, created_at_time). Recovery
+inside the ledger's 24 h deduplication window resends the identical call (`Duplicate` names the
+block); outside it, the scan keeps its place per intent across resumes. ICRC-3 tokens keep the
+`configure_token_ledger` path unchanged.
+
+- `tests/IcpBlockTest.mo` (`moc -r $(mops sources) tests/IcpBlockTest.mo`): the documented
+  account identifier of the anonymous principal, the exact transfer_from / transfer blocks
+  matched, and every single-field change refused (24 checks).
+- `ICP_LEDGER_WASM=<ledger-canister_notify-method.wasm.gz> cargo run --release --manifest-path
+  soak/Cargo.toml --bin icp_token_leg_battery`, with the ICP ledger wasm of the revision mainnet
+  runs (dfinity/ic `69b755062f5ef0a7d6efc9a127172b46121420c8`, module hash
+  `51f4be010f23064137defacd627ffbec024c5133210c68ca3b80ab8f257101d6`), installed at its mainnet id
+  on PocketIC's NNS subnet with ICRC-2 on and archiving after a few blocks:
+  - **Teeth first**: archived ranges skipped (I4, I5); transfer_from matched against the wrong
+    account (I1); the scan's place not kept, on a one-page budget (I6).
+  - **Then green**: make private and move out settle from the real ICP blocks, the user charged
+    exactly once (I1, I2); a crash after the ICP transfer recovered inside the window through
+    `Duplicate` (I3); the block archived and the intent resumed after 25 h through the archive (I4)
+    and inside the window through an archived `Duplicate` (I5); 100 ICP transfers between the
+    low-water mark and the shield's own block on a one-page scan budget, settled over several
+    resumes (I6).
 
 ## 3e. The recovery harness: canonicality census, tree repair, intent release
 

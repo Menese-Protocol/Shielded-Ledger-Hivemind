@@ -29,7 +29,7 @@ pub struct BuiltWasms {
     pub moc_path: String,
 }
 
-fn sha_hex(bytes: &[u8]) -> String {
+pub fn sha_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
@@ -54,7 +54,7 @@ pub fn copy_dir_recursive(src: &Path, dest: &Path) {
     }
 }
 
-fn resolve_moc() -> PathBuf {
+pub fn resolve_moc() -> PathBuf {
     if let Ok(p) = std::env::var("SOAK_MOC") {
         return PathBuf::from(p);
     }
@@ -65,7 +65,7 @@ fn resolve_moc() -> PathBuf {
     PathBuf::from("moc")
 }
 
-fn resolve_mops() -> PathBuf {
+pub fn resolve_mops() -> PathBuf {
     PathBuf::from(std::env::var("SOAK_MOPS").unwrap_or_else(|_| "mops".into()))
 }
 
@@ -166,6 +166,50 @@ pub fn build_wasms(repo_root: &Path, out_dir: &Path) -> BuiltWasms {
         moc_version,
         moc_path: moc.display().to_string(),
     }
+}
+
+/// The ledger with the admin-gated test-hook fragment (`scripts/test-hooks.frag.mo`) injected before
+/// the actor's closing brace — the `scripts/build-test-wasm.sh` construction, compiled with the SAME
+/// moc and package sources as `build_wasms`. The shipped wasm never contains these hooks; harnesses
+/// that inject faults (`test_arm_fail_after_token_once`) must run against this build. The injection
+/// is additive only: removing the hook block yields `src/Main.mo` byte for byte, which is asserted.
+pub fn build_hook_ledger(repo_root: &Path, out_dir: &Path) -> Vec<u8> {
+    std::fs::create_dir_all(out_dir).expect("create wasm out dir");
+    let moc = resolve_moc();
+    let mops = resolve_mops();
+    let main = std::fs::read_to_string(repo_root.join("src/Main.mo")).expect("read Main.mo");
+    let fragment =
+        std::fs::read_to_string(repo_root.join("scripts/test-hooks.frag.mo")).expect("read hook fragment");
+    let close = main.rfind('}').expect("actor closing brace");
+    let begin = "  // ================= TEST HOOKS (generated; NEVER in the shipped wasm) =================\n";
+    let end = "\n  // ================= END TEST HOOKS =================\n";
+    let generated = format!("{}{begin}{fragment}{end}{}", &main[..close], &main[close..]);
+    assert_eq!(generated.replacen(&format!("{begin}{fragment}{end}"), "", 1), main, "hook injection is not additive-only");
+    let gen_path = repo_root.join("src/MainTestHooks.harness.generated.mo");
+    std::fs::write(&gen_path, &generated).expect("write generated hook source");
+    let sources_raw = String::from_utf8_lossy(&run_checked(
+        Command::new(&mops).arg("sources").current_dir(repo_root),
+        "mops sources",
+    ))
+    .to_string();
+    let source_args: Vec<String> = sources_raw.split_whitespace().map(String::from).collect();
+    let out_path = out_dir.join("zk_ledger_hooks.wasm");
+    let compiled = Command::new(&moc)
+        .args(&source_args)
+        .arg("-c")
+        .arg(&gen_path)
+        .arg("-o")
+        .arg(&out_path)
+        .current_dir(repo_root)
+        .output();
+    let _ = std::fs::remove_file(&gen_path);
+    let out = compiled.expect("spawn moc for the hook ledger");
+    assert!(
+        out.status.success(),
+        "hook ledger compile failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    std::fs::read(&out_path).expect("read hook ledger wasm")
 }
 
 /// A self-managed PocketIC server process. The crate's built-in server carries a hard 10-minute
@@ -464,5 +508,213 @@ pub fn fund_accounts(env: &Env, principals: &[Principal], balance: u128, allowan
                 (account, pool.clone(), candid::Nat::from(allowance)),
             )
             .expect("test_set_allowance");
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The real NNS ICP ledger as the pool's token (configure_icp_token_ledger, IcpBlock).
+
+/// The mainnet ICP ledger's canister id; installed at the same id on PocketIC's NNS subnet.
+pub const ICP_LEDGER_ID: &str = "ryjl3-tyaaa-aaaaa-aaaba-cai";
+
+/// The ICP ledger's transfer fee, as mainnet charges it (0.0001 ICP).
+pub const ICP_FEE_E8S: u64 = 10_000;
+
+/// CRC-32 (IEEE), as the ICP account identifier's 4-byte prefix uses it.
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &b in bytes {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+/// ICP account identifier: CRC32(h) ‖ h, h = SHA-224("\x0Aaccount-id" ‖ principal ‖ subaccount32).
+pub fn icp_account_id(owner: &Principal, subaccount: Option<[u8; 32]>) -> [u8; 32] {
+    use sha2::Sha224;
+    let mut h = Sha224::new();
+    h.update(b"\x0Aaccount-id");
+    h.update(owner.as_slice());
+    h.update(subaccount.unwrap_or([0u8; 32]));
+    let digest = h.finalize();
+    let mut out = [0u8; 32];
+    out[..4].copy_from_slice(&crc32(&digest).to_be_bytes());
+    out[4..].copy_from_slice(&digest);
+    out
+}
+
+#[derive(CandidType)]
+struct IcpTokens {
+    e8s: u64,
+}
+#[derive(CandidType)]
+struct IcpArchiveOptions {
+    trigger_threshold: u64,
+    num_blocks_to_archive: u64,
+    node_max_memory_size_bytes: Option<u64>,
+    max_message_size_bytes: Option<u64>,
+    controller_id: Principal,
+    more_controller_ids: Option<Vec<Principal>>,
+    cycles_for_archive_creation: Option<u64>,
+    max_transactions_per_response: Option<u64>,
+}
+#[derive(CandidType)]
+struct IcpFeatureFlags {
+    icrc2: bool,
+}
+#[derive(CandidType)]
+struct IcpInitArgs {
+    minting_account: String,
+    icrc1_minting_account: Option<ct::Account>,
+    initial_values: Vec<(String, IcpTokens)>,
+    max_message_size_bytes: Option<u64>,
+    transaction_window: Option<IcpDuration>,
+    archive_options: Option<IcpArchiveOptions>,
+    send_whitelist: Vec<Principal>,
+    transfer_fee: Option<IcpTokens>,
+    token_symbol: Option<String>,
+    token_name: Option<String>,
+    feature_flags: Option<IcpFeatureFlags>,
+}
+#[derive(CandidType)]
+struct IcpDuration {
+    secs: u64,
+    nanos: u32,
+}
+#[derive(CandidType)]
+enum IcpLedgerPayload {
+    Init(IcpInitArgs),
+}
+
+/// Start PocketIC with the REAL NNS ICP ledger (`icp_ledger_wasm`, e.g. the mainnet revision's
+/// ledger-canister_notify-method.wasm.gz) at its mainnet id, ICRC-2 on, a 0.0001 ICP fee, each of
+/// `funded` holding `balance_e8s`, and archiving after `archive_trigger` blocks (so archived reads
+/// happen in-test). The zk ledger is bound with `configure_icp_token_ledger`: no history adapter.
+pub fn setup_icp(
+    wasms: &BuiltWasms,
+    icp_ledger_wasm: &[u8],
+    transfer_vk_hex: &str,
+    deposit_vk_hex: &str,
+    state_dir: &Path,
+    funded: &[Principal],
+    balance_e8s: u64,
+    archive_trigger: u64,
+) -> Env {
+    let binary = resolve_pocket_ic_server();
+    let server = std::sync::Arc::new(spawn_server(&binary));
+    let pic = PocketIcBuilder::new()
+        .with_server_url(server.url.clone())
+        .with_nns_subnet()
+        .with_application_subnet()
+        .with_state_dir(state_dir.to_path_buf())
+        .with_max_request_time_ms(Some(600_000))
+        .build();
+    pic.set_time(pocket_ic::Time::from_nanos_since_unix_epoch(GENESIS_NS));
+    let admin = Principal::self_authenticating(Sha256::digest(b"soak-admin-v1"));
+
+    let icp = Principal::from_text(ICP_LEDGER_ID).unwrap();
+    pic.create_canister_with_id(Some(admin), None, icp).expect("create the ICP ledger at its mainnet id");
+    pic.add_cycles(icp, 1_000_000_000_000_000);
+    let minting = Principal::self_authenticating(Sha256::digest(b"icp-minting-account"));
+    let init = IcpLedgerPayload::Init(IcpInitArgs {
+        minting_account: hex::encode(icp_account_id(&minting, None)),
+        icrc1_minting_account: None,
+        initial_values: funded
+            .iter()
+            .map(|p| (hex::encode(icp_account_id(p, None)), IcpTokens { e8s: balance_e8s }))
+            .collect(),
+        max_message_size_bytes: None,
+        transaction_window: None,
+        archive_options: Some(IcpArchiveOptions {
+            trigger_threshold: archive_trigger,
+            num_blocks_to_archive: archive_trigger / 2,
+            node_max_memory_size_bytes: None,
+            max_message_size_bytes: None,
+            controller_id: admin,
+            more_controller_ids: None,
+            cycles_for_archive_creation: Some(10_000_000_000_000),
+            max_transactions_per_response: None,
+        }),
+        send_whitelist: vec![],
+        transfer_fee: Some(IcpTokens { e8s: ICP_FEE_E8S }),
+        token_symbol: Some("ICP".into()),
+        token_name: Some("Internet Computer".into()),
+        feature_flags: Some(IcpFeatureFlags { icrc2: true }),
+    });
+    pic.install_canister(icp, icp_ledger_wasm.to_vec(), candid::encode_one(init).unwrap(), Some(admin));
+
+    let mut create = || {
+        let c = pic.create_canister_with_settings(Some(admin), None);
+        pic.add_cycles(c, 100_000_000_000_000);
+        c
+    };
+    let tree_oracle = create();
+    let ledger = create();
+    pic.install_canister(tree_oracle, wasms.tree_oracle.clone(), candid::encode_args(()).unwrap(), Some(admin));
+    pic.install_canister(ledger, wasms.ledger.clone(), candid::encode_args(()).unwrap(), Some(admin));
+    pic.update_canister_settings(
+        ledger,
+        Some(admin),
+        pocket_ic::CanisterSettings { wasm_memory_limit: Some(candid::Nat::from(8u64 * 1024 * 1024 * 1024)), ..Default::default() },
+    )
+    .expect("raise ledger wasm_memory_limit");
+
+    let env = Env { pic: Some(pic), server, admin, ledger, token: icp, tree_oracle, ledger_wasm: wasms.ledger.clone(), token_fee: ICP_FEE_E8S, recycles: 0 };
+    let configured: ct::MotokoResult<ct::LedgerStatus> = env
+        .update(ledger, admin, "configure", (ledger, tree_oracle, transfer_vk_hex.to_string(), deposit_vk_hex.to_string()))
+        .expect("ledger configure call");
+    configured.into_result().expect("ledger configure");
+    let bound: ct::MotokoResult<candid::Reserved> = env
+        .update(ledger, admin, "configure_icp_token_ledger", (icp, Option::<ct::Blob>::None))
+        .expect("configure_icp_token_ledger call");
+    bound.into_result().expect("configure_icp_token_ledger");
+    env
+}
+
+#[derive(CandidType)]
+struct IcpApproveArgs {
+    from_subaccount: Option<ct::Blob>,
+    spender: ct::Account,
+    amount: candid::Nat,
+    expected_allowance: Option<candid::Nat>,
+    expires_at: Option<u64>,
+    fee: Option<candid::Nat>,
+    memo: Option<ct::Blob>,
+    created_at_time: Option<u64>,
+}
+
+#[derive(CandidType, serde::Deserialize, Debug)]
+enum IcpApproveResult {
+    Ok(candid::Nat),
+    Err(candid::Reserved),
+}
+
+/// Each owner grants the pool `allowance` with a real `icrc2_approve` on the ICP ledger (the
+/// owner pays the ledger fee, as a user would). Pair with `setup_icp`, which seeds the balances.
+pub fn icp_approve_pool(env: &Env, owners: &[Principal], allowance: u128) {
+    let spender = env.pool_account();
+    for owner in owners {
+        let r: IcpApproveResult = env
+            .update(
+                env.token,
+                *owner,
+                "icrc2_approve",
+                (IcpApproveArgs {
+                    from_subaccount: None,
+                    spender: spender.clone(),
+                    amount: candid::Nat::from(allowance),
+                    expected_allowance: None,
+                    expires_at: None,
+                    fee: None,
+                    memo: None,
+                    created_at_time: None,
+                },),
+            )
+            .expect("icrc2_approve call");
+        assert!(matches!(r, IcpApproveResult::Ok(_)), "icrc2_approve for {owner}: {r:?}");
     }
 }

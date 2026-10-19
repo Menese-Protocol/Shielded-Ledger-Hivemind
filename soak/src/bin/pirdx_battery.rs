@@ -721,10 +721,11 @@ fn main() {
         other => panic!("PIRDX_EXPECT must be coupled|decoupled, got {other}"),
     };
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
+    // the soak's statement selector (default: the shipped hardened statement)
+    let (legacy, dir) = keys::statement_from_env();
     let manifest_json =
-        std::fs::read_to_string(root.join("fixtures/pool-vectors-bls12-381/SETUP-MANIFEST.json"))
-            .expect("read setup manifest");
-    let keyset = keys::regenerate_and_verify(&manifest_json, true).expect("keyset");
+        std::fs::read_to_string(root.join(dir).join("SETUP-MANIFEST.json")).expect("read setup manifest");
+    let keyset = keys::regenerate_and_verify(&manifest_json, legacy).expect("keyset");
     let wasms = pic_env::build_wasms(&root, &root.join("soak/target/wasms-pirdx"));
     println!("[build] ledger wasm sha256 {}", wasms.ledger_sha256);
 
@@ -897,6 +898,12 @@ fn main() {
                         soak::icrc3_hash::text("pass"),
                     )]))
                     .to_vec(),
+                    vk_anchor: Some(soak::cert::expected_vk_anchor(
+                        &ctx.runner.keys.transfer_vk_hex,
+                        &ctx.runner.keys.deposit_vk_hex,
+                        1,
+                    )),
+                    vk_frozen: None, // pirdx never freezes the keys
                 };
                 let tip: Option<ct::DataCertificate> = ctx
                     .runner

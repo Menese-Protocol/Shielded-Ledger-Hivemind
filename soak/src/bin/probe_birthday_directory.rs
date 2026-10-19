@@ -57,16 +57,22 @@ fn main() {
     let source_args: Vec<String> = sources_raw.split_whitespace().map(String::from).collect();
 
     // OLD = the pinned pre-implementation revision (last commit before the birthday endpoints).
-    const OLD_COMMIT: &str = "eb3d276";
-    let old_src_text = String::from_utf8(
-        Command::new("git")
-            .args(["show", &format!("{OLD_COMMIT}:tests/DemoDirectory.mo")])
-            .current_dir(&repo_root)
-            .output()
-            .expect("git show")
-            .stdout,
-    )
-    .unwrap();
+    // Full hash: a clone without this commit (a squashed or single-branch clone) must stop here,
+    // not compile an empty file into an empty canister. Fetch it with
+    // `git fetch origin eb3d2762288ec237bc2d6ffc4dbae777f0eec36b`.
+    const OLD_COMMIT: &str = "eb3d2762288ec237bc2d6ffc4dbae777f0eec36b";
+    let old_show = Command::new("git")
+        .args(["show", &format!("{OLD_COMMIT}:tests/DemoDirectory.mo")])
+        .current_dir(&repo_root)
+        .output()
+        .expect("git show");
+    assert!(
+        old_show.status.success(),
+        "OLD commit {OLD_COMMIT} is not in this clone: {}",
+        String::from_utf8_lossy(&old_show.stderr)
+    );
+    let old_src_text = String::from_utf8(old_show.stdout).unwrap();
+    assert!(old_src_text.contains("func register"), "OLD source is not the directory canister");
     assert!(!old_src_text.contains("set_birthday"), "OLD source unexpectedly has the new endpoint");
     let tmp = std::env::temp_dir().join(format!("bday_probe_{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();

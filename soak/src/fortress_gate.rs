@@ -11,7 +11,7 @@ use ark_groth16::{Groth16, Proof, ProvingKey, VerifyingKey};
 use ark_serialize::CanonicalDeserialize;
 use ark_snark::SNARK;
 use ark_std::rand::{rngs::StdRng, RngCore, SeedableRng};
-use common::{derive_pk, note_commitment, poseidon_config, DenseTree, Note, PoseidonCfg};
+use common::{derive_pk, note_commitment, poseidon_config, poseidon_config_tree, DenseTree, Note, PoseidonCfg};
 use pocket_ic::PocketIcBuilder;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -206,10 +206,11 @@ pub fn build_transfer(rng: &mut StdRng, cfg: &PoseidonCfg<Fr>) -> common::Transf
         filler(rng).cm(cfg), inputs[0].cm(cfg), filler(rng).cm(cfg),
         filler(rng).cm(cfg), inputs[1].cm(cfg), filler(rng).cm(cfg),
     ];
+    let cfg_tree = poseidon_config_tree();
     let tree = DenseTree { leaves };
-    let anchor = tree.root(cfg);
-    let (sib0, bits0) = tree.path(cfg, 1);
-    let (sib1, bits1) = tree.path(cfg, 4);
+    let anchor = tree.root(&cfg_tree);
+    let (rows0, pos0) = tree.path(&cfg_tree, 1);
+    let (rows1, pos1) = tree.path(&cfg_tree, 4);
     let nf = [inputs[0].nf(cfg), inputs[1].nf(cfg)];
     let out_pk = [derive_pk(cfg, recipient_nk), derive_pk(cfg, owner_nk)];
     let out_rcm = [Fr::rand(rng), Fr::rand(rng)];
@@ -237,8 +238,8 @@ pub fn build_transfer(rng: &mut StdRng, cfg: &PoseidonCfg<Fr>) -> common::Transf
         in_nk: [Some(inputs[0].nk), Some(inputs[1].nk)],
         in_rho: [Some(inputs[0].rho), Some(inputs[1].rho)],
         in_rcm: [Some(inputs[0].rcm), Some(inputs[1].rcm)],
-        in_siblings: [sib0, sib1],
-        in_bits: [bits0, bits1],
+        in_rows: [rows0, rows1],
+        in_pos: [pos0, pos1],
         out_v: [Some(Fr::from(out_v[0])), Some(Fr::from(out_v[1]))],
         out_pk: [Some(out_pk[0]), Some(out_pk[1])],
         out_rcm: [Some(out_rcm[0]), Some(out_rcm[1])],

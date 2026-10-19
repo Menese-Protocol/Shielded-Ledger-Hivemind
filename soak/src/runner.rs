@@ -32,6 +32,13 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::Instant;
 
+/// tree_frontier_status: the in-canister Poseidon frontier switch and the attached oracle, if any.
+#[derive(candid::CandidType, serde::Deserialize, Debug)]
+struct TreeFrontierStatus {
+    enabled: bool,
+    tree_oracle: Option<Principal>,
+}
+
 #[derive(Clone, Debug)]
 pub struct TierConfig {
     pub label: String,
@@ -48,6 +55,52 @@ pub struct TierConfig {
     /// durable PocketIC state directory and model checkpoint file (for crash-resume).
     pub state_dir: PathBuf,
     pub checkpoint_file: PathBuf,
+    /// SOAK_PROFILE=mainnet: run under the mainnet settings (see `MainnetSettings`).
+    pub mainnet: bool,
+    /// SOAK_TOKEN=icp: the pool's token is the REAL NNS ICP ledger (ICP_LEDGER_WASM, installed at
+    /// its mainnet id) bound with `configure_icp_token_ledger`, instead of the ICRC-3 fixture.
+    pub icp: Option<IcpToken>,
+}
+
+/// The ICP token mode's settings (see `TierConfig::icp`).
+#[derive(Clone, Debug)]
+pub struct IcpToken {
+    /// the ICP ledger wasm (e.g. the mainnet revision's ledger-canister_notify-method.wasm.gz)
+    pub wasm: PathBuf,
+    /// SOAK_ICP_ARCHIVE_TRIGGER: the ICP ledger archives once it holds this many blocks, so
+    /// confirmations and recovery scans read archived blocks during the run
+    pub archive_trigger: u64,
+    /// SOAK_ICP_LATE_RESUME_EVERY: every n-th crash after the token call is resumed
+    /// `LATE_RESUME_SECS` later, past the ledger's resend window, so the intent settles through the
+    /// ICP block scan instead of the deduplicated resend. 0 resumes every crash at once.
+    pub late_resume_every: u64,
+}
+
+impl IcpToken {
+    /// 23 h 30 min: past the ledger's own resend window (23 h, the ICP ledger's 24 h deduplication
+    /// window less its margin) and inside the 24 h after which only an administrator may resume an
+    /// unshield, so the owner's own resume still settles it.
+    pub const LATE_RESUME_SECS: u64 = 23 * 3600 + 1800;
+}
+
+/// The settings a mainnet ledger runs with, applied at genesis by SOAK_PROFILE=mainnet and
+/// asserted after every upgrade: the launch fee schedule; the recipient left UNSET, so protocol
+/// money stays in the ledger's own treasury subaccount and every payout is refused; a claim
+/// envelope required on every private transfer (a random decoy of the fixed length, bound to
+/// the proof, so every private transfer looks the same); every output at the fixed note shape;
+/// the forged-proof cool-down armed at its threshold cap, so every failed verification is
+/// counted under load and none pauses the run (cool-down trips are the cool-down battery's
+/// subject). Revenue is swept into the treasury every few batches, alternate sweeps crashed
+/// after the token leg and resumed.
+pub struct MainnetSettings;
+
+impl MainnetSettings {
+    pub const SEND_FEE: u64 = 10_000_000; // 0.1 token at 8 decimals
+    pub const UNSHIELD_BPS: u64 = 30; // 0.3%
+    pub const NOTE_SHAPE: (usize, usize) = (32, 584);
+    pub const CLAIM_ENVELOPE_LEN: usize = 216;
+    pub const GUARD: (u64, u64, u64) = (100_000, 600, 1_800); // threshold, window s, cool-down s
+    pub const SWEEP_EVERY_BATCHES: u64 = 3;
 }
 
 impl TierConfig {
@@ -77,6 +130,23 @@ impl TierConfig {
                 .unwrap_or_else(|_| {
                     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("checkpoints/model.ckpt")
                 }),
+            mainnet: match std::env::var("SOAK_PROFILE").as_deref() {
+                Ok("mainnet") => true,
+                Ok("") | Ok("default") | Err(_) => false,
+                Ok(other) => panic!("SOAK_PROFILE={other}: unknown profile (mainnet | default)"),
+            },
+            icp: match std::env::var("SOAK_TOKEN").as_deref() {
+                Ok("icp") => Some(IcpToken {
+                    wasm: PathBuf::from(
+                        std::env::var("ICP_LEDGER_WASM")
+                            .expect("SOAK_TOKEN=icp needs ICP_LEDGER_WASM=<ledger-canister_notify-method.wasm.gz>"),
+                    ),
+                    archive_trigger: get("SOAK_ICP_ARCHIVE_TRIGGER", 2000),
+                    late_resume_every: get("SOAK_ICP_LATE_RESUME_EVERY", 4),
+                }),
+                Ok("") | Ok("fixture") | Err(_) => None,
+                Ok(other) => panic!("SOAK_TOKEN={other}: unknown token (icp | fixture)"),
+            },
         }
     }
 }
@@ -212,10 +282,20 @@ pub struct RunReport {
     pub state_hash: String,
     pub wall_clock_seconds: f64,
     pub ledger_wasm_sha256: String,
+    /// "icrc3-fixture" or "nns-icp-ledger" (SOAK_TOKEN=icp)
+    pub token_ledger: String,
     pub token_wasm_sha256: String,
+    /// ICP mode: crashes resumed past the resend window, settled by the block scan
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icp_late_resumes: Option<u64>,
+    /// cycles added to the zk ledger by this process (`keep_pool_funded`)
+    pub pool_cycles_added: u128,
     pub tree_oracle_wasm_sha256: String,
     pub moc_version: String,
     pub battery: Vec<BatteryLine>,
+    /// the protocol-fee side at the end of a SOAK_PROFILE=mainnet run
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mainnet_fees: Option<crate::model::FeeLedger>,
 }
 
 fn now_stamp() -> String {
@@ -312,6 +392,14 @@ pub struct Runner {
     /// order — the pirdx battery compares these across flag-off/flag-on runs at the same
     /// seed to prove the money-path delta is zero (AC-D6a)
     pub op_instructions: Vec<u64>,
+    /// set up in this process (not reloaded from a checkpoint): `run` checkpoints the funded
+    /// genesis before the first op, so a crash during the first interval does not redo setup
+    fresh: bool,
+    /// (op, the zk ledger's cycle balance) at the last cycle reading; `keep_pool_funded` reports
+    /// the burn per op since then
+    cycles_mark: Option<(u64, u128)>,
+    /// cycles this process added to the zk ledger (a resumed run counts from its resume)
+    pub pool_cycles_added: u128,
 }
 
 #[derive(Default)]
@@ -387,8 +475,18 @@ impl Runner {
                         .last_accepted_private
                         .as_ref()
                         .map(|b| candid::decode_one::<ct::TransferArgs>(b).expect("decode replay args"));
+                    let ckpt_icp = ckpt.token == Principal::from_text(pic_env::ICP_LEDGER_ID).unwrap();
+                    assert_eq!(ckpt_icp, tier.icp.is_some(), "resume: the checkpoint's token differs from SOAK_TOKEN");
                     let model = ckpt.into_model(&cfg);
+                    let mainnet_ckpt = model.fees.send_fee > 0 || model.fees.unshield_bps > 0;
+                    assert_eq!(mainnet_ckpt, tier.mainnet, "resume: the checkpoint's profile differs from SOAK_PROFILE");
+                    if tier.mainnet {
+                        prover::set_note_shape(MainnetSettings::NOTE_SHAPE.0, MainnetSettings::NOTE_SHAPE.1);
+                    }
                     let runner = Runner {
+                        fresh: false,
+                        cycles_mark: None,
+                        pool_cycles_added: 0,
                         fixture_proof_hex,
                         progress_path: std::env::var("SOAK_PROGRESS_LOG").ok(),
                         resumed_from: executed,
@@ -439,7 +537,29 @@ impl Runner {
         let _ = std::fs::remove_dir_all(pairs_root(&tier.checkpoint_file));
         std::fs::create_dir_all(&tier.state_dir).expect("create state dir");
         std::fs::create_dir_all(tier.checkpoint_file.parent().unwrap()).ok();
-        let env = pic_env::setup(wasms, &keys.transfer_vk_hex, &keys.deposit_vk_hex, &tier.state_dir);
+        let principals: Vec<Principal> = accounts.iter().map(|a| a.principal).collect();
+        let env = match &tier.icp {
+            None => pic_env::setup(wasms, &keys.transfer_vk_hex, &keys.deposit_vk_hex, &tier.state_dir),
+            Some(icp) => {
+                let wasm = std::fs::read(&icp.wasm)
+                    .unwrap_or_else(|e| panic!("read ICP_LEDGER_WASM {}: {e}", icp.wasm.display()));
+                let mut funded = principals.clone();
+                funded.push(pauper.principal);
+                // Genesis balances carry the approve's fee on top, so after approving every account
+                // holds exactly INITIAL_BALANCE, as on the fixture.
+                let genesis = u64::try_from(INITIAL_BALANCE).unwrap() + pic_env::ICP_FEE_E8S;
+                pic_env::setup_icp(
+                    wasms,
+                    &wasm,
+                    &keys.transfer_vk_hex,
+                    &keys.deposit_vk_hex,
+                    &tier.state_dir,
+                    &funded,
+                    genesis,
+                    icp.archive_trigger,
+                )
+            }
+        };
         // Optionally run the whole corpus with the in-canister Poseidon frontier
         // enabled. With the oracle still attached (default) every append is cross-checked
         // in-canister vs the oracle — a corpus-scale proof the two roots agree. With
@@ -470,14 +590,33 @@ impl Runner {
             r.into_result().expect("enable detect chain");
             println!("[setup] certified detect-chain anchor ENABLED at genesis");
         }
-        let principals: Vec<Principal> = accounts.iter().map(|a| a.principal).collect();
-        println!("[setup] funding {} accounts on the token fixture...", principals.len());
+        if tier.mainnet {
+            Self::apply_mainnet_settings(&env);
+        }
         let t0 = Instant::now();
-        pic_env::fund_accounts(&env, &principals, INITIAL_BALANCE, ALLOWANCE);
-        pic_env::fund_accounts(&env, &[pauper.principal], INITIAL_BALANCE, 1);
+        if tier.icp.is_none() {
+            println!("[setup] funding {} accounts on the token fixture...", principals.len());
+            pic_env::fund_accounts(&env, &principals, INITIAL_BALANCE, ALLOWANCE);
+            pic_env::fund_accounts(&env, &[pauper.principal], INITIAL_BALANCE, 1);
+        } else {
+            println!(
+                "[setup] {} accounts hold genesis ICP on the NNS ICP ledger; each approves the pool (icrc2_approve)...",
+                principals.len()
+            );
+            pic_env::icp_approve_pool(&env, &principals, ALLOWANCE);
+            pic_env::icp_approve_pool(&env, &[pauper.principal], 1);
+            for p in [principals[0], *principals.last().unwrap(), pauper.principal] {
+                let held = env.token_balance(&ct::Account { owner: p, subaccount: None });
+                assert_eq!(held, INITIAL_BALANCE, "ICP funding: {p} holds {held} after approving");
+            }
+        }
         println!("[setup] funded in {:.1}s", t0.elapsed().as_secs_f64());
 
-        let model = Model::new(tier.accounts, INITIAL_BALANCE, env.token_fee);
+        let mut model = Model::new(tier.accounts, INITIAL_BALANCE, env.token_fee);
+        if tier.mainnet {
+            model.fees.send_fee = MainnetSettings::SEND_FEE;
+            model.fees.unshield_bps = MainnetSettings::UNSHIELD_BPS;
+        }
         let mut rng = prover::op_rng(tier.seed, u64::MAX, "runner");
         let lo = (tier.ops as u64 / 10).max(1);
         let hi = (tier.ops as u64).max(lo + 1);
@@ -489,6 +628,9 @@ impl Runner {
         upgrade_points.sort();
         println!("[setup] upgrade points at ops {upgrade_points:?}");
         Runner {
+            fresh: true,
+            cycles_mark: None,
+            pool_cycles_added: 0,
             fixture_proof_hex,
             progress_path: std::env::var("SOAK_PROGRESS_LOG").ok(),
             resumed_from: 0,
@@ -528,6 +670,8 @@ impl Runner {
         let pair_dir = root.join(format!("pair-{executed}"));
         let _ = std::fs::remove_dir_all(&pair_tmp);
         std::fs::create_dir_all(&pair_tmp).expect("create pair tmp dir");
+        // before the snapshot, so a resume starts from a funded canister
+        self.keep_pool_funded(executed);
         // recycle persists the PocketIC instance to the durable state dir and frees server
         // memory; the snapshot is taken inside the drop-rebuild window
         self.env
@@ -571,6 +715,193 @@ impl Runner {
         std::fs::rename(&latest_tmp, root.join("LATEST")).expect("commit LATEST");
         prune_pairs(&root, 2);
         t.elapsed().as_secs_f64()
+    }
+
+    /// Apply the mainnet settings as the administrator, then read every one back.
+    fn apply_mainnet_settings(env: &Env) {
+        let fee: ct::MotokoResult<ct::ProtocolFeeStatus> = env
+            .update(
+                env.ledger,
+                env.admin,
+                "set_protocol_fee",
+                (ct::ProtocolFeeConfig {
+                    send_fee: MainnetSettings::SEND_FEE,
+                    unshield_bps: candid::Nat::from(MainnetSettings::UNSHIELD_BPS),
+                    recipient: None,
+                },),
+            )
+            .expect("set_protocol_fee call");
+        fee.into_result().expect("set_protocol_fee");
+        let claims: ct::MotokoResult<ct::ClaimStatus> = env
+            .update(env.ledger, env.admin, "set_claim_envelopes_required", (true,))
+            .expect("set_claim_envelopes_required call");
+        claims.into_result().expect("set_claim_envelopes_required");
+        let shape = ct::NoteShape {
+            ephemeral_key_len: candid::Nat::from(MainnetSettings::NOTE_SHAPE.0),
+            note_ciphertext_len: candid::Nat::from(MainnetSettings::NOTE_SHAPE.1),
+        };
+        let set: ct::MotokoResult<Option<ct::NoteShape>> = env
+            .update(env.ledger, env.admin, "set_note_shape", (Some(shape),))
+            .expect("set_note_shape call");
+        set.into_result().expect("set_note_shape");
+        let (threshold, window, cooldown) = MainnetSettings::GUARD;
+        let guard: ct::MotokoResult<ct::ForgedProofGuardStatus> = env
+            .update(
+                env.ledger,
+                env.admin,
+                "set_forged_proof_guard",
+                (ct::ForgedProofGuardConfig {
+                    threshold: candid::Nat::from(threshold),
+                    window_seconds: candid::Nat::from(window),
+                    cooldown_seconds: candid::Nat::from(cooldown),
+                },),
+            )
+            .expect("set_forged_proof_guard call");
+        guard.into_result().expect("set_forged_proof_guard");
+        // mainnet runs the ledger alone: the in-canister Poseidon frontier (on by default) computes
+        // every root and the tree oracle is detached, so no other canister is in the root-trust base
+        let detach: ct::MotokoResult<ct::LedgerStatus> = env
+            .update(env.ledger, env.admin, "set_tree_oracle", (Option::<Principal>::None,))
+            .expect("set_tree_oracle call");
+        detach.into_result().expect("detach tree oracle");
+        prover::set_note_shape(MainnetSettings::NOTE_SHAPE.0, MainnetSettings::NOTE_SHAPE.1);
+        Self::assert_mainnet_settings_on(env, "genesis");
+        println!(
+            "[setup] MAINNET settings: send fee {} + unshield {} bps (recipient unset: fees stay in the treasury), claim envelopes required ({} B), note shape {:?}, forged-proof guard {:?}, tree oracle detached (in-canister frontier only)",
+            MainnetSettings::SEND_FEE,
+            MainnetSettings::UNSHIELD_BPS,
+            MainnetSettings::CLAIM_ENVELOPE_LEN,
+            MainnetSettings::NOTE_SHAPE,
+            MainnetSettings::GUARD
+        );
+    }
+
+    /// Every mainnet setting, read back from the ledger.
+    fn assert_mainnet_settings_on(env: &Env, context: &str) {
+        let nat = |n: &candid::Nat| u128::try_from(n.0.clone()).unwrap();
+        let fee: ct::ProtocolFeeStatus = env.query(env.ledger, "protocol_fee_status", ()).expect("protocol_fee_status");
+        assert_eq!(nat(&fee.send_fee), MainnetSettings::SEND_FEE as u128, "{context}: send fee");
+        assert_eq!(nat(&fee.unshield_bps), MainnetSettings::UNSHIELD_BPS as u128, "{context}: unshield bps");
+        assert!(fee.recipient.is_none(), "{context}: a fee recipient is set");
+        let claims: ct::ClaimStatus = env.query(env.ledger, "claim_status", ()).expect("claim_status");
+        assert!(claims.required, "{context}: claim envelopes not required");
+        assert_eq!(nat(&claims.envelope_len), MainnetSettings::CLAIM_ENVELOPE_LEN as u128, "{context}: envelope length");
+        let shape: Option<ct::NoteShape> = env.query(env.ledger, "get_note_shape", ()).expect("get_note_shape");
+        let shape = shape.unwrap_or_else(|| panic!("{context}: no note shape"));
+        assert_eq!(
+            (nat(&shape.ephemeral_key_len), nat(&shape.note_ciphertext_len)),
+            (MainnetSettings::NOTE_SHAPE.0 as u128, MainnetSettings::NOTE_SHAPE.1 as u128),
+            "{context}: note shape"
+        );
+        let guard: ct::ForgedProofGuardStatus =
+            env.query(env.ledger, "forged_proof_guard_status", ()).expect("forged_proof_guard_status");
+        assert_eq!(
+            (nat(&guard.config.threshold), nat(&guard.config.window_seconds), nat(&guard.config.cooldown_seconds)),
+            (MainnetSettings::GUARD.0 as u128, MainnetSettings::GUARD.1 as u128, MainnetSettings::GUARD.2 as u128),
+            "{context}: forged-proof guard"
+        );
+        let tree: TreeFrontierStatus = env.query(env.ledger, "tree_frontier_status", ()).expect("tree_frontier_status");
+        assert!(tree.enabled, "{context}: in-canister tree frontier is off");
+        assert!(tree.tree_oracle.is_none(), "{context}: a tree oracle is still attached");
+    }
+
+    /// The protocol-fee side against the ledger AND the token ledger's real balances: revenue,
+    /// treasury, pool custody at rest == pool_value + revenue, the treasury subaccount's balance,
+    /// the claim log's length, and the failed-verification count (no cool-down tripped).
+    fn fee_invariants(&self, context: &str) {
+        let nat = |n: &candid::Nat| u128::try_from(n.0.clone()).unwrap();
+        let fee: ct::ProtocolFeeStatus =
+            self.env.query(self.env.ledger, "protocol_fee_status", ()).expect("protocol_fee_status");
+        assert_eq!(nat(&fee.revenue), self.model.fees.revenue, "{context}: revenue vs model");
+        assert_eq!(nat(&fee.treasury), self.model.fees.treasury, "{context}: treasury vs model");
+        assert_eq!(
+            nat(&fee.pool_custody_at_rest),
+            self.model.pool_value + self.model.fees.revenue,
+            "{context}: pool custody at rest vs model"
+        );
+        let pool_tokens = self.env.token_balance(&self.env.pool_account());
+        assert_eq!(pool_tokens, self.model.pool_value + self.model.fees.revenue, "{context}: pool account != pool_value + revenue");
+        let treasury_tokens = self.env.token_balance(&fee.treasury_account);
+        assert_eq!(treasury_tokens, self.model.fees.treasury_custody, "{context}: treasury account vs model");
+        assert_eq!(treasury_tokens, self.model.fees.treasury, "{context}: treasury account != treasury balance");
+        let claims: ct::ClaimStatus = self.env.query(self.env.ledger, "claim_status", ()).expect("claim_status");
+        assert_eq!(nat(&claims.total) as u64, self.model.fees.claim_log, "{context}: claim log length vs model");
+        let guard: ct::ForgedProofGuardStatus =
+            self.env.query(self.env.ledger, "forged_proof_guard_status", ()).expect("forged_proof_guard_status");
+        assert_eq!(
+            nat(&guard.failures_total) as u64,
+            self.model.fees.verifier_failures,
+            "{context}: failed verifications vs model"
+        );
+        assert!(!guard.cooling_down && nat(&guard.trips) == 0, "{context}: the forged-proof guard tripped");
+    }
+
+    /// Largest unshield `v` with v + token fee + protocol share(v) <= `total`; 0 when none.
+    fn max_unshield(&self, total: u64) -> u64 {
+        let fee = self.env.token_fee;
+        if total <= fee {
+            return 0;
+        }
+        let bps = self.model.fees.unshield_bps as u128;
+        let mut v = ((total - fee) as u128 * 10_000 / (10_000 + bps)) as u64;
+        while v > 0 && v + fee + self.model.fees.unshield_share(v) > total {
+            v -= 1;
+        }
+        v
+    }
+
+    /// Sweep a random part of revenue into the treasury (alternate sweeps crash after the token
+    /// leg and are resumed), then show that no payout can leave the treasury while the recipient
+    /// is unset. Checked against the token ledger's balances before returning.
+    fn sweep_round(&mut self, at_op: u64) {
+        let fee = self.env.token_fee as u128;
+        let revenue = self.model.fees.revenue;
+        if revenue <= fee + 1 {
+            return;
+        }
+        let mut r = prover::op_rng(self.tier.seed, at_op, "protocol-sweep");
+        let amount = u64::try_from(r.gen_range(1..=(revenue - fee))).expect("sweep fits u64");
+        let crashed = self.model.fees.sweeps % 2 == 1;
+        let pool_before = self.env.token_balance(&self.env.pool_account());
+        if crashed {
+            let ok: ct::MotokoResult<()> = self
+                .env
+                .update(self.env.ledger, self.env.admin, "test_arm_fail_after_token_once", ())
+                .expect("arm fault");
+            ok.into_result().expect("arm fault result");
+            let r: Result<ct::MotokoResult<candid::Nat>, String> =
+                self.env.update(self.env.ledger, self.env.admin, "protocol_fee_sweep", (amount, self.env.time_ns()));
+            let err = r.err().expect("armed sweep must trap after the token call");
+            assert!(err.contains("TEST_ONLY:fail-after-token"), "unexpected sweep trap: {err}");
+            assert_eq!(
+                self.env.token_balance(&self.env.pool_account()),
+                pool_before - amount as u128 - fee,
+                "crashed sweep: the token move did not land before the trap"
+            );
+            let resumed: ct::MotokoResult<candid::Nat> = self
+                .env
+                .update(self.env.ledger, self.env.admin, "resume_prepaid", ())
+                .expect("resume_prepaid call");
+            resumed.into_result().expect("resume_prepaid after a crashed sweep");
+        } else {
+            let swept: ct::MotokoResult<candid::Nat> = self
+                .env
+                .update(self.env.ledger, self.env.admin, "protocol_fee_sweep", (amount, self.env.time_ns()))
+                .expect("protocol_fee_sweep call");
+            swept.into_result().expect("protocol_fee_sweep");
+        }
+        self.model.apply_sweep(amount);
+        let withdraw: ct::MotokoResult<candid::Nat> = self
+            .env
+            .update(self.env.ledger, self.env.admin, "protocol_treasury_withdraw", (1u64, self.env.time_ns()))
+            .expect("protocol_treasury_withdraw call");
+        assert_eq!(
+            withdraw.into_result().err().as_deref(),
+            Some("REJECT:protocol-fee-recipient-unset"),
+            "a treasury payout was not refused with the recipient unset"
+        );
+        self.fee_invariants(if crashed { "crashed sweep" } else { "sweep" });
+        self.cheap_invariants();
     }
 
     fn progress(&self, line: &str) {
@@ -625,12 +956,17 @@ impl Runner {
     /// Plan a shield and append its predicted commitment to the planning mirror.
     fn plan_shield(&mut self, index: u64, planning: &mut MerkleMirror) -> Blueprint {
         let acct = self.rng.gen_range(0..self.accounts.len());
-        let v = self.rng.gen_range(100_000..10_000_000);
+        // under the mainnet schedule notes are sized so two of them cover the 0.1 send fee
+        let v = if self.tier.mainnet {
+            self.rng.gen_range(20_000_000..2_000_000_000)
+        } else {
+            self.rng.gen_range(100_000..10_000_000)
+        };
         let mut prng = prover::op_rng(self.tier.seed, index, "shield-plan");
         let rho = F::rand(&mut prng);
         let rcm = F::rand(&mut prng);
         let cm = common::note_commitment(&self.cfg, v, self.accounts[acct].pk, rho, rcm);
-        planning.append(&self.cfg, cm);
+        planning.append(cm);
         let fault = self.rng.gen_bool(0.005);
         Blueprint::Shield { acct, v, rho, rcm, fault }
     }
@@ -642,6 +978,7 @@ impl Runner {
         let mut reserved: HashSet<usize> = HashSet::new();
         let mut jobs = Vec::with_capacity(want);
         let fee = self.env.token_fee;
+        let send_fee = self.model.fees.send_fee;
         let batch_pool_value = self.model.pool_value;
         for _ in 0..want {
             let index = self.op_index;
@@ -653,8 +990,9 @@ impl Runner {
                 self.plan_shield(index, &mut planning)
             } else if roll < 0.86 {
                 match self.pick_two(&reserved) {
-                    Some((a, i1, i2)) => {
-                        let total = self.model.notes[i1].v + self.model.notes[i2].v;
+                    Some((a, i1, i2)) if self.model.notes[i1].v + self.model.notes[i2].v >= send_fee => {
+                        // the outputs carry everything but the send fee (0 under a zero schedule)
+                        let total = self.model.notes[i1].v + self.model.notes[i2].v - send_fee;
                         let v1 = self.rng.gen_range(0..=total);
                         let recipient = self.rng.gen_range(0..self.accounts.len());
                         reserved.insert(i1);
@@ -669,24 +1007,27 @@ impl Runner {
                             &self.cfg, out_v.1, self.accounts[a].pk,
                             self.model.notes[i2].nf, crypto.out_rcm2,
                         );
-                        planning.append(&self.cfg, cm1);
-                        planning.append(&self.cfg, cm2);
+                        planning.append(cm1);
+                        planning.append(cm2);
                         Blueprint::Transfer {
                             caller: a, in1: i1, in2: i2, out_v, recipient,
                             unshield: None, fault: false, crypto,
                         }
                     }
-                    None => self.plan_shield(index, &mut planning),
+                    _ => self.plan_shield(index, &mut planning),
                 }
             } else {
                 match self.pick_two(&reserved) {
                     Some((a, i1, i2)) => {
                         let total = self.model.notes[i1].v + self.model.notes[i2].v;
-                        if total <= fee + 1 {
+                        // largest payout the notes cover with the token fee and the protocol
+                        // share; total - fee under a zero schedule
+                        let max_v = self.max_unshield(total);
+                        if total <= fee + 1 || max_v < 1 {
                             self.plan_shield(index, &mut planning)
                         } else {
-                            let v_pub = self.rng.gen_range(1..=(total - fee));
-                            let change = total - fee - v_pub;
+                            let v_pub = self.rng.gen_range(1..=max_v);
+                            let change = total - self.model.required_fee(v_pub) - v_pub;
                             let v1 = self.rng.gen_range(0..=change);
                             reserved.insert(i1);
                             reserved.insert(i2);
@@ -701,8 +1042,8 @@ impl Runner {
                                 &self.cfg, out_v.1, self.accounts[a].pk,
                                 self.model.notes[i2].nf, crypto.out_rcm2,
                             );
-                            planning.append(&self.cfg, cm1);
-                            planning.append(&self.cfg, cm2);
+                            planning.append(cm1);
+                            planning.append(cm2);
                             Blueprint::Transfer {
                                 caller: a, in1: i1, in2: i2, out_v, recipient: a,
                                 unshield: Some(v_pub), fault, crypto,
@@ -752,8 +1093,14 @@ impl Runner {
             classes.push(InjectionClass::InsufficientAllowance);
         }
         let two = self.pick_two(reserved);
-        if two.is_some() {
-            classes.push(InjectionClass::ProofMutation);
+        if let Some((_, i1, i2)) = two {
+            // the mutated proof is a real transfer of these two notes, so they must cover the send fee
+            // (as an ordinary transfer's pick does); dust pairs under the mainnet fee overflowed here
+            // (full ICP tier, op 7038, Oct-17). Only this class is dropped, so classes[0] is unchanged
+            // for every history that did not hit the overflow.
+            if self.model.notes[i1].v + self.model.notes[i2].v >= self.model.fees.send_fee {
+                classes.push(InjectionClass::ProofMutation);
+            }
             classes.push(InjectionClass::WrongRecipientBinding);
         }
         // bias toward the least-exercised class so every class accumulates evidence
@@ -785,7 +1132,8 @@ impl Runner {
                 let (a, i1, i2) = two.unwrap();
                 let fee = self.env.token_fee;
                 let total = self.model.notes[i1].v + self.model.notes[i2].v;
-                if total <= fee + 1 {
+                let max_v = self.max_unshield(total);
+                if total <= fee + 1 || max_v < 1 {
                     return Blueprint::InjectUnknownAnchor { caller: a };
                 }
                 reserved.insert(i1);
@@ -795,7 +1143,7 @@ impl Runner {
                     caller: a,
                     in1: i1,
                     in2: i2,
-                    v_pub: self.rng.gen_range(1..=(total - fee)),
+                    v_pub: self.rng.gen_range(1..=max_v),
                     bound_to: (a + 1) % n,
                     crypto,
                 }
@@ -815,7 +1163,14 @@ impl Runner {
                 // A payout claim beyond everything ever shielded in, padded past anything the
                 // rest of this batch can add. The anchor is the predicted current root, so the
                 // turnstile is provably the guard that fires (verifier_outcome NOT_CALLED).
-                let v_pub = u64::try_from(batch_pool_value + 1_000_000_000)
+                // The margin covers every shield the batch can still add: 1 token under the
+                // default note sizes, a full batch of the largest mainnet notes otherwise.
+                let margin: u128 = if self.tier.mainnet {
+                    1_000_000_000 + self.tier.batch as u128 * 2_000_000_000
+                } else {
+                    1_000_000_000
+                };
+                let v_pub = u64::try_from(batch_pool_value + margin)
                     .expect("pool value fits u64");
                 Blueprint::InjectCounterfeitMint {
                     caller: self.rng.gen_range(0..n),
@@ -838,6 +1193,25 @@ impl Runner {
         let ledger = self.env.ledger;
         let token = self.env.token;
         let fixture_proof_hex = &self.fixture_proof_hex;
+        let fees = self.model.fees;
+        let send_fee = fees.send_fee;
+        let required_fee = |v_pub: u64| if v_pub == 0 { send_fee } else { env_token_fee + fees.unshield_share(v_pub) };
+        let envelopes = self.tier.mainnet;
+        // A private transfer's claim envelope: under the mainnet settings every private transfer
+        // carries one, a random decoy of the fixed length, and proves its binding (the ledger
+        // treats envelopes as opaque bytes; real IBE envelopes are the wallet's subject).
+        let envelope_for = move |index: u64| -> Option<Vec<u8>> {
+            envelopes.then(|| {
+                use rand_chacha::rand_core::RngCore;
+                let mut e = vec![0u8; MainnetSettings::CLAIM_ENVELOPE_LEN];
+                prover::op_rng(seed, index, "claim-envelope").fill_bytes(&mut e);
+                e
+            })
+        };
+        let private_binding = move |envelope: &Option<Vec<u8>>| -> [u8; 32] {
+            envelope.as_ref().map(|e| prover::claim_envelope_binding(&ledger, e)).unwrap_or([0u8; 32])
+        };
+        let (eph_len, ct_len) = prover::note_shape().unwrap_or((16, prover::NOTE_TAG_LEN + prover::NOTE_PAYLOAD_LEN));
 
         let binding_for = move |owner: Principal| -> [u8; 32] {
             use crate::icrc3_hash::{blob_v, hash_value, text};
@@ -880,23 +1254,25 @@ impl Runner {
                     Blueprint::Transfer { caller, in1, in2, out_v, recipient, unshield, fault, crypto } => {
                         let i1 = plan_input(in1);
                         let i2 = plan_input(in2);
+                        let envelope = if unshield.is_none() { envelope_for(index) } else { None };
                         let (fee, v_pub, binding, recipient_account, recipient_idx) = match unshield {
                             Some(v_pub) => (
-                                env_token_fee,
+                                required_fee(v_pub),
                                 v_pub,
                                 binding_for(accounts[caller].principal),
                                 Some(ct::Account { owner: accounts[caller].principal, subaccount: None }),
                                 Some(caller),
                             ),
-                            None => (0u64, 0u64, [0u8; 32], None, None),
+                            None => (required_fee(0), 0u64, private_binding(&envelope), None, None),
                         };
                         let out1_owner = if unshield.is_some() { &accounts[caller] } else { &accounts[recipient] };
-                        let prepared = prover::prepare_transfer(
+                        let mut prepared = prover::prepare_transfer(
                             cfg, &keys.transfer_pk, keys.legacy_statement, &crypto, (&i1, &i2),
                             (out1_owner, &accounts[caller]), out_v,
                             fee, v_pub, binding, recipient_account, recipient_idx,
                             seed, index,
                         );
+                        prepared.args.claim_envelope = envelope.map(ct::blob);
                         if fault && unshield.is_some() {
                             PlannedOp::FaultUnshield { caller, prepared: Box::new(prepared) }
                         } else {
@@ -907,11 +1283,13 @@ impl Runner {
                         let i1 = plan_input(spent);
                         let i2 = plan_input(fresh);
                         let total = i1.v + i2.v;
-                        let prepared = prover::prepare_transfer(
+                        let envelope = envelope_for(index);
+                        let mut prepared = prover::prepare_transfer(
                             cfg, &keys.transfer_pk, keys.legacy_statement, &crypto, (&i1, &i2),
-                            (&accounts[caller], &accounts[caller]), (total, 0),
-                            0, 0, [0u8; 32], None, None, seed, index,
+                            (&accounts[caller], &accounts[caller]), (total - send_fee, 0),
+                            send_fee, 0, private_binding(&envelope), None, None, seed, index,
                         );
+                        prepared.args.claim_envelope = envelope.map(ct::blob);
                         PlannedOp::Inject { class: InjectionClass::DoubleSpend, caller, transfer: Some(Box::new(prepared)), shield: None }
                     }
                     Blueprint::InjectReplay => {
@@ -933,11 +1311,13 @@ impl Runner {
                         let i1 = plan_input(in1);
                         let i2 = plan_input(in2);
                         let total = i1.v + i2.v;
+                        let envelope = envelope_for(index);
                         let mut prepared = prover::prepare_transfer(
                             cfg, &keys.transfer_pk, keys.legacy_statement, &crypto, (&i1, &i2),
-                            (&accounts[caller], &accounts[caller]), (total, 0),
-                            0, 0, [0u8; 32], None, None, seed, index,
+                            (&accounts[caller], &accounts[caller]), (total - send_fee, 0),
+                            send_fee, 0, private_binding(&envelope), None, None, seed, index,
                         );
+                        prepared.args.claim_envelope = envelope.map(ct::blob);
                         let mut bytes = hex::decode(&prepared.args.proof_hex).unwrap();
                         let pos = (index as usize).wrapping_mul(37) % bytes.len();
                         bytes[pos] ^= 0x01;
@@ -946,11 +1326,13 @@ impl Runner {
                     }
                     Blueprint::InjectUnknownAnchor { caller } => {
                         let mut rng = prover::op_rng(seed, index, "fake-tree");
-                        let mut fake = MerkleMirror::new(cfg);
-                        let fn1 = common::Note { v: 1_000_000, nk: accounts[caller].nk, rho: F::rand(&mut rng), rcm: F::rand(&mut rng) };
-                        let fn2 = common::Note { v: 500_000, nk: accounts[caller].nk, rho: F::rand(&mut rng), rcm: F::rand(&mut rng) };
-                        let l1 = fake.append(cfg, fn1.cm(cfg));
-                        let l2 = fake.append(cfg, fn2.cm(cfg));
+                        let mut fake = MerkleMirror::new();
+                        // notes in a tree the ledger never saw, large enough to cover the send fee
+                        let (fv1, fv2) = if send_fee == 0 { (1_000_000, 500_000) } else { (100_000_000, 50_000_000) };
+                        let fn1 = common::Note { v: fv1, nk: accounts[caller].nk, rho: F::rand(&mut rng), rcm: F::rand(&mut rng) };
+                        let fn2 = common::Note { v: fv2, nk: accounts[caller].nk, rho: F::rand(&mut rng), rcm: F::rand(&mut rng) };
+                        let l1 = fake.append(fn1.cm(cfg));
+                        let l2 = fake.append(fn2.cm(cfg));
                         let mut prng = prover::op_rng(seed, index, "fake-tree-plan");
                         let crypto = TransferCrypto {
                             anchor: fake.root(),
@@ -961,23 +1343,25 @@ impl Runner {
                         };
                         let i1 = TransferPlanInput { note_index: usize::MAX, leaf_index: l1, v: fn1.v, nk: fn1.nk, rho: fn1.rho, rcm: fn1.rcm };
                         let i2 = TransferPlanInput { note_index: usize::MAX, leaf_index: l2, v: fn2.v, nk: fn2.nk, rho: fn2.rho, rcm: fn2.rcm };
-                        let prepared = prover::prepare_transfer(
+                        let envelope = envelope_for(index);
+                        let mut prepared = prover::prepare_transfer(
                             cfg, &keys.transfer_pk, keys.legacy_statement, &crypto, (&i1, &i2),
-                            (&accounts[caller], &accounts[caller]), (1_400_000, 100_000),
-                            0, 0, [0u8; 32], None, None, seed, index,
+                            (&accounts[caller], &accounts[caller]), (fv1 + fv2 - send_fee - 100_000, 100_000),
+                            send_fee, 0, private_binding(&envelope), None, None, seed, index,
                         );
+                        prepared.args.claim_envelope = envelope.map(ct::blob);
                         PlannedOp::Inject { class: InjectionClass::UnknownAnchor, caller, transfer: Some(Box::new(prepared)), shield: None }
                     }
                     Blueprint::InjectWrongBinding { caller, in1, in2, v_pub, bound_to, crypto } => {
                         let i1 = plan_input(in1);
                         let i2 = plan_input(in2);
                         let total = i1.v + i2.v;
-                        let change = total - env_token_fee - v_pub;
+                        let change = total - required_fee(v_pub) - v_pub;
                         // proof bound to `bound_to`'s account; submitted with recipient = caller
                         let prepared = prover::prepare_transfer(
                             cfg, &keys.transfer_pk, keys.legacy_statement, &crypto, (&i1, &i2),
                             (&accounts[caller], &accounts[caller]), (change, 0),
-                            env_token_fee, v_pub,
+                            required_fee(v_pub), v_pub,
                             binding_for(accounts[bound_to].principal),
                             Some(ct::Account { owner: accounts[caller].principal, subaccount: None }),
                             Some(caller),
@@ -999,21 +1383,24 @@ impl Runner {
                             anchor: ct::blob(anchor.to_vec()),
                             nullifier_1: ct::blob(f_bytes(&nf1).to_vec()),
                             nullifier_2: ct::blob(f_bytes(&nf2).to_vec()),
+                            // well-formed in every respect the ledger checks before the
+                            // turnstile (sizes, fee), so the turnstile is the guard that fires
                             output_1: ct::OutputRecord {
                                 commitment: ct::blob(f_bytes(&cm1).to_vec()),
-                                ephemeral_key: ct::blob(vec![1u8; 16]),
-                                note_ciphertext: ct::blob(vec![1u8; 112]),
+                                ephemeral_key: ct::blob(vec![1u8; eph_len]),
+                                note_ciphertext: ct::blob(vec![1u8; ct_len]),
                             },
                             output_2: ct::OutputRecord {
                                 commitment: ct::blob(f_bytes(&cm2).to_vec()),
-                                ephemeral_key: ct::blob(vec![1u8; 16]),
-                                note_ciphertext: ct::blob(vec![1u8; 112]),
+                                ephemeral_key: ct::blob(vec![1u8; eph_len]),
+                                note_ciphertext: ct::blob(vec![1u8; ct_len]),
                             },
-                            fee: env_token_fee,
+                            fee: required_fee(v_pub),
                             v_pub_out: v_pub,
                             recipient: Some(ct::Account { owner: accounts[caller].principal, subaccount: None }),
                             created_at_time: None, // stamped at submission
                             proof_hex: fixture_proof_hex.clone(),
+                            claim_envelope: None,
                         };
                         PlannedOp::Inject {
                             class: InjectionClass::CounterfeitMint,
@@ -1084,6 +1471,7 @@ impl Runner {
                     self.env.update(self.env.ledger, self.accounts[acct].principal, "shield", (args,));
                 let err = r.err().expect("armed shield must trap after the token call");
                 assert!(err.contains("TEST_ONLY:fail-after-token"), "unexpected trap: {err}");
+                self.late_resume_if_due();
                 let m: ct::MutationResult = self
                     .env
                     .update(self.env.ledger, self.accounts[acct].principal, "resume_shield", ())
@@ -1121,6 +1509,9 @@ impl Runner {
                 );
                 self.assert_state_matches(&m, "transfer");
                 if is_private {
+                    if args.claim_envelope.is_some() {
+                        self.model.fees.claim_log += 1;
+                    }
                     self.last_accepted_private = Some(args);
                     self.counters.private_transfers += 1;
                 } else {
@@ -1143,6 +1534,7 @@ impl Runner {
                 );
                 let err = r.err().expect("armed unshield must trap after the token call");
                 assert!(err.contains("TEST_ONLY:fail-after-token"), "unexpected trap: {err}");
+                self.late_resume_if_due();
                 let m: ct::MutationResult = self
                     .env
                     .update(self.env.ledger, self.accounts[caller].principal, "resume_unshield", ())
@@ -1191,7 +1583,9 @@ impl Runner {
                 let ok = match class {
                     InjectionClass::DoubleSpend | InjectionClass::ProofReplay => outcome == "REJECT:nullifier-spent",
                     InjectionClass::UnknownAnchor => outcome == "REJECT:unknown-anchor",
-                    InjectionClass::InsufficientAllowance => outcome == "REJECT:token:InsufficientAllowance",
+                    // The shield leg names a deterministic no-effect token error with the ":no-effect"
+                    // qualifier (src/Main.mo shield path): the pull did not happen, nothing moved.
+                    InjectionClass::InsufficientAllowance => outcome == "REJECT:token:InsufficientAllowance:no-effect",
                     InjectionClass::CounterfeitMint => {
                         outcome == "REJECT:turnstile" && verifier_outcome == "NOT_CALLED"
                     }
@@ -1204,6 +1598,22 @@ impl Runner {
                     ok,
                     "injection {class:?} was not rejected as expected: outcome={outcome} verifier={verifier_outcome}"
                 );
+                // A forgery that reaches the verifier is a failed verification the forged-proof
+                // guard counts; every other class must be refused before the verifier, or (the
+                // allowance shield) after a verification that passed.
+                match class {
+                    InjectionClass::ProofMutation | InjectionClass::WrongRecipientBinding => {
+                        assert!(
+                            verifier_outcome.starts_with("REJECT:"),
+                            "injection {class:?} did not reach the verifier: verifier={verifier_outcome}"
+                        );
+                        self.model.fees.verifier_failures += 1;
+                    }
+                    _ => assert!(
+                        verifier_outcome == "NOT_CALLED" || verifier_outcome == "ACCEPT",
+                        "injection {class:?} failed a verification: verifier={verifier_outcome}"
+                    ),
+                }
                 let status = self.env.ledger_status();
                 assert_eq!(
                     u64::try_from(status.epoch.0.clone()).unwrap(),
@@ -1240,12 +1650,27 @@ impl Runner {
         let custody = self.env.token_balance(&self.env.pool_account());
         assert_eq!(custody, self.model.pool_custody, "interval: token custody");
         assert_eq!(self.model.pool_value, self.model.total_unspent(), "interval: pool_value == unspent notes");
-        // A2 conservation: the pool can never pay out more than was shielded in.
+        // custody at rest: the pool account holds the notes' value plus unswept protocol revenue
+        assert_eq!(
+            self.model.pool_custody,
+            self.model.pool_value + self.model.fees.revenue,
+            "interval: custody == pool_value + revenue"
+        );
+        // A2 conservation: the pool can never pay out more than was shielded in. Protocol fees
+        // leave pool_value as they are earned.
         assert_eq!(
             self.model.pool_value,
-            self.model.cumulative_shield_in - self.model.cumulative_unshield_out,
-            "interval: pool_value == cumulative in - cumulative out"
+            self.model.cumulative_shield_in - self.model.cumulative_unshield_out - self.model.fees.earned_total,
+            "interval: pool_value == cumulative in - cumulative out - protocol fees earned"
         );
+        assert_eq!(
+            self.model.fees.revenue,
+            self.model.fees.earned_total - self.model.fees.swept_total,
+            "interval: revenue == earned - swept"
+        );
+        if self.tier.mainnet {
+            self.fee_invariants("interval");
+        }
     }
 
     pub fn audit_status(&self) -> ct::AuditStatus {
@@ -1458,6 +1883,9 @@ impl Runner {
             ));
         }
         self.cheap_invariants();
+        if self.tier.mainnet {
+            Self::assert_mainnet_settings_on(&self.env, "after upgrade");
+        }
         self.progress(&format!(
             "upgrade #{} complete, audit PASS (epoch {}), invariants green | postupgrade {} instr, heap delta {}B",
             self.upgrades_done.len() + 1,
@@ -1468,7 +1896,66 @@ impl Runner {
         self.upgrades_done.push(at_op);
     }
 
+    /// ICP mode: every `late_resume_every`-th crash after the token call (counted over shields and
+    /// unshields together) is resumed `IcpToken::LATE_RESUME_SECS` later. The ledger then settles
+    /// it by scanning the ICP ledger's blocks (archives included) rather than by the deduplicated
+    /// resend, so both recovery branches run at volume.
+    fn late_resume_if_due(&self) {
+        let Some(icp) = &self.tier.icp else { return };
+        let crashes = self.counters.fault_shield + self.counters.fault_unshield;
+        if icp.late_resume_every > 0 && crashes % icp.late_resume_every == icp.late_resume_every - 1 {
+            self.env.pic().advance_time(std::time::Duration::from_secs(IcpToken::LATE_RESUME_SECS));
+            self.env.pic().tick();
+        }
+    }
+
+    /// Crashes resumed late so far (`late_resume_if_due`); None outside ICP mode.
+    pub fn late_resumes(&self) -> Option<u64> {
+        let icp = self.tier.icp.as_ref()?;
+        let crashes = self.counters.fault_shield + self.counters.fault_unshield;
+        Some(if icp.late_resume_every > 0 { crashes / icp.late_resume_every } else { 0 })
+    }
+
+    /// Top the zk ledger up the way its controller does on mainnet, and report what it burns.
+    ///
+    /// On the mainnet profile every accepted op verifies a Groth16 proof in the canister, about
+    /// 18e9 cycles per op (measured Oct-17 on the full ICP tier). The 100T the canister is
+    /// created with lasts about 5 000 ops; below about 10T its calls to the ICP ledger failed with
+    /// "could not perform remote call", so the shield stayed PENDING and the run stalled at op
+    /// 5014 (it settled once topped up). Topping up never touches the block log or the model.
+    fn keep_pool_funded(&mut self, executed: u64) {
+        const FLOOR: u128 = 40_000_000_000_000;
+        const REFILL_TO: u128 = 100_000_000_000_000;
+        let ledger = self.env.ledger;
+        let balance = self.env.pic().cycle_balance(ledger);
+        if let Some((op0, b0)) = self.cycles_mark {
+            if executed > op0 {
+                let burned = b0.saturating_sub(balance);
+                let per_op = burned / u128::from(executed - op0);
+                self.progress(&format!(
+                    "zk ledger cycles {balance}: burned {burned} over ops {op0}..{executed} ({per_op} per op)"
+                ));
+            }
+        }
+        let mut after = balance;
+        if balance < FLOOR {
+            let added = REFILL_TO - balance;
+            after = self.env.pic().add_cycles(ledger, added);
+            self.pool_cycles_added += added;
+            self.progress(&format!("zk ledger topped up by {added} cycles to {after} at op {executed}"));
+        }
+        self.cycles_mark = Some((executed, after));
+    }
+
     pub fn run(&mut self) -> u64 {
+        self.keep_pool_funded(self.executed_start);
+        if self.fresh && self.tier.checkpoint_ops > 0 {
+            // Setup and funding are the run's slowest single step (10 000 approvals on the ICP
+            // ledger) and the one a dead PocketIC server used to send back to the start.
+            let secs = self.checkpoint(0, 0, 0, 0);
+            self.fresh = false;
+            self.progress(&format!("durable checkpoint of the funded genesis in {secs:.1}s (resumable from op 0)"));
+        }
         let mut executed: u64 = self.executed_start;
         let total = self.tier.ops as u64;
         let mut next_upgrade = self.next_upgrade_start;
@@ -1476,6 +1963,7 @@ impl Runner {
         let mut last_recycle = executed;
         let mut last_durable_ckpt = executed;
         let mut upgrade_since_recycle = false;
+        let mut batch_no: u64 = 0;
         if self.resumed_from > 0 {
             self.progress(&format!("resumed at op {} of {total}", self.resumed_from));
         }
@@ -1512,6 +2000,10 @@ impl Runner {
                 }
             }
             let submitting = t1.elapsed().as_secs_f64();
+            batch_no += 1;
+            if self.tier.mainnet && batch_no % MainnetSettings::SWEEP_EVERY_BATCHES == 0 {
+                self.sweep_round(executed);
+            }
             // pure in-process recycle (memory only), if configured separately from checkpointing
             let interval_due = self.tier.recycle_ops > 0
                 && executed / self.tier.recycle_ops as u64 > last_recycle / self.tier.recycle_ops as u64;
@@ -1653,22 +2145,56 @@ impl Runner {
         let custody = self.env.token_balance(&self.env.pool_account());
         let status = self.env.ledger_status();
         let pool_value = u128::try_from(status.pool_value.0.clone()).unwrap();
+        let revenue = self.model.fees.revenue;
         assert_eq!(custody, self.model.pool_custody, "B4: custody vs model");
         assert_eq!(pool_value, self.model.total_unspent(), "B4: pool_value vs model unspent");
-        assert_eq!(custody, pool_value, "B4: custody vs pool_value");
-        assert_eq!(replay.total_unspent, custody, "B4: replayer unspent vs custody");
-        push(&mut battery, "B4-solvency",
-            format!("PASS (custody == pool_value == unspent == {custody}, model + replayer)"));
+        assert_eq!(custody, pool_value + revenue, "B4: custody vs pool_value + unswept revenue");
+        assert_eq!(replay.total_unspent, pool_value, "B4: replayer unspent vs pool_value");
+        push(&mut battery, "B4-solvency", if revenue == 0 {
+            format!("PASS (custody == pool_value == unspent == {custody}, model + replayer)")
+        } else {
+            format!("PASS (custody {custody} == pool_value {pool_value} + unswept revenue {revenue}; pool_value == unspent, model + replayer)")
+        });
 
         // A2 cumulative conservation at final state
+        let earned = self.model.fees.earned_total;
         assert_eq!(
             pool_value,
-            self.model.cumulative_shield_in - self.model.cumulative_unshield_out,
-            "A2: pool_value != cumulative shields - cumulative unshields"
+            self.model.cumulative_shield_in - self.model.cumulative_unshield_out - earned,
+            "A2: pool_value != cumulative shields - cumulative unshields - protocol fees earned"
         );
-        push(&mut battery, "A2-conservation",
+        push(&mut battery, "A2-conservation", if earned == 0 {
             format!("PASS (pool_value == {} shielded in - {} paid out)",
-                self.model.cumulative_shield_in, self.model.cumulative_unshield_out));
+                self.model.cumulative_shield_in, self.model.cumulative_unshield_out)
+        } else {
+            format!("PASS (pool_value == {} shielded in - {} paid out - {earned} protocol fees)",
+                self.model.cumulative_shield_in, self.model.cumulative_unshield_out)
+        });
+
+        // B13: the mainnet settings, end to end
+        if self.tier.mainnet {
+            Self::assert_mainnet_settings_on(&self.env, "final");
+            self.fee_invariants("final");
+            let f = self.model.fees;
+            assert_eq!(f.claim_log, self.counters.private_transfers, "B13: claim log != accepted private transfers");
+            let (eph, ct) = MainnetSettings::NOTE_SHAPE;
+            for b in &blocks {
+                assert!(
+                    b.ephemeral_key.len() == eph && b.note_ciphertext.len() == ct,
+                    "B13: block {} output is {}+{} bytes, not the note shape",
+                    b.position,
+                    b.ephemeral_key.len(),
+                    b.note_ciphertext.len()
+                );
+            }
+            assert!(f.sweeps >= 2, "B13: fewer than two sweeps ran ({}), the crashed path was not exercised", f.sweeps);
+            push(&mut battery, "B13-mainnet-settings", format!(
+                "PASS (send fee {} + unshield {} bps: earned {} = revenue {} + swept {} incl. token fees; treasury {} == treasury account; {} sweeps, {} crashed after the token leg and resumed, every payout refused with the recipient unset; {} claim envelopes logged == {} accepted private transfers; all {} outputs at {}+{} bytes; {} failed verifications counted, guard never tripped; settings intact across {} upgrades)",
+                f.send_fee, f.unshield_bps, f.earned_total, f.revenue, f.swept_total, f.treasury,
+                f.sweeps, f.sweeps / 2, f.claim_log, self.counters.private_transfers,
+                blocks.len(), eph, ct, f.verifier_failures, self.upgrades_done.len()
+            ));
+        }
 
         // B6 certificate, bound to the replayer's independently computed tip hash
         let tip: Option<ct::DataCertificate> = self
@@ -1738,6 +2264,9 @@ impl Runner {
             encoding_version: 1,
             archive_manifest,
             audit_digest,
+            // configure() bumps vk_epoch 0 -> 1 and the soak never rotates keys
+            vk_anchor: Some(cert::expected_vk_anchor(&self.keys.transfer_vk_hex, &self.keys.deposit_vk_hex, 1)),
+            vk_frozen: None, // the soak never freezes the keys
         };
         let report = cert::verify_tip_certificate(
             &tip.certificate,

@@ -78,6 +78,7 @@ struct Harness {
     env: pic_env::Env,
     keyset: keys::Keyset,
     cfg: common::PoseidonCfg<F>,
+    cfg_tree: common::TreeCfg,
     accounts: Vec<AccountKeys>,
     leaves: Vec<F>,
     notes: Vec<NoteRec>,
@@ -95,7 +96,7 @@ impl Harness {
         let env = pic_env::setup(wasms, &keyset.transfer_vk_hex, &keyset.deposit_vk_hex, &state_dir);
         let principals: Vec<Principal> = accounts.iter().map(|a| a.principal).collect();
         pic_env::fund_accounts(&env, &principals, FUND, FUND);
-        Harness { env, keyset, cfg, accounts, leaves: Vec::new(), notes: Vec::new(), op: 0 }
+        Harness { env, keyset, cfg, cfg_tree: common::poseidon_config_tree(), accounts, leaves: Vec::new(), notes: Vec::new(), op: 0 }
     }
 
     fn admin(&self) -> Principal {
@@ -231,12 +232,12 @@ impl Harness {
             }
         };
         let tree = common::DenseTree { leaves: self.leaves.clone() };
-        let anchor = tree.root(&self.cfg);
+        let anchor = tree.root(&self.cfg_tree);
         let mut prng = prover::op_rng(20260723, self.op, "prepaid-transfer-plan");
         let crypto = prover::TransferCrypto {
             anchor,
-            path1: tree.path(&self.cfg, self.notes_leaf(i)),
-            path2: tree.path(&self.cfg, self.notes_leaf(j)),
+            path1: tree.path(&self.cfg_tree, self.notes_leaf(i)),
+            path2: tree.path(&self.cfg_tree, self.notes_leaf(j)),
             out_rcm1: F::rand(&mut prng),
             out_rcm2: F::rand(&mut prng),
         };
@@ -290,7 +291,7 @@ impl Harness {
         }
         // sanity: our mirror root matches the canister's
         let tree = common::DenseTree { leaves: self.leaves.clone() };
-        let root = f_bytes(&tree.root(&self.cfg)).to_vec();
+        let root = f_bytes(&tree.root(&self.cfg_tree)).to_vec();
         let status = self.env.ledger_status();
         assert_eq!(status.note_root.as_ref(), root.as_slice(), "battery mirror diverged from the ledger root");
     }
@@ -738,7 +739,10 @@ fn c10_crash_recovery(w: &pic_env::BuiltWasms, ks: keys::Keyset) -> Result<(), S
 // Planted-defect variants
 // ---------------------------------------------------------------------------
 
-fn build_variant(root: &Path, wasms: &pic_env::BuiltWasms, tag: &str, patches: &[(&str, &str)]) -> pic_env::BuiltWasms {
+/// `hooks` injects the admin-gated test-hook fragment (scripts/test-hooks.frag.mo) before the actor's
+/// closing brace, the build-test-wasm.sh construction: C10 arms `test_arm_fail_after_token_once`,
+/// which the shipped wasm deliberately does not contain.
+fn build_variant(root: &Path, wasms: &pic_env::BuiltWasms, tag: &str, patches: &[(&str, &str)], hooks: bool) -> pic_env::BuiltWasms {
     let stage = std::env::temp_dir().join(format!("prepaid_variant_{}_{}", std::process::id(), tag));
     let _ = std::fs::remove_dir_all(&stage);
     pic_env::copy_dir_recursive(&root.join("src"), &stage.join("src"));
@@ -750,6 +754,16 @@ fn build_variant(root: &Path, wasms: &pic_env::BuiltWasms, tag: &str, patches: &
             "variant {tag}: patch anchor not found:\n{from}"
         );
         source = source.replace(from, to);
+    }
+    if hooks {
+        let fragment = std::fs::read_to_string(root.join("scripts/test-hooks.frag.mo")).expect("read hook fragment");
+        let close = source.rfind('}').expect("actor closing brace");
+        source = format!(
+            "{}  // ================= TEST HOOKS (generated; NEVER in the shipped wasm) =================\n{}\n  // ================= END TEST HOOKS =================\n{}",
+            &source[..close],
+            fragment,
+            &source[close..]
+        );
     }
     std::fs::write(&main_path, source).expect("write patched Main.mo");
     let out = stage.join("zk_ledger_variant.wasm");
@@ -781,10 +795,10 @@ fn main() {
     let root = repo_root();
     let keyset_for = || {
         let manifest = std::fs::read_to_string(
-            root.join("fixtures/pool-vectors-bls12-381/SETUP-MANIFEST.json"),
+            root.join("fixtures/pool-vectors-bls12-381-hardened/SETUP-MANIFEST.json"),
         )
         .unwrap();
-        keys::regenerate_and_verify(&manifest, true).expect("keyset")
+        keys::regenerate_and_verify(&manifest, false).expect("keyset")
     };
     println!("[battery] building wasms (ledger + token + tree oracle)...");
     let wasms = pic_env::build_wasms(&root, &root.join("soak/target/wasms"));
@@ -820,6 +834,7 @@ fn main() {
                 "    let prepaidRate = activePrepaidRate(); // PLANTED DEFECT X: pre-verify guard removed",
             ),
         ],
+        false,
     );
     let variant_y = build_variant(
         &root,
@@ -829,6 +844,7 @@ fn main() {
             "func activePrepaidRate() : Nat { if (prepaid_fee_enabled) prepaid_fee_rate else 0 };",
             "func activePrepaidRate() : Nat { if (prepaid_fee_rate == 0) 1 else prepaid_fee_rate }; // PLANTED DEFECT Y: flag ignored, floor 1",
         )],
+        false,
     );
     let variant_w = build_variant(
         &root,
@@ -838,16 +854,30 @@ fn main() {
             "let prepaid_fee_balances = Map.empty<Principal, Nat>();",
             "transient let prepaid_fee_balances = Map.empty<Principal, Nat>(); // PLANTED DEFECT W: balances wiped by upgrades",
         )],
+        false,
     );
     let variant_r = build_variant(
         &root,
         &wasms,
         "R",
-        &[(
-            "pending_prepaid := ?{ pending with attempts = pending.attempts + 1 };\n    await drivePendingPrepaid(pending.intent_id, false, true)",
-            "pending_prepaid := ?{ pending with attempts = pending.attempts + 1 };\n    await drivePendingPrepaid(pending.intent_id, false, false) // PLANTED DEFECT R: resume without reconcile",
-        )],
+        &[
+            (
+                "    await drivePendingPrepaid(pending.intent_id, trapAfterToken, true)",
+                "    await drivePendingPrepaid(pending.intent_id, trapAfterToken, false) // PLANTED DEFECT R: resume without reconcile",
+            ),
+            // The deposit leg also settles against the token log when a re-send fails in a way
+            // whose effect is not inferable (TooOld past the dedup window). Leaving that fallback in
+            // place recovers anyway, so the defect must remove BOTH reconcile paths.
+            (
+                "            if (requiresLogSettlement(error) and pendingPrepaidById(intentId) != null) {",
+                "            if (false and requiresLogSettlement(error) and pendingPrepaidById(intentId) != null) { // PLANTED DEFECT R",
+            ),
+        ],
+        true, // C10 arms the fault hook
     );
+    // C10 needs the admin-gated fault hook, so its GREEN run uses the shipped source plus the hook
+    // fragment (additive only); every other check runs on the shipped wasm itself.
+    let shipped_hooks = build_variant(&root, &wasms, "shipped-hooks", &[], true);
 
     let red_expectations: Vec<(&str, &pic_env::BuiltWasms, Vec<&str>)> = vec![
         ("X:debit-skipped", &variant_x, vec!["C2", "C3", "C4", "C5", "C7", "C9"]),
@@ -884,7 +914,8 @@ fn main() {
     println!("\n==== SHIPPED WASM: all checks must be GREEN ====");
     let mut green = 0u32;
     for (name, f) in &checks {
-        f(&wasms, keyset_for()).unwrap_or_else(|e| panic!("{name} FAILED on the shipped wasm: {e}"));
+        let target = if *name == "C10" { &shipped_hooks } else { &wasms };
+        f(target, keyset_for()).unwrap_or_else(|e| panic!("{name} FAILED on the shipped wasm: {e}"));
         green += 1;
     }
     println!("\nPREPAID-FEE BATTERY COMPLETE: {green}/10 green on shipped, {teeth}/10 planted reds");

@@ -1,0 +1,154 @@
+=== 1. export the transcript as the chain holds it now
+coordinator osqjo-zyaaa-aaaad-agxua-cai: power=14 contributions=25 finalized=False phase=closed
+  initial_transfer.wire 2,948,360 B  sha256 ok
+  initial_deposit.wire 168,200 B  sha256 ok
+  c0: contribution transfer 2,948,360 B deposit 168,200 B  sha256 ok
+  c1: contribution transfer 2,948,360 B deposit 168,200 B  sha256 ok
+  c2: contribution transfer 2,948,360 B deposit 168,200 B  sha256 ok
+  c3: contribution transfer 2,948,360 B deposit 168,200 B  sha256 ok
+  c4: contribution transfer 2,948,360 B deposit 168,200 B  sha256 ok
+  c5: contribution transfer 2,948,360 B deposit 168,200 B  sha256 ok
+  c6: contribution transfer 2,948,360 B deposit 168,200 B  sha256 ok
+  c7: contribution transfer 2,948,360 B deposit 168,200 B  sha256 ok
+  c8: contribution transfer 2,948,360 B deposit 168,200 B  sha256 ok
+  c9: contribution transfer 2,948,360 B deposit 168,200 B  sha256 ok
+  c10: contribution transfer 2,948,360 B deposit 168,200 B  sha256 ok
+  c11: contribution transfer 2,948,360 B deposit 168,200 B  sha256 ok
+  c12: contribution transfer 2,948,360 B deposit 168,200 B  sha256 ok
+  c13: contribution transfer 2,948,360 B deposit 168,200 B  sha256 ok
+  c14: contribution transfer 2,948,360 B deposit 168,200 B  sha256 ok
+  c15: contribution transfer 2,948,360 B deposit 168,200 B  sha256 ok
+  c16: contribution transfer 2,948,360 B deposit 168,200 B  sha256 ok
+  c17: contribution transfer 2,948,360 B deposit 168,200 B  sha256 ok
+  c18: contribution transfer 2,948,360 B deposit 168,200 B  sha256 ok
+  c19: contribution transfer 2,948,360 B deposit 168,200 B  sha256 ok
+  c20: contribution transfer 2,948,360 B deposit 168,200 B  sha256 ok
+  c21: contribution transfer 2,948,360 B deposit 168,200 B  sha256 ok
+  c22: contribution transfer 2,948,360 B deposit 168,200 B  sha256 ok
+  c23: contribution transfer 2,948,360 B deposit 168,200 B  sha256 ok
+  c24: contribution transfer 2,948,360 B deposit 168,200 B  sha256 ok
+wrote manifest.tsv (25 row(s), finalized=False)
+=== 2. assemble + verify it (must be VALID and unfinalized)
+$ ceremony-cli assemble-transcript sapling-phase1-p14.srs.bin parts pre.transcript.bin
+  initial parameters match the SRS-derived ones
+  assembled 25 contribution(s), finalized=false
+  wrote pre.transcript.bin (43420419 bytes)
+  now verify it: verify-transcript sapling-phase1-p14.srs.bin pre.transcript.bin --selfcheck
+$ verify-transcript sapling-phase1-p14.srs.bin pre.transcript.bin
+  TRANSCRIPT VALID
+    honest contributions : 25
+    finalized (beacon)   : false
+    transfer vk SHA-256  : c37b8d85f9de555d0ac8b6cb47023023f077a1178cdbc7eec56393b378236dd7
+    deposit  vk SHA-256  : c41f73c7ccd406b93b96b6cfef9ad29c6405951fd0013014cdd29222316f70a8
+    transfer fixed SHA256: fb5f120a18a0318cd9d49ac413f64cae27312b9d55a8b36240e53aa2cae2e9ad
+    deposit  fixed SHA256: fdc73e08de8a562262c94464a3ea739bc452c1ac120b78a885ab5aaf6f1e0cbd
+  reading SRS from sapling-phase1-p14.srs.bin ...
+  reading transcript from pre.transcript.bin ...
+  SRS: power 14 (32767 G1 tau powers), provenance InheritedReviewedPhase1
+  SRS SHA-256: 94f268950305fd23b50fa77dec3d540e2742d3472d7416160cce627566ae39e8
+  transcript: 25 contributions, finalized=false
+=== 3. apply the beacon locally: step 25
+$ ceremony-cli finalize sapling-phase1-p14.srs.bin post.transcript.bin icp-ledger-block:38420079:589baa51acbeffde82538bd5d1bfcdb0b96b69a4cbd2e739d2f9cae5faaf44ea
+  finalized with beacon "icp-ledger-block:38420079:589baa51acbeffde82538bd5d1bfcdb0b96b69a4cbd2e739d2f9cae5faaf44ea"
+  wrote post.transcript.bin (44979222 bytes)
+$ verify-transcript sapling-phase1-p14.srs.bin post.transcript.bin
+  TRANSCRIPT VALID
+    honest contributions : 25
+    finalized (beacon)   : true
+    transfer vk SHA-256  : f409d18f8149ccae11d9319f95c80fde72f3a9b13834d1c3410050e190116514
+    deposit  vk SHA-256  : b0afc42ad1b764b9fc2c435c41b328bc822c2ac70937211df1bcd9af23112224
+    transfer fixed SHA256: fb5f120a18a0318cd9d49ac413f64cae27312b9d55a8b36240e53aa2cae2e9ad
+    deposit  fixed SHA256: fdc73e08de8a562262c94464a3ea739bc452c1ac120b78a885ab5aaf6f1e0cbd
+  reading SRS from sapling-phase1-p14.srs.bin ...
+  reading transcript from post.transcript.bin ...
+  SRS: power 14 (32767 G1 tau powers), provenance InheritedReviewedPhase1
+  SRS SHA-256: 94f268950305fd23b50fa77dec3d540e2742d3472d7416160cce627566ae39e8
+  transcript: 26 contributions, finalized=true
+=== 4. emit the beacon step in wire form
+$ ceremony-cli emit-contribution post.transcript.bin 25 emit
+  wrote c25_transfer.wire (2948360 bytes)
+  wrote c25_deposit.wire (168200 bytes)
+  wrote c25_meta.json (2124 bytes)
+  step 25: is_beacon=true transfer 2948360 B, deposit 168200 B
+=== 5. stage + submit_beacon
+{
+  "T": "2026-09-16T12:00:00Z (1789560000000000000)",
+  "index": 38420079,
+  "timestamp": "2026-09-16T12:00:02Z (1789560002760859872)",
+  "sha256": "589baa51acbeffde82538bd5d1bfcdb0b96b69a4cbd2e739d2f9cae5faaf44ea",
+  "chain_check": "confirmed: block 38420080.parent_hash == sha256(block 38420079)",
+  "chain_length_at_resolution": 39162396,
+  "beacon": "icp-ledger-block:38420079:589baa51acbeffde82538bd5d1bfcdb0b96b69a4cbd2e739d2f9cae5faaf44ea",
+  "claimed": "icp-ledger-block:38420079:589baa51acbeffde82538bd5d1bfcdb0b96b69a4cbd2e739d2f9cae5faaf44ea",
+  "verdict": "BEACON VALID"
+}
+coordinator osqjo-zyaaa-aaaad-agxua-cai: contributions=25 finalized=False queue=0 phase=closed
+begin_beacon_staging as 4jzjr-ob6oo-sb3ew-eeaxp-444x7-sdf33-allxe-owics-g5k2v-52jrv-fae ...
+  uploaded transfer chunk 1/2 (1,500,000 B, 7.9s)
+  uploaded transfer chunk 2/2 (1,448,360 B, 7.3s)
+  uploaded deposit chunk 1/1 (168,200 B, 6.1s)
+submit_beacon('icp-ledger-block:38420079:589baa51acbeffde82538bd5d1bfcdb0b96b69a4cbd2e739d2f9cae5faaf44ea') ...
+coordinator: FINALIZED: beacon contribution 26 accepted
+  [OK ] finalized = true
+  [OK ] contribution_count = 26
+  [OK ] contribution 25 is the beacon step
+  [OK ] recorded beacon bytes match
+  [OK ] recorded transfer delta hash matches
+  [OK ] recorded deposit delta hash matches
+SUBMITTED: the coordinator is finalized with the beacon step
+=== 6. re-export from the chain and verify with --selfcheck
+coordinator osqjo-zyaaa-aaaad-agxua-cai: power=14 contributions=26 finalized=True phase=finalized
+  initial_transfer.wire 2,948,360 B  sha256 ok
+  initial_deposit.wire 168,200 B  sha256 ok
+  c0: contribution transfer 2,948,360 B deposit 168,200 B  sha256 ok
+  c1: contribution transfer 2,948,360 B deposit 168,200 B  sha256 ok
+  c2: contribution transfer 2,948,360 B deposit 168,200 B  sha256 ok
+  c3: contribution transfer 2,948,360 B deposit 168,200 B  sha256 ok
+  c4: contribution transfer 2,948,360 B deposit 168,200 B  sha256 ok
+  c5: contribution transfer 2,948,360 B deposit 168,200 B  sha256 ok
+  c6: contribution transfer 2,948,360 B deposit 168,200 B  sha256 ok
+  c7: contribution transfer 2,948,360 B deposit 168,200 B  sha256 ok
+  c8: contribution transfer 2,948,360 B deposit 168,200 B  sha256 ok
+  c9: contribution transfer 2,948,360 B deposit 168,200 B  sha256 ok
+  c10: contribution transfer 2,948,360 B deposit 168,200 B  sha256 ok
+  c11: contribution transfer 2,948,360 B deposit 168,200 B  sha256 ok
+  c12: contribution transfer 2,948,360 B deposit 168,200 B  sha256 ok
+  c13: contribution transfer 2,948,360 B deposit 168,200 B  sha256 ok
+  c14: contribution transfer 2,948,360 B deposit 168,200 B  sha256 ok
+  c15: contribution transfer 2,948,360 B deposit 168,200 B  sha256 ok
+  c16: contribution transfer 2,948,360 B deposit 168,200 B  sha256 ok
+  c17: contribution transfer 2,948,360 B deposit 168,200 B  sha256 ok
+  c18: contribution transfer 2,948,360 B deposit 168,200 B  sha256 ok
+  c19: contribution transfer 2,948,360 B deposit 168,200 B  sha256 ok
+  c20: contribution transfer 2,948,360 B deposit 168,200 B  sha256 ok
+  c21: contribution transfer 2,948,360 B deposit 168,200 B  sha256 ok
+  c22: contribution transfer 2,948,360 B deposit 168,200 B  sha256 ok
+  c23: contribution transfer 2,948,360 B deposit 168,200 B  sha256 ok
+  c24: contribution transfer 2,948,360 B deposit 168,200 B  sha256 ok
+  c25: BEACON transfer 2,948,360 B deposit 168,200 B  sha256 ok
+wrote manifest.tsv (26 row(s), finalized=True)
+$ ceremony-cli assemble-transcript sapling-phase1-p14.srs.bin parts-final final.transcript.bin
+  initial parameters match the SRS-derived ones
+  assembled 26 contribution(s), finalized=true
+  wrote final.transcript.bin (44979222 bytes)
+  now verify it: verify-transcript sapling-phase1-p14.srs.bin final.transcript.bin --selfcheck
+$ verify-transcript sapling-phase1-p14.srs.bin final.transcript.bin --selfcheck
+  TRANSCRIPT VALID
+    honest contributions : 25
+    finalized (beacon)   : true
+    transfer vk SHA-256  : f409d18f8149ccae11d9319f95c80fde72f3a9b13834d1c3410050e190116514
+    deposit  vk SHA-256  : b0afc42ad1b764b9fc2c435c41b328bc822c2ac70937211df1bcd9af23112224
+    transfer fixed SHA256: fb5f120a18a0318cd9d49ac413f64cae27312b9d55a8b36240e53aa2cae2e9ad
+    deposit  fixed SHA256: fdc73e08de8a562262c94464a3ea739bc452c1ac120b78a885ab5aaf6f1e0cbd
+  KEYS WORK (real transfer + deposit proofs verify)
+  reading SRS from sapling-phase1-p14.srs.bin ...
+  reading transcript from final.transcript.bin ...
+  SRS: power 14 (32767 G1 tau powers), provenance InheritedReviewedPhase1
+  SRS SHA-256: 94f268950305fd23b50fa77dec3d540e2742d3472d7416160cce627566ae39e8
+  transcript: 26 contributions, finalized=true
+  running key self-check (prove+verify real transfer & deposit) ...
+=== verdict
+  local  vk: transfer f409d18f8149ccae11d9319f95c80fde72f3a9b13834d1c3410050e190116514  deposit b0afc42ad1b764b9fc2c435c41b328bc822c2ac70937211df1bcd9af23112224
+  chain  vk: transfer f409d18f8149ccae11d9319f95c80fde72f3a9b13834d1c3410050e190116514  deposit b0afc42ad1b764b9fc2c435c41b328bc822c2ac70937211df1bcd9af23112224
+FINALIZED AND VERIFIED FROM THE CHAIN: 26 steps, final transcript at final.transcript.bin
+mainnet-exit=0

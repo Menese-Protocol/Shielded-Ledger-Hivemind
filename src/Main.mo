@@ -38,6 +38,7 @@ import Groth16Wire "groth16/Groth16Wire";
 import ICRC1Block "ICRC1Block";
 import ICRC2 "ICRC2";
 import ICRC2Block "ICRC2Block";
+import IcpBlock "IcpBlock";
 import ICRC3 "ICRC3";
 import NoteAudit "NoteAudit";
 import NoteCodec "NoteCodec";
@@ -124,6 +125,29 @@ persistent actor ZkLedger {
     recipient : ?ICRC2.Account;
     created_at_time : ?Nat64;
     proof_hex : Text;
+    /// Claimable-payment envelope: an opaque, fixed-length
+    /// vetKeys IBE ciphertext bound to the proof through `recipient_binding`. Private transfers
+    /// only; null on unshields. Absent from older callers' records, which decode as null.
+    claim_envelope : ?Blob;
+  };
+  public type ClaimRecord = {
+    index : Nat;
+    /// log position of the note the envelope describes (the transfer's first output)
+    note_position : Nat;
+    time : Int;
+    envelope : Blob;
+  };
+  public type ClaimLogPage = {
+    total : Nat;
+    records : [ClaimRecord];
+  };
+  /// One length for every new output's opaque fields, so outputs from different wallets (or a
+  /// claimable payment and any other transfer) cannot be told apart by size.
+  public type NoteShape = { ephemeral_key_len : Nat; note_ciphertext_len : Nat };
+  public type ClaimStatus = {
+    required : Bool;
+    envelope_len : Nat;
+    total : Nat;
   };
   public type MutationResult = {
     outcome : Text;
@@ -243,7 +267,10 @@ persistent actor ZkLedger {
       // a deterministic token failure refunds it, finalization keeps it debited
       #withdraw : {
         reserved : Nat;
-        source : { #balance; #revenue };
+        // #sweep moves protocol-fee revenue from the POOL account into the protocol treasury
+        // subaccount (protocol_fee_sweep); #treasury pays out of that subaccount
+        // (protocol_treasury_withdraw).
+        source : { #balance; #revenue; #sweep; #treasury };
         transfer_args : ICRC2.TransferArg;
       };
     };
@@ -259,6 +286,50 @@ persistent actor ZkLedger {
     holders : Nat;
     pending : ?PendingPrepaid;
     completed_intents : Nat;
+  };
+
+  /// The protocol fee schedule the administrator sets. `send_fee` is a flat amount every private
+  /// transfer carries in the proof's public `fee`; `unshield_bps` is the share of `v_pub_out` an
+  /// unshield carries on top of the token ledger's own fee; `recipient` is where
+  /// protocol_treasury_withdraw pays.
+  public type ProtocolFeeConfig = {
+    send_fee : Nat64;
+    unshield_bps : Nat;
+    recipient : ?ICRC2.Account;
+  };
+  /// The forged-proof cool-down (set_forged_proof_guard). `threshold` failed proof verifications
+  /// within `window_seconds` start a cool-down of `cooldown_seconds`, during which no NEW proof is
+  /// verified. 0 = off.
+  public type ForgedProofGuardConfig = {
+    threshold : Nat;
+    window_seconds : Nat;
+    cooldown_seconds : Nat;
+  };
+  public type ForgedProofGuardStatus = {
+    config : ForgedProofGuardConfig;
+    cooling_down : Bool;
+    /// ns since epoch; 0 when no cool-down has started
+    cooldown_until : Int;
+    failures_in_window : Nat;
+    window_started_at : Int;
+    /// cool-downs started since install
+    trips : Nat;
+    /// failed proof verifications since install, counted whether the guard is on or off
+    failures_total : Nat;
+  };
+  public type ProtocolFeeStatus = {
+    send_fee : Nat;
+    unshield_bps : Nat;
+    recipient : ?ICRC2.Account;
+    revenue : Nat;
+    transparent_ledger_fee : Nat;
+    /// What the pool account holds at rest: pool_value + revenue. While a sweep is in flight
+    /// its reservation has already left `revenue` but not yet the account.
+    pool_custody_at_rest : Nat;
+    /// Protocol fees already swept out of the pool, held in the ledger's own treasury subaccount.
+    /// At rest the treasury account's token balance equals this.
+    treasury : Nat;
+    treasury_account : ICRC2.Account;
   };
 
   /// The publicly visible shape of an in-flight token intent.
@@ -282,6 +353,8 @@ persistent actor ZkLedger {
     token_configured : Bool;
     token_ledger : ?Principal;
     history_adapter : ?Principal;
+    /// true: the token is the NNS ICP ledger, its own query_blocks log read directly (no adapter)
+    icp_history : Bool;
     transparent_ledger_fee : Nat;
     transparent_ledger_decimals : Nat8;
     pool_account : ICRC2.Account;
@@ -335,6 +408,18 @@ persistent actor ZkLedger {
   var tree_oracle_id : ?Principal = null;
   var token_ledger_id : ?Principal = null;
   var history_adapter_id : ?Principal = null;
+  // Where the token's history is read. false: an ICRC-3 log (the token ledger itself, or an
+  // adapter). true: the NNS ICP ledger's own legacy `query_blocks` log, read directly and matched
+  // by account identifier (IcpBlock); no adapter exists in that configuration.
+  var token_history_icp : Bool = false;
+  // ICP recovery scans keep their place per intent: the first index not yet observed. A scan that
+  // reaches its per-call bound resumes there next time instead of restarting from the low-water
+  // mark (an immutable log, so an index observed without a match never needs observing again).
+  // The place is kept after the scan concludes too: a recovery can scan twice for one intent (prove
+  // absence, resend, the ledger answers TooOld, settle by scan again), and restarting the second
+  // scan at the low-water mark would loop forever on a log longer than one call's budget. Intent
+  // ids are unique, so a concluded intent's entry is a few bytes that are never read again.
+  let icp_scan_cursor = Map.empty<Blob, Nat>();
   var token_configuring : Bool = false;
   var transparent_ledger_fee : Nat = 0;
   var transparent_ledger_decimals : Nat8 = 0;
@@ -346,6 +431,11 @@ persistent actor ZkLedger {
   // Monotonic keyset epoch. Bumped by configure and by every rotate_verifying_keys_v2, and
   // carried in the certified vk anchor so a client can detect a rotation it has not adopted.
   var vk_epoch : Nat64 = 0;
+  // One-way verifying-key latch (freeze_verifying_keys). Some = frozen: holds the 40-byte vk
+  // anchor leaf as it stood at the freeze, is certified under label "vk_frozen", and makes
+  // rotate_verifying_keys_v2 refuse forever. Nothing in this canister can set it back to null;
+  // after a freeze the keys can change only through a code upgrade by the controller.
+  var vk_frozen_anchor : ?Blob = null;
   var transfer_vk_prepared : ?Groth16Multi.PreparedVk = null;
   var deposit_vk_prepared : ?Groth16Multi.PreparedVk = null;
   // Flat-limb projection of the prepared vks: rebuilding it inline cost a measured
@@ -390,6 +480,22 @@ persistent actor ZkLedger {
   let completed_shield_intents = StableBlobSet.newState();
   let completed_unshield_intents = StableBlobSet.newState();
   let note_log = StableLog.newState();
+  // Claimable-payment envelopes, in their own stable region: record = note_position (8B BE) ‖
+  // time ns (8B BE, two's complement) ‖ envelope. Append-only, one record per enveloped transfer.
+  let claim_log = StableLog.newState();
+  // When true every private transfer must carry an envelope (real or decoy), so a claimable
+  // payment cannot be told apart from any other private transfer. Default off: a pool that
+  // never turns it on behaves exactly as before.
+  var claim_envelopes_required : Bool = false;
+  // vetKeys IBE ciphertext of the fixed 80-byte claim payload (measured with @dfinity/vetkeys
+  // 0.4.0: 80 → 216 bytes). One length for every envelope, real or decoy.
+  transient let CLAIM_ENVELOPE_LEN : Nat = 216;
+  // When set, every NEW output (shield, private transfer, unshield change) must have exactly these
+  // opaque-field lengths. Checked where outputs enter, never in the stable-state self-check, so
+  // outputs pending from before the setting stay valid. Default off.
+  var note_shape : ?NoteShape = null;
+  transient let NOTE_SHAPE_MAX : Nat = 4096;
+  transient let CLAIM_PAGE_MAX : Nat = 500;
 
   // ==== PIR v2 query layer (default OFF; src/Pir2.mo) ====
   // Additive and gated: while `pir2_state.enabled` is false the append path carries no v2
@@ -446,8 +552,8 @@ persistent actor ZkLedger {
   // and no public block, so shielded transfers leave no per-transfer fee trail on the token
   // ledger (the deanonymization vector a visible per-transfer payment would create).
   // Custody for these balances lives in the DEDICATED fee subaccount below, never in the
-  // pool account, so the pool solvency identity (custody == pool_value == Σ unspent notes)
-  // is untouched. Fee-side identity: fee-account custody == total_prepaid + revenue
+  // pool account, so the pool solvency identity (custody == pool_value + protocol_fee_revenue,
+  // with pool_value == Σ unspent notes; see the protocol fee below) is untouched. Fee-side identity: fee-account custody == total_prepaid + revenue
   // + (in-flight withdrawal reservation, while one is pending).
   var prepaid_fee_enabled : Bool = false;
   var prepaid_fee_rate : Nat = 0;
@@ -467,6 +573,48 @@ persistent actor ZkLedger {
   // intent). A separate stable var (not a PendingUnshield field) keeps the stable record
   // type backward-compatible.
   var pending_unshield_prepaid_debit : Nat = 0;
+
+  // ==== protocol fee (schedule defaults to zero) ====
+  // Charged through the transfer statement's PUBLIC `fee` input, which the circuit already binds:
+  // in_1 + in_2 == out_1 + out_2 + fee + v_pub_out. So no circuit change and no new trusted setup.
+  // Before this the ledger checked `fee` only on unshields (>= the token fee) and ignored it on
+  // private transfers: any value a wallet put there left the notes without leaving pool_value —
+  // untracked surplus nobody could ever spend. Now `fee` must equal the schedule EXACTLY, and the
+  // protocol share moves from pool_value into protocol_fee_revenue in the same commit as the
+  // nullifiers. Custody identity at rest: pool-account balance == pool_value + protocol_fee_revenue.
+  // The send fee is FLAT so it is the same for every transfer and says nothing about the hidden
+  // amount; the unshield share is a percentage of v_pub_out, which is already public. Nothing here
+  // is keyed by the caller, so a private transfer may be submitted from any principal.
+  var protocol_send_fee : Nat = 0;
+  var protocol_unshield_bps : Nat = 0;
+  var protocol_fee_revenue : Nat = 0;
+  var protocol_fee_recipient : ?ICRC2.Account = null;
+  // Swept revenue, held in the ledger's own treasury subaccount (never the pool account), so the
+  // two custody identities stay separate and each is checkable on the token ledger:
+  //   pool account     == pool_value + protocol_fee_revenue
+  //   treasury account == protocol_treasury_balance
+  var protocol_treasury_balance : Nat = 0;
+  // The protocol share carried by the CURRENT pending unshield (0 when none). A separate stable
+  // var rather than a PendingUnshield field, for the M0170 reason given above.
+  var pending_unshield_protocol_fee : Nat = 0;
+  // Caps protect users from a mistyped schedule. Transient so a future build's caps take effect.
+  transient let PROTOCOL_SEND_FEE_MAX : Nat = 100_000_000; // one whole token at 8 decimals
+  transient let PROTOCOL_UNSHIELD_BPS_MAX : Nat = 100; // 1%
+  transient let BPS_DENOMINATOR : Nat = 10_000;
+
+  // ==== forged-proof cool-down (default off) ====
+  // `threshold` failed verifications within the window start a cool-down during which shield and
+  // confidential_transfer refuse before the verifier. Finalize and resume paths never verify a
+  // proof and are never refused, so nothing pending is stranded.
+  var forged_guard : ForgedProofGuardConfig = { threshold = 0; window_seconds = 600; cooldown_seconds = 1800 };
+  var forged_window_start : Int = 0;
+  var forged_in_window : Nat = 0;
+  var forged_cooldown_until : Int = 0;
+  var forged_trips : Nat = 0;
+  var forged_failures_total : Nat = 0;
+  transient let FORGED_THRESHOLD_MAX : Nat = 100_000;
+  transient let FORGED_SECONDS_MIN : Nat = 60;
+  transient let FORGED_SECONDS_MAX : Nat = 86_400;
 
   /// The unshield commit's PREPARE output. A NEW TOP-LEVEL STABLE VARIABLE rather than a field of
   /// PendingUnshield, which would be an M0170 incompatible change and would make every deployed pool
@@ -539,6 +687,9 @@ persistent actor ZkLedger {
   /// declaration is an operator decision with the costs above, not a cleanup.
   var test_hooks_sealed : Bool = false;
   var test_fail_after_token_once : Bool = false;
+  // Test hook state (only the hooks build can set it): the next shield's token call is treated as
+  // rejected, exactly the `catch` branch below, leaving the intent pending with nothing moved.
+  var test_reject_token_call_once : Bool = false;
   // While > 0, the PIR fold path traps. In the synchronous wiring the in-message rollback keeps
   // the counter armed (every transfer traps until disarmed) — the exact money-path coupling the
   // derived-index decoupling removes.
@@ -749,6 +900,7 @@ persistent actor ZkLedger {
   StableBlobSet.ensureInit(completed_shield_intents);
   StableBlobSet.ensureInit(completed_unshield_intents);
   StableLog.ensureInit(note_log);
+  StableLog.ensureInit(claim_log);
 
   func noteCount() : Nat { StableLog.size(note_log) };
   func rootCount() : Nat { StableBlobSet.size(historical_roots) };
@@ -758,13 +910,22 @@ persistent actor ZkLedger {
 
   func selfPrincipal() : Principal { Principal.fromActor(ZkLedger) };
   func poolAccount() : ICRC2.Account { { owner = selfPrincipal(); subaccount = pool_subaccount } };
-  func tokenConfigured() : Bool { token_ledger_id != null and history_adapter_id != null };
+  func tokenConfigured() : Bool {
+    token_ledger_id != null and (token_history_icp or history_adapter_id != null)
+  };
 
   func isAdministrator(caller : Principal) : Bool {
     switch (administrator) { case (?value) Principal.equal(value, caller); case null false }
   };
 
   func tokenActor() : TransferLedger {
+    switch (token_ledger_id) {
+      case (?id) actor (Principal.toText(id));
+      case null Runtime.trap("unconfigured token ledger");
+    }
+  };
+
+  func icpActor() : IcpBlock.IcpLedger {
     switch (token_ledger_id) {
       case (?id) actor (Principal.toText(id));
       case null Runtime.trap("unconfigured token ledger");
@@ -805,6 +966,41 @@ persistent actor ZkLedger {
   };
 
   func zeroField() : Blob { Blob.fromArray(Array.repeat<Nat8>(0, 32)) };
+
+  /// The `recipient_binding` a private transfer carrying `envelope` must prove:
+  /// SHA-256("picp-claim-envelope/v1" ‖ pool principal ‖ envelope), top byte cleared so the
+  /// value is a canonical field element (< 2^248 < r), the same reduction the unshield binding uses.
+  func claimBinding(envelope : Blob) : Blob {
+    let hash = Sha256.Digest(#sha256);
+    hash.writeBlob(Text.encodeUtf8("picp-claim-envelope/v1"));
+    hash.writeBlob(Principal.toBlob(selfPrincipal()));
+    hash.writeBlob(envelope);
+    let bytes = Blob.toArray(hash.sum());
+    Blob.fromArray(Array.tabulate<Nat8>(32, func(i) { if (i == 31) 0 else bytes[i] }))
+  };
+
+  func be8(n : Nat) : [Nat8] {
+    Array.tabulate<Nat8>(8, func(i) { Nat8.fromNat((n / (256 ** (7 - i))) % 256) })
+  };
+
+  func claimRecordBytes(position : Nat, time : Int, envelope : Blob) : Blob {
+    let t : Nat = Nat64.toNat(Nat64.fromIntWrap(time));
+    Blob.fromArray(Array.flatten<Nat8>([be8(position), be8(t), Blob.toArray(envelope)]))
+  };
+
+  func decodeClaimRecord(index : Nat, raw : Blob) : ClaimRecord {
+    let b = Blob.toArray(raw);
+    var position : Nat = 0;
+    var t : Nat = 0;
+    var i = 0;
+    while (i < 8) { position := position * 256 + Nat8.toNat(b[i]); t := t * 256 + Nat8.toNat(b[8 + i]); i += 1 };
+    {
+      index;
+      note_position = position;
+      time = Int.fromNat(t);
+      envelope = Blob.fromArray(Array.sliceToArray<Nat8>(b, 16, b.size()));
+    }
+  };
 
   /// Canonical recipient commitment used as the eighth Groth16 public input. Hashing includes
   /// the pool and token canisters, so a proof cannot be replayed into another pool or asset. The
@@ -1004,6 +1200,7 @@ persistent actor ZkLedger {
       pir2_boundary = pir2BoundaryLeaf();
       detect_stream = if (detect_chain_enabled) ?DetectChain.streamLeaf(detect_chain_state) else null;
       vk_anchor = vkAnchorLeaf();
+      vk_frozen = vk_frozen_anchor;
     }
   };
 
@@ -1059,6 +1256,10 @@ persistent actor ZkLedger {
     if (configured()) {
       if (transfer_vk_hex.size() == 0 or deposit_vk_hex.size() == 0) {
         return #err("stable-state:empty-vk");
+      };
+      switch (vk_frozen_anchor) {
+        case (?frozen) { if (?frozen != vkAnchorLeaf()) return #err("stable-state:vk-frozen-mismatch") };
+        case null {};
       };
       if (not fieldSized(note_root) or not StableBlobSet.contains(historical_roots, note_root)) {
         return #err("stable-state:current-root");
@@ -1160,7 +1361,8 @@ persistent actor ZkLedger {
             transfer.memo != ?pending.intent_id or not Principal.equal(transfer.to.owner, pending.caller)) {
           return #err("stable-state:pending-unshield-transfer");
         };
-        if (pending.pool_debit != transfer.amount + transparent_ledger_fee or pending.pool_debit > pool_value) {
+        if (pending.pool_debit != transfer.amount + transparent_ledger_fee or
+            pending.pool_debit + pending_unshield_protocol_fee > pool_value) {
           return #err("stable-state:pending-unshield-pool-debit");
         };
         switch (recipientBindingValue(transfer.to)) {
@@ -1168,7 +1370,10 @@ persistent actor ZkLedger {
           case (#err(_)) return #err("stable-state:pending-unshield-binding-invalid");
         };
       };
-      case null {};
+      case null {
+        // The protocol share lives exactly as long as its pending unshield.
+        if (pending_unshield_protocol_fee != 0) return #err("stable-state:orphan-unshield-protocol-fee");
+      };
     };
     #ok(())
   };
@@ -1185,6 +1390,10 @@ persistent actor ZkLedger {
     };
     switch (StableLog.validateHeader(note_log)) {
       case (#err(message)) return #err(message);
+      case (#ok(_)) {};
+    };
+    switch (StableLog.validateHeader(claim_log)) {
+      case (#err(message)) return #err("claims:" # message);
       case (#ok(_)) {};
     };
     switch (StableBlobSet.validateHeader(historical_roots)) {
@@ -1821,6 +2030,7 @@ persistent actor ZkLedger {
         pending_unshield := null;
         pending_unshield_prepared := null;
         if (pending_unshield_prepaid_debit > 0) { pending_unshield_prepaid_debit := 0 };
+        pending_unshield_protocol_fee := 0;
         refreshCertification();
         #ok({ payout_found = false; nullifiers_burned = 0; pool_debited = 0; change_notes_lost = 0 })
       };
@@ -1829,7 +2039,11 @@ persistent actor ZkLedger {
       case (#found(_)) {
         addNullifier(current.nullifier_1);
         addNullifier(current.nullifier_2);
-        pool_value -= current.pool_debit;
+        // The input notes are burned, so their protocol share is earned exactly as at finalize.
+        let protocolShare = pending_unshield_protocol_fee;
+        pool_value -= current.pool_debit + protocolShare;
+        protocol_fee_revenue += protocolShare;
+        pending_unshield_protocol_fee := 0;
         if (pending_unshield_prepaid_debit > 0) {
           prepaid_fee_revenue += pending_unshield_prepaid_debit;
           pending_unshield_prepaid_debit := 0;
@@ -1849,7 +2063,7 @@ persistent actor ZkLedger {
         #ok({
           payout_found = true;
           nullifiers_burned = 2;
-          pool_debited = current.pool_debit;
+          pool_debited = current.pool_debit + protocolShare;
           change_notes_lost = 2;
         })
       };
@@ -2823,6 +3037,17 @@ persistent actor ZkLedger {
     // A PIR fault can degrade queries, never this message.
   };
 
+  func shapeRejection(ephemeralKey : Blob, noteCiphertext : Blob) : ?Text {
+    switch (note_shape) {
+      case null null;
+      case (?shape) {
+        if (ephemeralKey.size() != shape.ephemeral_key_len) return ?"REJECT:ephemeral-key-shape";
+        if (noteCiphertext.size() != shape.note_ciphertext_len) return ?"REJECT:note-ciphertext-shape";
+        null
+      };
+    }
+  };
+
   func validateOutput(output : OutputRecord) : ?Text {
     if (not fieldSized(output.commitment)) return ?"REJECT:commitment-length";
     if (output.ephemeral_key.size() == 0) return ?"REJECT:ephemeral-key-empty";
@@ -2920,6 +3145,7 @@ persistent actor ZkLedger {
     switch (guardRejection()) { case (?message) return #err(message); case null {} };
     if (not isAdministrator(caller)) return #err("REJECT:not-administrator");
     if (not configured()) return #err("REJECT:unconfigured");
+    if (vk_frozen_anchor != null) return #err("REJECT:vk-frozen");
     if (pending_shield != null or pending_unshield != null) return #err("REJECT:pending-token-mutation");
     if (transfer_vk_hex != expectedOldTransferVkHex) return #err("REJECT:transfer-vk-precondition");
     if (deposit_vk_hex != expectedOldDepositVkHex) return #err("REJECT:deposit-vk-precondition");
@@ -2941,6 +3167,24 @@ persistent actor ZkLedger {
     deposit_vk_flat := ?Groth16Multi.prepareFlatVk(depositPrepared);
     transfer_statement_version := 2;
     #ok(statusValue())
+  };
+
+  /// Freeze the verifying keys, once and for good. Administrator only, on a configured pool.
+  /// `expectedAnchor` must equal the current 40-byte vk anchor (verifying_key_anchor's digest ‖
+  /// epoch, the certified `vk` leaf), so the administrator freezes exactly the keys they checked
+  /// against the ceremony hashes and not a pair swapped in meanwhile. Afterwards
+  /// rotate_verifying_keys_v2 refuses, the anchor is certified under "vk_frozen", and there is
+  /// no call that unfreezes.
+  public shared ({ caller }) func freeze_verifying_keys(expectedAnchor : Blob) : async Result<Blob> {
+    switch (guardRejection()) { case (?message) return #err(message); case null {} };
+    if (not isAdministrator(caller)) return #err("REJECT:not-administrator");
+    if (not configured()) return #err("REJECT:unconfigured");
+    if (vk_frozen_anchor != null) return #err("REJECT:vk-frozen");
+    let anchor = switch (vkAnchorLeaf()) { case (?value) value; case null return #err("REJECT:unconfigured") };
+    if (anchor != expectedAnchor) return #err("REJECT:vk-anchor-precondition");
+    vk_frozen_anchor := ?anchor;
+    refreshCertification();
+    #ok(anchor)
   };
 
   /// THE single switch for the in-canister Poseidon frontier. Admin-gated,
@@ -3007,9 +3251,12 @@ persistent actor ZkLedger {
     { enabled = tree_frontier_enabled; tree_oracle = tree_oracle_id }
   };
 
-  public shared ({ caller }) func configure_token_ledger(
+  /// Bind the pool to its token. `historyAdapterId` = null means the token is the NNS ICP ledger and
+  /// its own legacy log is the history (token_history_icp); otherwise an ICRC-3 log at that id.
+  func configureToken(
+    caller : Principal,
     tokenLedgerId : Principal,
-    historyAdapterId : Principal,
+    historyAdapterId : ?Principal,
     poolSubaccount : ?Blob,
   ) : async Result<AtomicityStatus> {
     switch (guardRejection()) { case (?message) return #err(message); case null {} };
@@ -3041,13 +3288,45 @@ persistent actor ZkLedger {
       token_configuring := false;
       return #err("REJECT:token-configuration-race");
     };
+    if (historyAdapterId == null) {
+      // the ICP ledger must answer query_blocks before the pool depends on it
+      let probe : IcpBlock.IcpLedger = actor (Principal.toText(tokenLedgerId));
+      try {
+        ignore await probe.query_blocks({ start = 0; length = 0 });
+      } catch (error) {
+        token_configuring := false;
+        return #err("REJECT:icp-query-blocks:" # Error.message(error));
+      };
+      if (tokenConfigured() or noteCount() != 0 or pool_value != 0 or pending_shield != null or pending_unshield != null) {
+        token_configuring := false;
+        return #err("REJECT:token-configuration-race");
+      };
+    };
     token_ledger_id := ?tokenLedgerId;
-    history_adapter_id := ?historyAdapterId;
+    history_adapter_id := historyAdapterId;
+    token_history_icp := historyAdapterId == null;
     transparent_ledger_fee := metadata.0;
     transparent_ledger_decimals := metadata.1;
     pool_subaccount := poolSubaccount;
     token_configuring := false;
     #ok(atomicityStatusValue())
+  };
+
+  public shared ({ caller }) func configure_token_ledger(
+    tokenLedgerId : Principal,
+    historyAdapterId : Principal,
+    poolSubaccount : ?Blob,
+  ) : async Result<AtomicityStatus> {
+    await configureToken(caller, tokenLedgerId, ?historyAdapterId, poolSubaccount)
+  };
+
+  /// Bind the pool to the NNS ICP ledger, whose own `query_blocks` log is read directly (IcpBlock):
+  /// no history adapter.
+  public shared ({ caller }) func configure_icp_token_ledger(
+    icpLedgerId : Principal,
+    poolSubaccount : ?Blob,
+  ) : async Result<AtomicityStatus> {
+    await configureToken(caller, icpLedgerId, null, poolSubaccount)
   };
 
   func statusValue() : LedgerStatus {
@@ -3165,6 +3444,7 @@ persistent actor ZkLedger {
       token_configured = tokenConfigured();
       token_ledger = token_ledger_id;
       history_adapter = history_adapter_id;
+      icp_history = token_history_icp;
       transparent_ledger_fee;
       transparent_ledger_decimals;
       pool_account = poolAccount();
@@ -3318,6 +3598,7 @@ persistent actor ZkLedger {
     digest : Blob;
     epoch : Nat64;
     certified : Bool;
+    frozen : Bool;
   } {
     {
       transfer_vk_hex;
@@ -3326,6 +3607,8 @@ persistent actor ZkLedger {
       epoch = vk_epoch;
       // false only while unconfigured, i.e. exactly when the certified tree carries no vk leaf
       certified = vkAnchorLeaf() != null;
+      // true once freeze_verifying_keys ran; certified as the "vk_frozen" leaf
+      frozen = vk_frozen_anchor != null;
     }
   };
 
@@ -3719,8 +4002,8 @@ persistent actor ZkLedger {
     }
   };
 
-  /// Scan the token log from `tip` for a block satisfying `matches`.
-  func reconcileTokenBlock(tip : Nat, matches : ICRC3.Value -> Bool) : async ReconcileResult {
+  /// Scan the ICRC-3 token log from `tip` for a block satisfying `matches`.
+  func reconcileIcrc3Block(tip : Nat, matches : ICRC3.Value -> Bool) : async ReconcileResult {
     let history = historyActor();
     var index = tip;
     var pages : Nat = 0;
@@ -3757,7 +4040,7 @@ persistent actor ZkLedger {
   /// moment ago can already have been archived by the time it is read back, and an archived index
   /// answers with an empty inline reply. It latches the intent rather than cancelling it, so it
   /// costs liveness rather than funds — but it is reachable, and it is the same root cause.
-  func fetchTokenBlock(id : Nat) : async { #found : ICRC3.Value; #absent; #error : Text } {
+  func fetchIcrc3Block(id : Nat) : async { #found : ICRC3.Value; #absent; #error : Text } {
     let history = historyActor();
     let page = try {
       await history.icrc3_get_blocks([{ start = id; length = 1 }])
@@ -3780,12 +4063,185 @@ persistent actor ZkLedger {
     }
   };
 
+  // ---- the NNS ICP ledger's own log (token_history_icp) ----
+  //
+  // Same contract as the ICRC-3 path above: #found only on a matching block, #absent only once the
+  // end of the log has been reached with every index behind it observed, #error for anything else
+  // (which leaves the intent pending for another attempt). ICP archive replies are flat block lists
+  // (no further deferral), so a span is the ledger's inline blocks plus at most one call per
+  // archived range.
+
+  /// Observe [start, start+length) from a `query_blocks` reply already in hand.
+  func icpScanSpan(
+    first : IcpBlock.QueryBlocksResponse,
+    start : Nat,
+    length : Nat,
+    matches : IcpBlock.Block -> Bool,
+  ) : async SpanOutcome {
+    if (length == 0 or length > 64) return #error("icp-log-scan:span-width");
+    var mask : Nat64 = 0;
+    let inlineFirst = Nat64.toNat(first.first_block_index);
+    var k : Nat = 0;
+    for (block in first.blocks.vals()) {
+      let id = inlineFirst + k;
+      k += 1;
+      if (id < start or id >= start + length) return #error("icp-log-scan:block-id-outside-span");
+      if (matches(block)) return #found(id);
+      mask := mask | (1 << Nat64.fromNat(id - start));
+    };
+    if (first.archived_blocks.size() > SCAN_VISIT_LIMIT) return #error("icp-log-scan:archive-visit-limit");
+    for (range in first.archived_blocks.vals()) {
+      let rangeStart = Nat64.toNat(range.start);
+      let rangeLength = Nat64.toNat(range.length);
+      if (rangeLength == 0) return #error("icp-log-scan:archive-empty-range");
+      if (rangeStart < start or rangeStart + rangeLength > start + length) {
+        return #error("icp-log-scan:archive-range-outside-span");
+      };
+      let reply = try {
+        await range.callback({ start = range.start; length = range.length })
+      } catch (error) {
+        return #error("icp-log-scan:archive-call:" # Error.message(error));
+      };
+      let blocks = switch (reply) {
+        case (#Ok(value)) value.blocks;
+        case (#Err(_)) return #error("icp-log-scan:archive-reply-error");
+      };
+      if (blocks.size() > rangeLength) return #error("icp-log-scan:archive-overlong-reply");
+      var j : Nat = 0;
+      for (block in blocks.vals()) {
+        let id = rangeStart + j;
+        j += 1;
+        if (matches(block)) return #found(id);
+        mask := mask | (1 << Nat64.fromNat(id - start));
+      };
+    };
+    #observed(observedPrefix(mask, length))
+  };
+
+  /// Scan the ICP log for `intent` from max(`tip`, the intent's saved cursor).
+  func reconcileIcpBlock(tip : Nat, intent : Blob, matches : IcpBlock.Block -> Bool) : async ReconcileResult {
+    let ledger = icpActor();
+    var index = switch (Map.get(icp_scan_cursor, Blob.compare, intent)) {
+      case (?saved) if (saved > tip) saved else tip;
+      case null tip;
+    };
+    var pages : Nat = 0;
+    loop {
+      if (pages >= SCAN_PAGE_LIMIT) return #error("icp-log-scan:page-limit-at-" # Nat.toText(index));
+      pages += 1;
+      let page = try {
+        await ledger.query_blocks({ start = Nat64.fromNat(index); length = Nat64.fromNat(SCAN_PAGE) })
+      } catch (error) {
+        return #error("icp-log-scan:" # Error.message(error));
+      };
+      let chainLength = Nat64.toNat(page.chain_length);
+      if (index >= chainLength) return #absent;
+      let want = if (index + SCAN_PAGE > chainLength) chainLength - index else SCAN_PAGE;
+      switch (await icpScanSpan(page, index, want, matches)) {
+        case (#found(id)) return #found(id);
+        case (#error(message)) return #error(message);
+        case (#observed(covered)) {
+          if (covered == 0) return #error("icp-log-scan:no-progress-at-" # Nat.toText(index));
+          index += covered;
+          Map.add(icp_scan_cursor, Blob.compare, intent, index);
+        };
+      };
+    }
+  };
+
+  /// Read exactly the ICP block at `id`, from the ledger or from the archive that holds it.
+  func fetchIcpBlock(id : Nat) : async { #found : IcpBlock.Block; #absent; #error : Text } {
+    let page = try {
+      await icpActor().query_blocks({ start = Nat64.fromNat(id); length = 1 })
+    } catch (error) {
+      return #error("icp-log-fetch:" # Error.message(error));
+    };
+    if (id >= Nat64.toNat(page.chain_length)) return #absent;
+    var captured : ?IcpBlock.Block = null;
+    switch (await icpScanSpan(page, id, 1, func(block : IcpBlock.Block) : Bool { captured := ?block; true })) {
+      case (#found(_)) {
+        switch (captured) {
+          case (?value) #found(value);
+          case null #error("icp-log-fetch:capture");
+        };
+      };
+      case (#observed(_)) #error("icp-log-fetch:not-observed-at-" # Nat.toText(id));
+      case (#error(message)) #error(message);
+    }
+  };
+
+  // ---- one token history, whichever log serves it ----
+
+  type TokenBlock = { #icrc3 : ICRC3.Value; #icp : IcpBlock.Block };
+
+  /// The token log's length now: the low-water mark a recovery scan starts from.
+  func tokenLogLength() : async Nat {
+    if (token_history_icp) {
+      Nat64.toNat((await icpActor().query_blocks({ start = 0; length = 0 })).chain_length)
+    } else {
+      (await historyActor().icrc3_get_blocks([{ start = 0; length = 0 }])).log_length
+    }
+  };
+
+  func fetchTokenBlock(id : Nat) : async { #found : TokenBlock; #absent; #error : Text } {
+    if (token_history_icp) {
+      switch (await fetchIcpBlock(id)) {
+        case (#found(block)) #found(#icp(block));
+        case (#absent) #absent;
+        case (#error(message)) #error(message);
+      }
+    } else {
+      switch (await fetchIcrc3Block(id)) {
+        case (#found(value)) #found(#icrc3(value));
+        case (#absent) #absent;
+        case (#error(message)) #error(message);
+      }
+    }
+  };
+
+  /// Scan the token log for `intent`'s block from `tip`.
+  func reconcileTokenBlock(tip : Nat, intent : Blob, matches : TokenBlock -> Bool) : async ReconcileResult {
+    if (token_history_icp) {
+      await reconcileIcpBlock(tip, intent, func(block : IcpBlock.Block) : Bool { matches(#icp(block)) })
+    } else {
+      await reconcileIcrc3Block(tip, func(value : ICRC3.Value) : Bool { matches(#icrc3(value)) })
+    }
+  };
+
+  func tokenMatchesTransferFrom(block : TokenBlock, args : ICRC2.TransferFromArgs) : Bool {
+    switch (block) {
+      case (#icrc3(value)) ICRC2Block.matchesTransferFrom(value, args, selfPrincipal());
+      case (#icp(value)) IcpBlock.matchesTransferFrom(value, args, selfPrincipal());
+    }
+  };
+
+  func tokenMatchesTransfer(block : TokenBlock, args : ICRC2.TransferArg) : Bool {
+    switch (block) {
+      case (#icrc3(value)) ICRC1Block.matchesTransfer(value, args, selfPrincipal());
+      case (#icp(value)) IcpBlock.matchesTransfer(value, args, selfPrincipal());
+    }
+  };
+
+  /// On the ICP log, a recovery inside the ICP ledger's deduplication window resends the identical
+  /// call instead of scanning first: the ledger answers `Duplicate { duplicate_of }` if it already
+  /// executed it (no second charge) and executes it once if it did not. The window is 24 h; one hour
+  /// of margin keeps the resend well clear of its edge (and of the ledger's permitted clock drift).
+  func icpResendIsDeduplicated(createdAt : ?Nat64) : Bool {
+    if (not token_history_icp) return false;
+    switch (createdAt) {
+      case (?value) {
+        let age = Time.now() - Nat64.toNat(value);
+        age >= 0 and age < 23 * 3_600_000_000_000
+      };
+      case null false;
+    }
+  };
+
   func reconcileShieldBlock(pending : PendingShield) : async ReconcileResult {
     await reconcileTokenBlock(
       pending.ledger_tip_before,
-      func(block : ICRC3.Value) : Bool {
-        ICRC2Block.matchesTransferFrom(block, pending.transfer_args, selfPrincipal())
-      },
+      pending.intent_id,
+      func(block : TokenBlock) : Bool { tokenMatchesTransferFrom(block, pending.transfer_args) },
     )
   };
 
@@ -3796,7 +4252,9 @@ persistent actor ZkLedger {
     };
     // Recovery path: if the token block already landed under this intent's memo, finalize against it
     // directly — never re-call transfer_from (which would hit #TooOld or double-charge post-window).
-    if (reconcileFirst) {
+    // ICP log: inside the deduplication window the resend below is the recovery (Duplicate names
+    // the block), so the scan is skipped; outside it the scan settles the intent.
+    if (reconcileFirst and not icpResendIsDeduplicated(pending.transfer_args.created_at_time)) {
       switch (await reconcileShieldBlock(pending)) {
         case (#found(_)) {
           switch (pendingById(intentId)) {
@@ -3817,6 +4275,10 @@ persistent actor ZkLedger {
         case (#error(msg)) return mutation("PENDING:reconcile-scan:" # msg, pending.verifier_outcome);
         case (#absent) {}; // transfer never landed — safe to (re)send below
       };
+    };
+    if (test_reject_token_call_once) {
+      test_reject_token_call_once := false;
+      return mutation("PENDING:token-call:TEST_ONLY:rejected", "CALL_FAILED");
     };
     let response = try {
       await tokenActor().icrc2_transfer_from(pending.transfer_args)
@@ -3887,7 +4349,7 @@ persistent actor ZkLedger {
     // The id is no longer re-checked here: scanSpan rejects any block carrying an id outside the
     // requested span, so what fetchTokenBlock returns is the block at blockIndex or nothing.
     if (epoch != current.base_epoch or
-        not ICRC2Block.matchesTransferFrom(observed, current.transfer_args, selfPrincipal())) {
+        not tokenMatchesTransferFrom(observed, current.transfer_args)) {
       return mutation("PENDING:token-block-mismatch", current.verifier_outcome);
     };
     finalizeShield(intentId)
@@ -3929,6 +4391,10 @@ persistent actor ZkLedger {
     if (args.ephemeral_key.size() == 0 or args.note_ciphertext.size() == 0) {
       return mutation("REJECT:opaque-record-empty", "NOT_CALLED");
     };
+    switch (shapeRejection(args.ephemeral_key, args.note_ciphertext)) {
+      case (?e) return mutation(e, "NOT_CALLED");
+      case null {};
+    };
     let intentId = shieldIntentId(caller, args);
     if (StableBlobSet.contains(completed_shield_intents, intentId)) {
       return mutation("ACCEPT:already-finalized", "ACCEPT");
@@ -3947,8 +4413,12 @@ persistent actor ZkLedger {
     // In-process verify: no await, so no state can change between the guards above and the
     // verdict — the old post-verify state-change re-check is structurally impossible to fail
     // and is gone with the call boundary.
+    switch (forgedCooldownRejection()) { case (?e) return mutation(e, "NOT_CALLED"); case null {} };
     let verdict = verifyShieldProof(args.proof_hex, inputs);
-    if (verdict != "ACCEPT") return mutation(verdict, verdict);
+    if (verdict != "ACCEPT") {
+      recordFailedVerification(verdict);
+      return mutation(verdict, verdict);
+    };
 
     let treeBefore = currentTree();
     // COMMITMENT INGRESS — the third stored value. Leaves never pass through
@@ -4016,7 +4486,7 @@ persistent actor ZkLedger {
     // Low-water for dedup-window-independent recovery: the token ledger's block count BEFORE the
     // transfer. Any block minted by this shield lands at an index >= this, bounding the recovery scan.
     let ledgerTip = try {
-      (await historyActor().icrc3_get_blocks([{ start = 0; length = 0 }])).log_length
+      await tokenLogLength()
     } catch (error) {
       return mutation("REJECT:ledger-tip-call:" # Error.message(error), verdict);
     };
@@ -4133,7 +4603,7 @@ persistent actor ZkLedger {
         StableBlobSet.contains(spent_nullifiers, pending.nullifier_2)) {
       return #err("REJECT:prepare-nullifier-spent");
     };
-    if (pending.pool_debit > pool_value) return #err("REJECT:prepare-pool-debit");
+    if (pending.pool_debit + pending_unshield_protocol_fee > pool_value) return #err("REJECT:prepare-pool-debit");
 
     // ---- the encodings, so NoteCodec.encode cannot trap inside the commit ----
     // Both blocks are built here because block 2's phash is block 1's hash: neither can be derived
@@ -4198,7 +4668,7 @@ persistent actor ZkLedger {
       case null return mutation("REJECT:pending-unshield-changed", "NOT_CALLED");
     };
     if (epoch != pending.base_epoch or note_root != pending.anchor_before or
-        pending.pool_debit > pool_value) {
+        pending.pool_debit + pending_unshield_protocol_fee > pool_value) {
       return mutation("REJECT:pending-unshield-epoch", pending.verifier_outcome);
     };
 
@@ -4258,7 +4728,11 @@ persistent actor ZkLedger {
     addRoot(pending.root_after);
     commitNoteBytes(prepared.encoded_1, prepared.position_1, prepared.hash_1, pending.output_1.note_ciphertext);
     commitNoteBytes(prepared.encoded_2, prepared.position_1 + 1, prepared.hash_2, pending.output_2.note_ciphertext);
-    pool_value -= pending.pool_debit;
+    // The protocol share left the notes with the proof and is earned now, in the same commit as
+    // the payout: pool_value drops by the payout, the token fee and the share; revenue gains the share.
+    pool_value -= pending.pool_debit + pending_unshield_protocol_fee;
+    protocol_fee_revenue += pending_unshield_protocol_fee;
+    pending_unshield_protocol_fee := 0;
     // The prepaid fee reserved at acceptance is earned now, atomically with the payout commit.
     if (pending_unshield_prepaid_debit > 0) {
       prepaid_fee_revenue += pending_unshield_prepaid_debit;
@@ -4282,9 +4756,8 @@ persistent actor ZkLedger {
   func reconcileUnshieldBlock(pending : PendingUnshield) : async ReconcileResult {
     await reconcileTokenBlock(
       pending.ledger_tip_before,
-      func(block : ICRC3.Value) : Bool {
-        ICRC1Block.matchesTransfer(block, pending.transfer_args, selfPrincipal())
-      },
+      pending.intent_id,
+      func(block : TokenBlock) : Bool { tokenMatchesTransfer(block, pending.transfer_args) },
     )
   };
 
@@ -4301,7 +4774,8 @@ persistent actor ZkLedger {
       case (#ok(_)) {};
     };
 
-    if (reconcileFirst) {
+    // ICP log: inside the deduplication window the resend below is the recovery (see shield).
+    if (reconcileFirst and not icpResendIsDeduplicated(pending.transfer_args.created_at_time)) {
       switch (await reconcileUnshieldBlock(pending)) {
         case (#found(_)) {
           switch (pendingUnshieldById(intentId)) {
@@ -4339,6 +4813,8 @@ persistent actor ZkLedger {
             creditPrepaid(pending.caller, pending_unshield_prepaid_debit);
             pending_unshield_prepaid_debit := 0;
           };
+          // Nothing was burned, so nothing was earned: the notes keep their full value.
+          pending_unshield_protocol_fee := 0;
           pending_unshield := null;
           pending_unshield_prepared := null;
           return mutation("REJECT:unshield-token:" # directTokenErrorName(error), pending.verifier_outcome);
@@ -4372,6 +4848,7 @@ persistent actor ZkLedger {
                 creditPrepaid(pending.caller, pending_unshield_prepaid_debit);
                 pending_unshield_prepaid_debit := 0;
               };
+              pending_unshield_protocol_fee := 0;
               pending_unshield := null;
               pending_unshield_prepared := null;
               return mutation("REJECT:unshield-token:" # directTokenErrorName(error), pending.verifier_outcome);
@@ -4398,7 +4875,7 @@ persistent actor ZkLedger {
       };
     };
     if (epoch != current.base_epoch or
-        not ICRC1Block.matchesTransfer(observed, current.transfer_args, selfPrincipal())) {
+        not tokenMatchesTransfer(observed, current.transfer_args)) {
       return mutation("PENDING:unshield-token-block-mismatch", current.verifier_outcome);
     };
     finalizeUnshield(intentId)
@@ -4518,7 +4995,7 @@ persistent actor ZkLedger {
 
   func prepaidWithdrawIntentId(
     caller : Principal,
-    source : { #balance; #revenue },
+    source : { #balance; #revenue; #sweep; #treasury },
     to : ICRC2.Account,
     amount : Nat64,
     createdAt : Nat64,
@@ -4526,7 +5003,12 @@ persistent actor ZkLedger {
     let entries = List.empty<(Text, ICRC3.Value)>();
     List.add(entries, ("domain", #Text("zk-ledger/prepaid-fee-withdraw/v1")));
     List.add(entries, ("caller", #Blob(Principal.toBlob(caller))));
-    List.add(entries, ("source", #Text(switch (source) { case (#balance) "balance"; case (#revenue) "revenue" })));
+    List.add(entries, ("source", #Text(switch (source) {
+      case (#balance) "balance";
+      case (#revenue) "revenue";
+      case (#sweep) "sweep";
+      case (#treasury) "treasury";
+    })));
     List.add(entries, ("to_owner", #Blob(Principal.toBlob(to.owner))));
     switch (to.subaccount) {
       case (?value) List.add(entries, ("to_subaccount", #Blob(value)));
@@ -4579,10 +5061,11 @@ persistent actor ZkLedger {
   func reconcilePrepaidBlock(pending : PendingPrepaid) : async ReconcileResult {
     await reconcileTokenBlock(
       pending.ledger_tip_before,
-      func(block : ICRC3.Value) : Bool {
+      pending.intent_id,
+      func(block : TokenBlock) : Bool {
         switch (pending.op) {
-          case (#deposit(op)) ICRC2Block.matchesTransferFrom(block, op.transfer_args, selfPrincipal());
-          case (#withdraw(op)) ICRC1Block.matchesTransfer(block, op.transfer_args, selfPrincipal());
+          case (#deposit(op)) tokenMatchesTransferFrom(block, op.transfer_args);
+          case (#withdraw(op)) tokenMatchesTransfer(block, op.transfer_args);
         }
       },
     )
@@ -4597,6 +5080,7 @@ persistent actor ZkLedger {
         switch (op.source) {
           case (#balance) prepaidFeeBalance(pending.caller);
           case (#revenue) prepaid_fee_revenue;
+          case (#sweep or #treasury) protocol_treasury_balance;
         }
       };
     }
@@ -4611,6 +5095,8 @@ persistent actor ZkLedger {
         switch (op.source) {
           case (#balance) creditPrepaid(pending.caller, op.reserved);
           case (#revenue) prepaid_fee_revenue += op.reserved;
+          case (#sweep) protocol_fee_revenue += op.reserved;
+          case (#treasury) protocol_treasury_balance += op.reserved;
         }
       };
     }
@@ -4622,7 +5108,14 @@ persistent actor ZkLedger {
   func finalizePrepaid(pending : PendingPrepaid) : Result<Nat> {
     switch (pending.op) {
       case (#deposit(op)) creditPrepaid(pending.caller, Nat64.toNat(op.value));
-      case (#withdraw(_)) {}; // the reservation was debited when the intent was created
+      case (#withdraw(op)) {
+        // the reservation was debited when the intent was created; a sweep's amount has now
+        // landed in the treasury subaccount (its token fee is burned by the token ledger)
+        switch (op.source) {
+          case (#sweep) protocol_treasury_balance += op.transfer_args.amount;
+          case (_) {};
+        };
+      };
     };
     Map.add(completed_prepaid_intents, Blob.compare, pending.intent_id, ());
     pending_prepaid := null;
@@ -4634,7 +5127,12 @@ persistent actor ZkLedger {
       case (?value) value;
       case null return #err("REJECT:pending-prepaid-changed");
     };
-    if (reconcileFirst) {
+    // ICP log: inside the deduplication window the resend below is the recovery (see shield).
+    let prepaidCreatedAt = switch (pending.op) {
+      case (#deposit(op)) op.transfer_args.created_at_time;
+      case (#withdraw(op)) op.transfer_args.created_at_time;
+    };
+    if (reconcileFirst and not icpResendIsDeduplicated(prepaidCreatedAt)) {
       switch (await reconcilePrepaidBlock(pending)) {
         case (#found(_)) {
           switch (pendingPrepaidById(intentId)) {
@@ -4756,8 +5254,8 @@ persistent actor ZkLedger {
       };
     };
     let matches = switch (final.op) {
-      case (#deposit(op)) ICRC2Block.matchesTransferFrom(observed, op.transfer_args, selfPrincipal());
-      case (#withdraw(op)) ICRC1Block.matchesTransfer(observed, op.transfer_args, selfPrincipal());
+      case (#deposit(op)) tokenMatchesTransferFrom(observed, op.transfer_args);
+      case (#withdraw(op)) tokenMatchesTransfer(observed, op.transfer_args);
     };
     if (not matches) return #err("PENDING:prepaid-token-block-mismatch");
     finalizePrepaid(final)
@@ -4790,7 +5288,7 @@ persistent actor ZkLedger {
     };
     // Reconcile low-water BEFORE the transfer, exactly as the shield leg records it.
     let ledgerTip = try {
-      (await historyActor().icrc3_get_blocks([{ start = 0; length = 0 }])).log_length
+      await tokenLogLength()
     } catch (error) {
       return #err("REJECT:prepaid-ledger-tip-call:" # Error.message(error));
     };
@@ -4838,7 +5336,7 @@ persistent actor ZkLedger {
 
   func prepaidPayout(
     caller : Principal,
-    source : { #balance; #revenue },
+    source : { #balance; #revenue; #sweep; #treasury },
     to : ICRC2.Account,
     amount : Nat64,
     createdAt : Nat64,
@@ -4846,11 +5344,21 @@ persistent actor ZkLedger {
     let reserved = Nat64.toNat(amount) + transparent_ledger_fee;
     let intentId = prepaidWithdrawIntentId(caller, source, to, amount, createdAt);
     let answer = func() : Nat {
-      switch (source) { case (#balance) prepaidFeeBalance(caller); case (#revenue) prepaid_fee_revenue }
+      switch (source) {
+        case (#balance) prepaidFeeBalance(caller);
+        case (#revenue) prepaid_fee_revenue;
+        case (#sweep or #treasury) protocol_treasury_balance;
+      }
     };
     if (prepaidCompleted(intentId)) return #ok(answer());
     let transferArgs : ICRC2.TransferArg = {
-      from_subaccount = ?prepaid_fee_subaccount;
+      // Unswept protocol revenue is held in the POOL account (it never left it); swept revenue in
+      // the treasury subaccount; prepaid custody in its own.
+      from_subaccount = switch (source) {
+        case (#sweep) pool_subaccount;
+        case (#treasury) ?protocol_treasury_subaccount;
+        case (_) ?prepaid_fee_subaccount;
+      };
       to;
       amount = Nat64.toNat(amount);
       fee = ?transparent_ledger_fee;
@@ -4858,7 +5366,7 @@ persistent actor ZkLedger {
       created_at_time = ?createdAt;
     };
     let ledgerTip = try {
-      (await historyActor().icrc3_get_blocks([{ start = 0; length = 0 }])).log_length
+      await tokenLogLength()
     } catch (error) {
       return #err("REJECT:prepaid-ledger-tip-call:" # Error.message(error));
     };
@@ -4873,6 +5381,14 @@ persistent actor ZkLedger {
       case (#revenue) {
         if (prepaid_fee_revenue < reserved) return #err("REJECT:prepaid-fee-insufficient");
         prepaid_fee_revenue -= reserved;
+      };
+      case (#sweep) {
+        if (protocol_fee_revenue < reserved) return #err("REJECT:protocol-fee-insufficient");
+        protocol_fee_revenue -= reserved;
+      };
+      case (#treasury) {
+        if (protocol_treasury_balance < reserved) return #err("REJECT:protocol-treasury-insufficient");
+        protocol_treasury_balance -= reserved;
       };
     };
     pending_prepaid := ?{
@@ -4908,6 +5424,233 @@ persistent actor ZkLedger {
     await drivePendingPrepaid(pending.intent_id, trapAfterToken, true)
   };
 
+  // ==================== protocol fee ====================
+  // See the state-level comment at protocol_send_fee for the accounting and why the fee is flat
+  // on private transfers.
+
+  /// The protocol share of an unshield of `vPubOut` under `bps`, rounded UP so no positive
+  /// share rounds away. Zero when `bps` is zero.
+  func unshieldProtocolShare(vPubOut : Nat, bps : Nat) : Nat {
+    (vPubOut * bps + BPS_DENOMINATOR - 1) / BPS_DENOMINATOR
+  };
+
+  /// The exact public `fee` a transfer must carry under a schedule: the flat send fee for a
+  /// private transfer (`vPubOut == 0`); the token ledger's fee plus the protocol share otherwise.
+  func requiredTransferFee(vPubOut : Nat, sendFee : Nat, bps : Nat) : Nat {
+    if (vPubOut == 0) sendFee else transparent_ledger_fee + unshieldProtocolShare(vPubOut, bps)
+  };
+
+  func protocolFeeStatusValue() : ProtocolFeeStatus {
+    {
+      send_fee = protocol_send_fee;
+      unshield_bps = protocol_unshield_bps;
+      recipient = protocol_fee_recipient;
+      revenue = protocol_fee_revenue;
+      transparent_ledger_fee;
+      pool_custody_at_rest = pool_value + protocol_fee_revenue;
+      treasury = protocol_treasury_balance;
+      treasury_account = protocolTreasuryAccount();
+    }
+  };
+
+  public query func protocol_fee_status() : async ProtocolFeeStatus { protocolFeeStatusValue() };
+
+  /// The exact `fee` a wallet must prove for a transfer paying `v_pub_out` publicly (0 for a
+  /// private transfer) under the CURRENT schedule. A wallet reads this before proving.
+  public query func required_transfer_fee(v_pub_out : Nat64) : async Nat {
+    requiredTransferFee(Nat64.toNat(v_pub_out), protocol_send_fee, protocol_unshield_bps)
+  };
+
+  /// Set the protocol fee schedule. Administrator only. A transfer already proven against the
+  /// old schedule is rejected with REJECT:transfer-fee-mismatch and must be re-proven; an
+  /// unshield already pending keeps the share it was accepted with.
+  public shared ({ caller }) func set_protocol_fee(config : ProtocolFeeConfig) : async Result<ProtocolFeeStatus> {
+    switch (guardRejection()) { case (?message) return #err(message); case null {} };
+    if (not isAdministrator(caller)) return #err("REJECT:not-administrator");
+    let sendFee = Nat64.toNat(config.send_fee);
+    if (sendFee > PROTOCOL_SEND_FEE_MAX) return #err("REJECT:protocol-send-fee-cap");
+    if (config.unshield_bps > PROTOCOL_UNSHIELD_BPS_MAX) return #err("REJECT:protocol-unshield-bps-cap");
+    switch (config.recipient) {
+      case (?account) {
+        switch (account.subaccount) {
+          case (?value) { if (value.size() != 32) return #err("REJECT:recipient-subaccount-length") };
+          case null {};
+        };
+        // Every account this canister owns already holds pool or treasury money. A payout into
+        // one of them would land outside pool_value and the treasury balance, and stay there.
+        // To keep the fees in the ledger, leave the recipient unset: they stay in the treasury.
+        if (account.owner == selfPrincipal()) return #err("REJECT:recipient-is-ledger");
+      };
+      case null {};
+    };
+    protocol_send_fee := sendFee;
+    protocol_unshield_bps := config.unshield_bps;
+    protocol_fee_recipient := config.recipient;
+    #ok(protocolFeeStatusValue())
+  };
+
+  // Domain-separated treasury subaccount: protocol money never shares an account with user funds.
+  transient let protocol_treasury_subaccount : Blob =
+    Sha256.fromBlob(#sha256, Text.encodeUtf8("zk-ledger/protocol-treasury/v1"));
+
+  func protocolTreasuryAccount() : ICRC2.Account {
+    { owner = selfPrincipal(); subaccount = ?protocol_treasury_subaccount }
+  };
+
+  /// Move `amount` of protocol revenue from the pool account into the ledger's own treasury
+  /// subaccount. Administrator only. `amount + token fee` is reserved from revenue up front and the
+  /// treasury is credited when the token block is observed; the move rides the crash-safe intent
+  /// rail (memo = intent id, block-verified, resumable through resume_prepaid). Sweep in batches:
+  /// each sweep is one public token transfer that shows only a total.
+  public shared ({ caller }) func protocol_fee_sweep(amount : Nat64, createdAt : Nat64) : async Result<Nat> {
+    switch (guardRejection()) { case (?message) return #err(message); case null {} };
+    if (not isAdministrator(caller)) return #err("REJECT:not-administrator");
+    if (not tokenConfigured()) return #err("REJECT:token-unconfigured");
+    if (pending_prepaid != null) return #err("REJECT:pending-prepaid-mutation");
+    if (amount == 0) return #err("REJECT:protocol-zero-value");
+    await prepaidPayout(caller, #sweep, protocolTreasuryAccount(), amount, createdAt)
+  };
+
+  /// Pay `amount` out of the treasury to the recipient fixed by set_protocol_fee. Administrator
+  /// only; same rail and reservation discipline as the sweep.
+  public shared ({ caller }) func protocol_treasury_withdraw(amount : Nat64, createdAt : Nat64) : async Result<Nat> {
+    switch (guardRejection()) { case (?message) return #err(message); case null {} };
+    if (not isAdministrator(caller)) return #err("REJECT:not-administrator");
+    if (not tokenConfigured()) return #err("REJECT:token-unconfigured");
+    if (pending_prepaid != null) return #err("REJECT:pending-prepaid-mutation");
+    if (amount == 0) return #err("REJECT:protocol-zero-value");
+    let to = switch (protocol_fee_recipient) {
+      case (?account) account;
+      case null return #err("REJECT:protocol-fee-recipient-unset");
+    };
+    await prepaidPayout(caller, #treasury, to, amount, createdAt)
+  };
+
+  // ==================== forged-proof cool-down ====================
+  // See the state-level comment at forged_guard.
+
+  func forgedCoolingDown() : Bool {
+    forged_guard.threshold > 0 and Time.now() < forged_cooldown_until
+  };
+
+  /// Refuse before the verifier while a cool-down runs.
+  func forgedCooldownRejection() : ?Text {
+    if (forgedCoolingDown()) ?"REJECT:forged-proof-cooldown" else null
+  };
+
+  /// Count a failed verification (any verdict but ACCEPT, except an unconfigured verifier, which
+  /// is no one's forgery) and start a cool-down when the window reaches the threshold. Runs in the
+  /// same message segment as the verify and the rejection, so the count commits with the answer.
+  func recordFailedVerification(verdict : Text) {
+    if (verdict == "ACCEPT" or verdict == "REJECT:unconfigured") return;
+    forged_failures_total += 1;
+    if (forged_guard.threshold == 0) return;
+    let now = Time.now();
+    if (now - forged_window_start >= forged_guard.window_seconds * 1_000_000_000) {
+      forged_window_start := now;
+      forged_in_window := 0;
+    };
+    forged_in_window += 1;
+    if (forged_in_window >= forged_guard.threshold) {
+      forged_cooldown_until := now + forged_guard.cooldown_seconds * 1_000_000_000;
+      forged_trips += 1;
+      forged_window_start := now;
+      forged_in_window := 0;
+    };
+  };
+
+  func forgedGuardStatusValue() : ForgedProofGuardStatus {
+    {
+      config = forged_guard;
+      cooling_down = forgedCoolingDown();
+      cooldown_until = forged_cooldown_until;
+      failures_in_window = forged_in_window;
+      window_started_at = forged_window_start;
+      trips = forged_trips;
+      failures_total = forged_failures_total;
+    }
+  };
+
+  public query func forged_proof_guard_status() : async ForgedProofGuardStatus { forgedGuardStatusValue() };
+
+  /// Set the cool-down. Administrator only. threshold 0 turns it off (and ends a running cool-down);
+  /// otherwise 1..100_000 failures, window and cool-down 60..86_400 seconds. The current window's
+  /// count restarts so a new threshold applies to failures from now on.
+  public shared ({ caller }) func set_forged_proof_guard(config : ForgedProofGuardConfig) : async Result<ForgedProofGuardStatus> {
+    switch (guardRejection()) { case (?message) return #err(message); case null {} };
+    if (not isAdministrator(caller)) return #err("REJECT:not-administrator");
+    if (config.threshold > FORGED_THRESHOLD_MAX) return #err("REJECT:forged-guard-threshold");
+    if (config.window_seconds < FORGED_SECONDS_MIN or config.window_seconds > FORGED_SECONDS_MAX) {
+      return #err("REJECT:forged-guard-window");
+    };
+    if (config.cooldown_seconds < FORGED_SECONDS_MIN or config.cooldown_seconds > FORGED_SECONDS_MAX) {
+      return #err("REJECT:forged-guard-cooldown");
+    };
+    forged_guard := config;
+    forged_window_start := Time.now();
+    forged_in_window := 0;
+    #ok(forgedGuardStatusValue())
+  };
+
+  /// End a running cool-down now. Administrator only.
+  public shared ({ caller }) func clear_forged_proof_cooldown() : async Result<ForgedProofGuardStatus> {
+    switch (guardRejection()) { case (?message) return #err(message); case null {} };
+    if (not isAdministrator(caller)) return #err("REJECT:not-administrator");
+    forged_cooldown_until := 0;
+    forged_window_start := Time.now();
+    forged_in_window := 0;
+    #ok(forgedGuardStatusValue())
+  };
+
+  // ==================== claimable payments ====================
+
+  /// A page of claim envelopes in log order. Public: envelopes are opaque IBE ciphertexts.
+  public query func claim_envelopes(start : Nat, count : Nat) : async ClaimLogPage {
+    let total = StableLog.size(claim_log);
+    let n = Nat.min(count, CLAIM_PAGE_MAX);
+    let records = List.empty<ClaimRecord>();
+    var i = start;
+    while (i < total and i < start + n) {
+      switch (StableLog.get(claim_log, i)) {
+        case (?raw) List.add(records, decodeClaimRecord(i, raw));
+        case null Runtime.trap("claim-log:missing-record");
+      };
+      i += 1;
+    };
+    { total; records = List.toArray(records) }
+  };
+
+  public query func claim_status() : async ClaimStatus {
+    { required = claim_envelopes_required; envelope_len = CLAIM_ENVELOPE_LEN; total = StableLog.size(claim_log) }
+  };
+
+  /// Require an envelope on every private transfer. Administrator only.
+  public shared ({ caller }) func set_claim_envelopes_required(required : Bool) : async Result<ClaimStatus> {
+    switch (guardRejection()) { case (?message) return #err(message); case null {} };
+    if (not isAdministrator(caller)) return #err("REJECT:not-administrator");
+    claim_envelopes_required := required;
+    #ok({ required; envelope_len = CLAIM_ENVELOPE_LEN; total = StableLog.size(claim_log) })
+  };
+
+  public query func get_note_shape() : async ?NoteShape { note_shape };
+
+  /// Fix (or clear, with null) the opaque-field lengths of every new output. Administrator only.
+  public shared ({ caller }) func set_note_shape(shape : ?NoteShape) : async Result<?NoteShape> {
+    switch (guardRejection()) { case (?message) return #err(message); case null {} };
+    if (not isAdministrator(caller)) return #err("REJECT:not-administrator");
+    switch (shape) {
+      case (?value) {
+        if (value.ephemeral_key_len == 0 or value.ephemeral_key_len > NOTE_SHAPE_MAX or
+            value.note_ciphertext_len == 0 or value.note_ciphertext_len > NOTE_SHAPE_MAX) {
+          return #err("REJECT:note-shape-bounds");
+        };
+      };
+      case null {};
+    };
+    note_shape := shape;
+    #ok(shape)
+  };
+
   public shared ({ caller }) func confidential_transfer(args : TransferArgs) : async MutationResult {
     // Seed the publish salt on an update path — queries cannot seed one, so it has to happen
     // here. REG-4: this comment used to end "an unseeded salt makes publishedIntentId fall through
@@ -4937,15 +5680,26 @@ persistent actor ZkLedger {
     };
     switch (validateOutput(args.output_1)) { case (?e) return mutation(e, "NOT_CALLED"); case null {} };
     switch (validateOutput(args.output_2)) { case (?e) return mutation(e, "NOT_CALLED"); case null {} };
+    switch (shapeRejection(args.output_1.ephemeral_key, args.output_1.note_ciphertext)) { case (?e) return mutation(e, "NOT_CALLED"); case null {} };
+    switch (shapeRejection(args.output_2.ephemeral_key, args.output_2.note_ciphertext)) { case (?e) return mutation(e, "NOT_CALLED"); case null {} };
 
     let isUnshield = args.v_pub_out > 0;
+    // The fee schedule, captured ONCE so a mid-flight set_protocol_fee cannot split the check
+    // from the commit. The proof binds args.fee, so what is checked here is what is committed.
+    let requiredFee = requiredTransferFee(Nat64.toNat(args.v_pub_out), protocol_send_fee, protocol_unshield_bps);
     let recipientBinding : Blob = if (isUnshield) {
       if (not tokenConfigured()) return mutation("REJECT:token-unconfigured", "NOT_CALLED");
       if (Nat64.toNat(args.fee) < transparent_ledger_fee) {
         return mutation("REJECT:unshield-fee-below-token-fee", "NOT_CALLED");
       };
+      if (Nat64.toNat(args.fee) != requiredFee) {
+        return mutation("REJECT:transfer-fee-mismatch", "NOT_CALLED");
+      };
       if (args.created_at_time == null) {
         return mutation("REJECT:unshield-created-at-time", "NOT_CALLED");
+      };
+      if (args.claim_envelope != null) {
+        return mutation("REJECT:unshield-claim-envelope", "NOT_CALLED");
       };
       let recipient = switch (args.recipient) {
         case (?value) value;
@@ -4962,8 +5716,24 @@ persistent actor ZkLedger {
       if (args.recipient != null or args.created_at_time != null) {
         return mutation("REJECT:private-transfer-public-recipient", "NOT_CALLED");
       };
-      zeroField()
+      if (Nat64.toNat(args.fee) != requiredFee) {
+        return mutation("REJECT:transfer-fee-mismatch", "NOT_CALLED");
+      };
+      switch (args.claim_envelope) {
+        case null {
+          if (claim_envelopes_required) return mutation("REJECT:claim-envelope-required", "NOT_CALLED");
+          zeroField()
+        };
+        case (?envelope) {
+          if (envelope.size() != CLAIM_ENVELOPE_LEN) return mutation("REJECT:claim-envelope-length", "NOT_CALLED");
+          claimBinding(envelope)
+        };
+      }
     };
+    // What leaves the notes for the protocol: the whole fee on a private transfer; on an
+    // unshield, the fee minus the token ledger's own fee (which pays for the payout and is
+    // already inside poolDebit). Non-negative: both branches above checked the fee.
+    let protocolShare : Nat = if (isUnshield) Nat64.toNat(args.fee) - transparent_ledger_fee else Nat64.toNat(args.fee);
 
     let intentId = if (isUnshield) ?unshieldIntentId(caller, args, recipientBinding) else null;
     switch (intentId) {
@@ -5004,7 +5774,7 @@ persistent actor ZkLedger {
       return mutation("REJECT:nullifier-spent", "NOT_CALLED");
     };
     let poolDebit = if (isUnshield) Nat64.toNat(args.v_pub_out) + transparent_ledger_fee else 0;
-    if (poolDebit > pool_value) {
+    if (poolDebit + protocolShare > pool_value) {
       return mutation("REJECT:turnstile", "NOT_CALLED");
     };
     // Prepaid fee: the rate this transfer must pay, captured ONCE so a mid-flight admin
@@ -5033,8 +5803,12 @@ persistent actor ZkLedger {
     // In-process verify: no await before the tree append, so the anchor/nullifier/turnstile
     // guards above are still the live state when the verdict lands. The re-checks below the
     // old verifier await collapse into the post-tree-append re-checks that remain.
+    switch (forgedCooldownRejection()) { case (?e) return mutation(e, "NOT_CALLED"); case null {} };
     let verdict = verifyTransferProof(args.proof_hex, inputs);
-    if (verdict != "ACCEPT") return mutation(verdict, verdict);
+    if (verdict != "ACCEPT") {
+      recordFailedVerification(verdict);
+      return mutation(verdict, verdict);
+    };
 
     let treeBefore = currentTree();
     let transferLeaves = [
@@ -5080,7 +5854,7 @@ persistent actor ZkLedger {
         StableBlobSet.contains(spent_nullifiers, args.nullifier_2)) {
       return mutation("REJECT:nullifier-spent", verdict);
     };
-    if (poolDebit > pool_value) return mutation("REJECT:turnstile", verdict);
+    if (poolDebit + protocolShare > pool_value) return mutation("REJECT:turnstile", verdict);
     let next = switch (parseTransition(transition)) {
       case (#ok(state)) state;
       case (#err(message)) return mutation(message, verdict);
@@ -5095,6 +5869,17 @@ persistent actor ZkLedger {
     };
 
     if (not isUnshield) {
+      // Envelope headroom BEFORE any write, so the append below cannot fail inside the commit.
+      switch (args.claim_envelope) {
+        case (?envelope) {
+          switch (StableLog.ensureHeadroom(claim_log, Nat64.fromNat(16 + envelope.size()), 1)) {
+            case (#err(message)) return mutation("REJECT:claim-log-headroom:" # message, verdict);
+            case (#ok(_)) {};
+          };
+        };
+        case null {};
+      };
+      let claimPosition = noteCount();   // position of output_1, appended first below
       // No await after this point: a private transfer commits all shielded state together —
       // including the prepaid fee debit, which is re-checked HERE because the balance can
       // have been drained by an interleaved transfer while the tree transition awaited.
@@ -5104,6 +5889,9 @@ persistent actor ZkLedger {
         };
         prepaid_fee_revenue += prepaidRate;
       };
+      // The flat send fee left the notes with the proof; it moves to revenue in this commit.
+      pool_value -= protocolShare;
+      protocol_fee_revenue += protocolShare;
       addNullifier(args.nullifier_1);
       addNullifier(args.nullifier_2);
       tree_state := ?next;
@@ -5112,6 +5900,15 @@ persistent actor ZkLedger {
       let nullifiers = [args.nullifier_1, args.nullifier_2];
       appendBlock(args.output_1, nullifiers, args.anchor, rootAfter, #confidential_transfer);
       appendBlock(args.output_2, nullifiers, args.anchor, rootAfter, #confidential_transfer);
+      switch (args.claim_envelope) {
+        case (?envelope) {
+          switch (StableLog.append(claim_log, claimRecordBytes(claimPosition, Time.now(), envelope))) {
+            case (#ok(_)) {};
+            case (#err(message)) Runtime.trap("claim-log-append:" # message); // headroom was reserved above
+          };
+        };
+        case null {};
+      };
       epoch += 1;
       refreshCertification();
       return mutation("ACCEPT", verdict);
@@ -5121,7 +5918,7 @@ persistent actor ZkLedger {
     let createdAt = switch (args.created_at_time) { case (?value) value; case null Runtime.trap("validated timestamp") };
     let intent = switch (intentId) { case (?value) value; case null Runtime.trap("validated intent") };
     let ledgerTip = try {
-      (await historyActor().icrc3_get_blocks([{ start = 0; length = 0 }])).log_length
+      await tokenLogLength()
     } catch (error) {
       return mutation("REJECT:unshield-ledger-tip-call:" # Error.message(error), verdict);
     };
@@ -5129,7 +5926,7 @@ persistent actor ZkLedger {
       return mutation("REJECT:state-changed", verdict);
     };
     if (StableBlobSet.contains(spent_nullifiers, args.nullifier_1) or
-        StableBlobSet.contains(spent_nullifiers, args.nullifier_2) or poolDebit > pool_value) {
+        StableBlobSet.contains(spent_nullifiers, args.nullifier_2) or poolDebit + protocolShare > pool_value) {
       return mutation("REJECT:state-changed", verdict);
     };
     // Unshield prepaid debit: reserved NOW (same message segment as the pending intent —
@@ -5142,6 +5939,9 @@ persistent actor ZkLedger {
       };
       pending_unshield_prepaid_debit := prepaidRate;
     };
+    // Carried beside the pending intent (same message segment, no await between): earned at
+    // finalize, dropped on cancel.
+    pending_unshield_protocol_fee := protocolShare;
     let transferArgs : ICRC2.TransferArg = {
       from_subaccount = pool_subaccount;
       to = recipient;

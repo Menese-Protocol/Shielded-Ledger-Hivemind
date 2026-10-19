@@ -7,15 +7,38 @@ are answered by a ledger that never learns the question.
 The whole system is **open source under the MIT licence** — the coordinator, the contributor
 client, the circuits, the in-canister verifier, and every gate that checks them.
 
-## The trusted-setup ceremony is live, and it needs contributors
+## The shielded ledger is live
 
-**[ovrp2-uaaaa-aaaad-agxuq-cai.icp0.io](https://ovrp2-uaaaa-aaaad-agxuq-cai.icp0.io)** — about a
-minute in your browser. You sample a secret, it is mixed into the proving parameters, and it is
-destroyed without ever leaving the tab. The final trapdoor is the product of every contributor's
-secret, so recovering it requires every one of them: **a single honest participant makes forgery
-impossible forever.** That property is why the ask is not that you trust us.
+The ledger runs on Internet Computer mainnet, with ICP as its token:
 
-Accordingly, nothing here rests on trust that cannot be checked:
+| Canister | ID |
+|---|---|
+| shielded ledger | `3pwrb-oiaaa-aaaao-bbqba-cai` |
+| shielded directory | `3gv25-yaaaa-aaaao-bbqaq-cai` |
+
+- **Shield** ICP into a private balance, **send** privately to anyone who has turned on a private
+  balance, or send a **claimable payment** the recipient picks up later. **Unshield** back to any
+  ICP account.
+- **Fees**, enforced by the ledger itself for every app that uses it: shielding is free (only the
+  ICP ledger's own fees apply); a private send costs 0.1 ICP; an unshield costs the ICP network fee
+  plus 0.3% of the amount.
+- **The verifying keys are frozen.** They are the keys produced by the ceremony below, and the
+  ledger can never switch to other keys. `ceremony-launch-p14/final/README.md` shows how to check
+  this against the chain yourself.
+
+## The trusted-setup ceremony is complete
+
+The Phase-2 ceremony closed with **25 honest contributions** and was finalized with a beacon named
+in public before the window closed (an ICP ledger block chosen by timestamp, `ceremony-launch-p14/BEACON.md`).
+Each contributor sampled a secret in their browser that never left the tab. The final trapdoor is
+the product of every contributor's secret, so recovering it would require every one of them:
+**a single honest participant makes forgery impossible forever.**
+
+The full record is published in [`ceremony-launch-p14/final/`](ceremony-launch-p14/final/): the
+Phase-1 parameters, the complete transcript, the resulting keys, and the finalize log, with the
+commands to verify each step.
+
+Nothing here rests on trust that cannot be checked:
 
 - The coordinator receiving contributions is **blackholed** — its controller list is empty, so
   nobody, us included, can upgrade it and rewrite the transcript afterwards.
@@ -30,7 +53,7 @@ Accordingly, nothing here rests on trust that cannot be checked:
   different paths and requires both to match what the page serves.
 
 Every one of those checks, with the exact command and the output you should get, is in
-[`docs/REPRODUCING.md`](docs/REPRODUCING.md). Run them before you contribute, not after.
+[`docs/REPRODUCING.md`](docs/REPRODUCING.md).
 
 Worth doing anyway, because it is the claim a hash cannot make for you:
 `demo-frontend/contributor-wasm/src/lib.rs` is 133 lines, and neither of its two exports returns
@@ -42,13 +65,9 @@ does *not* give you is section 8, which is worth reading before the rest.
 
 *The ceremony comes before the money.*
 
-## The pool itself
+## The demo
 
-**The hosted pool demo is offline while the pool is redeployed.** It is not linked here rather than
-linked and broken; this section will name the new deployment when it exists. The ceremony above is
-live, and separate from it.
-
-The demo itself runs locally today (`## Running it yourself`): two browsers, two users, a private
+The demo runs locally (`## Running it yourself`): two browsers, two users, a private
 transfer, and a live panel showing exactly what a node provider can and cannot see.
 `node demo-frontend/verify.mjs` drives that whole story headless and screenshots every step.
 
