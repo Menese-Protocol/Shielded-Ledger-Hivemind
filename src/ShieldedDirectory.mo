@@ -1,6 +1,6 @@
 /// Shielded directory — Menese DeFi Team.
 ///
-/// The private balance's key desk and address book:
+/// The private balance's key desk and address book (docs/CLAIMABLE-PAYMENTS-SPEC.md):
 ///
 /// * KEYS. A user's shielded account is recovered at every sign-in from a vetKey derived for their
 ///   principal and delivered encrypted to a one-use browser transport key. The derivation input is

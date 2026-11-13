@@ -125,7 +125,7 @@ persistent actor ZkLedger {
     recipient : ?ICRC2.Account;
     created_at_time : ?Nat64;
     proof_hex : Text;
-    /// Claimable-payment envelope: an opaque, fixed-length
+    /// Claimable-payment envelope (docs/CLAIMABLE-PAYMENTS-SPEC.md): an opaque, fixed-length
     /// vetKeys IBE ciphertext bound to the proof through `recipient_binding`. Private transfers
     /// only; null on unshields. Absent from older callers' records, which decode as null.
     claim_envelope : ?Blob;
@@ -606,6 +606,11 @@ persistent actor ZkLedger {
   // `threshold` failed verifications within the window start a cool-down during which shield and
   // confidential_transfer refuse before the verifier. Finalize and resume paths never verify a
   // proof and are never refused, so nothing pending is stranded.
+  //
+  //
+  //
+  //
+  //
   var forged_guard : ForgedProofGuardConfig = { threshold = 0; window_seconds = 600; cooldown_seconds = 1800 };
   var forged_window_start : Int = 0;
   var forged_in_window : Nat = 0;
@@ -5602,7 +5607,7 @@ persistent actor ZkLedger {
     #ok(forgedGuardStatusValue())
   };
 
-  // ==================== claimable payments ====================
+  // ==================== claimable payments (docs/CLAIMABLE-PAYMENTS-SPEC.md) ====================
 
   /// A page of claim envelopes in log order. Public: envelopes are opaque IBE ciphertexts.
   public query func claim_envelopes(start : Nat, count : Nat) : async ClaimLogPage {
