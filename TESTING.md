@@ -477,6 +477,42 @@ block); outside it, the scan keeps its place per intent across resumes. ICRC-3 t
     low-water mark and the shield's own block on a one-page scan budget, settled over several
     resumes (I6).
 
+## 3d-vi. The ckBTC token leg: DFINITY's ICRC ledger (legacy block schema), teeth-first
+
+The ckBTC ledger writes the legacy ICRC-1/2 block schema: no `btype`, the operation in `tx.op`
+(`xfer` for a transfer and for a transfer_from, told apart by `spender`), the caller's fee in
+`tx.fee` (a block-level `fee` only when the caller named none). `src/ICRC1Block.mo` and
+`src/ICRC2Block.mo` accept that schema and the typed `1xfer` / `2xfer` one, and match every
+field the pool sent exactly; fields they do not read (`fee_col`, `fee_col_block`, `phash`) are
+passed over.
+
+- `tests/ICRC2BlockTest.mo` (also in `scripts/security-gate.sh`): three real blocks read from the
+  live ckBTC ledger (`tests/CkbtcBlockVectors.mo`) matched for the call that made them, and every
+  single-field change, another `op`, a second `op`, a block-level fee, a spender on a payout, a
+  missing spender on a transfer_from, or the other operation's `btype` refused.
+- `CKBTC_LEDGER_WASM=<ic-icrc1-ledger.wasm.gz> cargo run --release --manifest-path
+  soak/Cargo.toml --bin ckbtc_token_leg_battery`, with the ledger wasm the live ckBTC ledger runs
+  (dfinity/ic `cf41372e3d4dc1accfe2c09a7969f8bddc729dc1`, module hash
+  `354dd6ecfdc72b5409805b31dea22c9db11df6e14095a5a68924eb63535e6d8a`; the battery refuses any
+  other), set up as ckBTC is (8 decimals, 10-satoshi fee, a fee collector, ICRC-2 on), archiving
+  after a few blocks:
+  - **Teeth first**: the `05af6db` matchers (K1+K2, K3, K4, K5); only the payout matcher from
+    `05af6db` (K1+K2, K5); archived ranges skipped (K4, K5); transfer_from matched against the
+    wrong account (K1+K2).
+  - **Then green**: the pool's own blocks read back are the legacy schema; make private and move
+    out settle from them, charged and paid exactly once (K1, K2); a crash after the transfer_from
+    resumed (K3) and, the block archived, resumed after 25 h (K4); a crash after the payout, the
+    block archived, 25 h later: the owner's resume is refused as expired and the administrator's
+    settles it, paid once, never cancelled (K5); a rejected token call, 40 more blocks, 25 h:
+    absence proven and the intent released, nothing charged (K6).
+- `cargo run --release --manifest-path soak/Cargo.toml --bin directory_pool_upgrade`: rebuilds the
+  live directory module (`cf544e74…`, from `05af6db`) and refuses unless the hash matches,
+  installs it, registers users through the old calls, upgrades to `src/ShieldedDirectory.mo`,
+  and checks that old addresses and birthdays read back unchanged through the old calls and
+  through `*_for_pool(<ICP pool>)`, that a ckBTC pool keeps its own, and that a second upgrade
+  keeps them; teeth: the ICP pool not mapped to the old maps, and a pool write landing in the ICP
+  maps (address or birthday).
+
 ## 3e. The recovery harness: canonicality census, tree repair, intent release
 
 Every value the tree stores must be a canonical field element — below the BLS12-381 scalar

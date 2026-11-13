@@ -718,3 +718,140 @@ pub fn icp_approve_pool(env: &Env, owners: &[Principal], allowance: u128) {
         assert!(matches!(r, IcpApproveResult::Ok(_)), "icrc2_approve for {owner}: {r:?}");
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// DFINITY's ICRC ledger (the ckBTC ledger's code) as the pool's token (configure_token_ledger with
+// the ledger as its own ICRC-3 history, ICRC1Block / ICRC2Block on legacy `op = "xfer"` blocks).
+
+/// The ckBTC ledger's transfer fee, as mainnet charges it (10 satoshi).
+pub const CKBTC_FEE_SATS: u64 = 10;
+
+#[derive(CandidType)]
+struct IcrcArchiveOptions {
+    num_blocks_to_archive: u64,
+    max_transactions_per_response: Option<u64>,
+    trigger_threshold: u64,
+    max_message_size_bytes: Option<u64>,
+    cycles_for_archive_creation: Option<u64>,
+    node_max_memory_size_bytes: Option<u64>,
+    controller_id: Principal,
+    more_controller_ids: Option<Vec<Principal>>,
+}
+#[derive(CandidType)]
+enum IcrcMetadataValue {
+    Text(String),
+}
+#[derive(CandidType)]
+struct IcrcInitArgs {
+    minting_account: ct::Account,
+    fee_collector_account: Option<ct::Account>,
+    transfer_fee: candid::Nat,
+    decimals: Option<u8>,
+    max_memo_length: Option<u16>,
+    token_symbol: String,
+    token_name: String,
+    metadata: Vec<(String, IcrcMetadataValue)>,
+    initial_balances: Vec<(ct::Account, candid::Nat)>,
+    feature_flags: Option<IcpFeatureFlags>,
+    archive_options: IcrcArchiveOptions,
+    index_principal: Option<Principal>,
+}
+#[derive(CandidType)]
+enum IcrcLedgerArg {
+    Init(IcrcInitArgs),
+}
+
+/// The fee collector the test ledger names, as the live ckBTC ledger names one: its blocks then
+/// carry `fee_col` / `fee_col_block`, the shape the matchers must read past.
+pub fn ckbtc_fee_collector() -> Principal {
+    Principal::self_authenticating(Sha256::digest(b"ckbtc-fee-collector"))
+}
+
+/// Start PocketIC with DFINITY's ICRC ledger (`icrc_ledger_wasm`, e.g. the ic-icrc1-ledger.wasm.gz
+/// the live ckBTC ledger runs) configured as ckBTC is: 8 decimals, a 10-satoshi fee, a fee collector,
+/// an 80-byte memo limit, ICRC-2 on; each of `funded` holding `balance`, and archiving after
+/// `archive_trigger` blocks (so archived reads happen in-test). The zk ledger is bound with
+/// `configure_token_ledger(token, token, null)`: the ICRC ledger serves its own ICRC-3 log.
+pub fn setup_icrc_real(
+    wasms: &BuiltWasms,
+    icrc_ledger_wasm: &[u8],
+    transfer_vk_hex: &str,
+    deposit_vk_hex: &str,
+    state_dir: &Path,
+    funded: &[Principal],
+    balance: u64,
+    archive_trigger: u64,
+) -> Env {
+    let binary = resolve_pocket_ic_server();
+    let server = std::sync::Arc::new(spawn_server(&binary));
+    let pic = PocketIcBuilder::new()
+        .with_server_url(server.url.clone())
+        .with_nns_subnet()
+        .with_application_subnet()
+        .with_state_dir(state_dir.to_path_buf())
+        .with_max_request_time_ms(Some(600_000))
+        .build();
+    pic.set_time(pocket_ic::Time::from_nanos_since_unix_epoch(GENESIS_NS));
+    let admin = Principal::self_authenticating(Sha256::digest(b"soak-admin-v1"));
+    let app = pic.topology().get_app_subnets()[0];
+
+    let token = pic.create_canister_on_subnet(Some(admin), None, app);
+    pic.add_cycles(token, 1_000_000_000_000_000);
+    let minting = Principal::self_authenticating(Sha256::digest(b"ckbtc-minter"));
+    let init = IcrcLedgerArg::Init(IcrcInitArgs {
+        minting_account: ct::Account { owner: minting, subaccount: None },
+        fee_collector_account: Some(ct::Account { owner: ckbtc_fee_collector(), subaccount: None }),
+        transfer_fee: candid::Nat::from(CKBTC_FEE_SATS),
+        decimals: Some(8),
+        max_memo_length: Some(80),
+        token_symbol: "ckBTC".into(),
+        token_name: "ckBTC".into(),
+        metadata: vec![("icrc1:logo".into(), IcrcMetadataValue::Text(String::new()))],
+        initial_balances: funded
+            .iter()
+            .map(|p| (ct::Account { owner: *p, subaccount: None }, candid::Nat::from(balance)))
+            .collect(),
+        feature_flags: Some(IcpFeatureFlags { icrc2: true }),
+        archive_options: IcrcArchiveOptions {
+            num_blocks_to_archive: archive_trigger / 2,
+            max_transactions_per_response: None,
+            trigger_threshold: archive_trigger,
+            max_message_size_bytes: None,
+            cycles_for_archive_creation: Some(10_000_000_000_000),
+            node_max_memory_size_bytes: None,
+            controller_id: admin,
+            more_controller_ids: None,
+        },
+        index_principal: None,
+    });
+    pic.install_canister(token, icrc_ledger_wasm.to_vec(), candid::encode_one(init).unwrap(), Some(admin));
+
+    let mut create = || {
+        let c = pic.create_canister_on_subnet(Some(admin), None, app);
+        pic.add_cycles(c, 100_000_000_000_000);
+        c
+    };
+    let tree_oracle = create();
+    let ledger = create();
+    pic.install_canister(tree_oracle, wasms.tree_oracle.clone(), candid::encode_args(()).unwrap(), Some(admin));
+    pic.install_canister(ledger, wasms.ledger.clone(), candid::encode_args(()).unwrap(), Some(admin));
+    pic.update_canister_settings(
+        ledger,
+        Some(admin),
+        pocket_ic::CanisterSettings { wasm_memory_limit: Some(candid::Nat::from(8u64 * 1024 * 1024 * 1024)), ..Default::default() },
+    )
+    .expect("raise ledger wasm_memory_limit");
+
+    let env = Env { pic: Some(pic), server, admin, ledger, token, tree_oracle, ledger_wasm: wasms.ledger.clone(), token_fee: CKBTC_FEE_SATS, recycles: 0 };
+    let configured: ct::MotokoResult<ct::LedgerStatus> = env
+        .update(ledger, admin, "configure", (ledger, tree_oracle, transfer_vk_hex.to_string(), deposit_vk_hex.to_string()))
+        .expect("ledger configure call");
+    configured.into_result().expect("ledger configure");
+    let bound: ct::MotokoResult<candid::Reserved> = env
+        .update(ledger, admin, "configure_token_ledger", (token, token, Option::<ct::Blob>::None))
+        .expect("configure_token_ledger call");
+    bound.into_result().expect("configure_token_ledger");
+    let fee: candid::Nat = env.query(token, "icrc1_fee", ()).expect("icrc1_fee");
+    assert_eq!(fee, candid::Nat::from(CKBTC_FEE_SATS), "the ICRC ledger must charge the ckBTC fee");
+    env
+}

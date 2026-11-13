@@ -1,4 +1,5 @@
-/// Exact ICRC-3 `1xfer` matcher for recovering an idempotent pool withdrawal.
+/// Exact ICRC-3 transfer matcher for recovering an idempotent pool withdrawal: the typed `1xfer`
+/// block, or the legacy `op = "xfer"` block (no spender) that DFINITY's ICRC ledger writes (ckBTC).
 
 import Blob "mo:core/Blob";
 import Nat64 "mo:core/Nat64";
@@ -16,6 +17,25 @@ module {
       };
     };
     found
+  };
+
+  func hasField(entries : [(Text, ICRC3.Value)], name : Text) : Bool {
+    for ((key, _) in entries.vals()) { if (key == name) return true };
+    false
+  };
+
+  /// True when the block is in one of the two schemas ICRC-3 allows and names the wanted transfer.
+  /// Typed form: `btype` names the operation (`typed` here) and the caller-set fee is `tx.fee`.
+  /// Legacy ICRC-1/2 form, written by DFINITY's ICRC ledger (ckBTC included): no `btype`, `tx.op`
+  /// names the operation, and the fee is `tx.fee` when the caller set it, else a block-level `fee`.
+  /// The pool always sets the fee, so a legacy block of ours has `tx.fee` and no block-level `fee`.
+  /// A duplicated `btype` or `op` reads as missing, so the block is refused.
+  func schemaOk(outer : [(Text, ICRC3.Value)], tx : [(Text, ICRC3.Value)], typed : Text) : Bool {
+    if (hasField(outer, "btype")) {
+      textField(outer, "btype") == ?typed
+    } else {
+      textField(tx, "op") == ?"xfer" and not hasField(outer, "fee")
+    }
   };
 
   func natField(entries : [(Text, ICRC3.Value)], name : Text) : ?Nat {
@@ -57,8 +77,11 @@ module {
 
   public func matchesTransfer(block : ICRC3.Value, args : ICRC2.TransferArg, fromOwner : Principal) : Bool {
     let outer = switch (block) { case (#Map(value)) value; case _ return false };
-    if (textField(outer, "btype") != ?"1xfer") return false;
     let tx = switch (mapField(outer, "tx")) { case (?#Map(value)) value; case _ return false };
+    if (not schemaOk(outer, tx, "1xfer")) return false;
+    // A legacy transfer and a legacy transfer_from are both `op = "xfer"`; only the spender tells
+    // them apart, so a payout block must not name one.
+    if (hasField(tx, "spender")) return false;
     if (natField(tx, "amt") != ?args.amount) return false;
     let fee = switch (args.fee) { case (?value) value; case null return false };
     if (natField(tx, "fee") != ?fee) return false;

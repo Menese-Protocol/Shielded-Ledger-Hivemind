@@ -18,6 +18,25 @@ module {
     found
   };
 
+  func hasField(entries : [(Text, ICRC3.Value)], name : Text) : Bool {
+    for ((key, _) in entries.vals()) { if (key == name) return true };
+    false
+  };
+
+  /// True when the block is in one of the two schemas ICRC-3 allows and names the wanted transfer.
+  /// Typed form: `btype` names the operation (`typed` here) and the caller-set fee is `tx.fee`.
+  /// Legacy ICRC-1/2 form, written by DFINITY's ICRC ledger (ckBTC included): no `btype`, `tx.op`
+  /// names the operation, and the fee is `tx.fee` when the caller set it, else a block-level `fee`.
+  /// The pool always sets the fee, so a legacy block of ours has `tx.fee` and no block-level `fee`.
+  /// A duplicated `btype` or `op` reads as missing, so the block is refused.
+  func schemaOk(outer : [(Text, ICRC3.Value)], tx : [(Text, ICRC3.Value)], typed : Text) : Bool {
+    if (hasField(outer, "btype")) {
+      textField(outer, "btype") == ?typed
+    } else {
+      textField(tx, "op") == ?"xfer" and not hasField(outer, "fee")
+    }
+  };
+
   func natField(entries : [(Text, ICRC3.Value)], name : Text) : ?Nat {
     switch (mapField(entries, name)) { case (?#Nat(value)) ?value; case _ null }
   };
@@ -55,16 +74,17 @@ module {
     ?{ owner; subaccount }
   };
 
-  /// Requires the preferred, fully reconstructible pinned ICRC-3 form. Because the caller supplies
-  /// `fee`, it must be in `tx.fee`; because `created_at_time` is non-null, it must be in `tx.ts`.
+  /// Accepts the typed `2xfer` block or the legacy `op = "xfer"` block with a spender (DFINITY's ICRC
+  /// ledger, ckBTC). Because the caller supplies `fee`, it must be in `tx.fee`; because
+  /// `created_at_time` is non-null, it must be in `tx.ts`.
   public func matchesTransferFrom(
     block : ICRC3.Value,
     args : ICRC2.TransferFromArgs,
     spenderOwner : Principal,
   ) : Bool {
     let outer = switch (block) { case (#Map(value)) value; case _ return false };
-    if (textField(outer, "btype") != ?"2xfer") return false;
     let tx = switch (mapField(outer, "tx")) { case (?#Map(value)) value; case _ return false };
+    if (not schemaOk(outer, tx, "2xfer")) return false;
 
     if (natField(tx, "amt") != ?args.amount) return false;
     let expectedFee = switch (args.fee) { case (?value) value; case null return false };

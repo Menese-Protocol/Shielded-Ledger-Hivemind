@@ -16,12 +16,15 @@ Steps:
      with --history, an ICRC-3 token and its history log (configure_token_ledger)
   4. tree: the in-canister Poseidon frontier (on by default) stays on and the tree oracle is
      detached, so the ledger computes every note-tree root itself and trusts no other canister
-  5. launch settings: protocol fee (0.1 token per private send, 0.3% of every unshield, no
+  5. launch settings: protocol fee (per private send: 0.1 ICP for the ICP pool; any other token
+     must name its own with --send-fee, in its smallest unit; 0.3% of every unshield, no
      recipient), claim envelopes required, note shape (32, 584)
   6. the certified vk anchor must equal sha256("zk-ledger/vk-anchor/v1" ‖ transfer_vk_hex ‖
      deposit_vk_hex) ‖ epoch 1, computed here from the gated key files
   7. freeze_verifying_keys with exactly that anchor, then read the freeze back
-  8. directory: vetKD key name, administrator, limits read back
+  8. directory: vetKD key name, administrator, limits read back; for a pool other than the ICP
+     pool, the directory accepts addresses for it (add_pool, read back through pools()), and with
+     --legacy-pool the original maps are named once as that pool's (set_legacy_pool)
 
 The forged-proof cool-down is left as found and reported; its threshold is set separately.
 
@@ -29,6 +32,9 @@ Usage:
   scripts/mainnet-setup.py --network ic --identity <admin identity> \
       --ledger <id> --tree-oracle <id> --token ryjl3-tyaaa-aaaaa-aaaba-cai --directory <id> \
       --keyset <dir with transfer_vk.hex, deposit_vk.hex, SETUP-MANIFEST.json, transcript>
+
+  An ICRC token pool (ckBTC): --token <ledger> --history <ledger> --send-fee <smallest units>
+  [--legacy-pool <the ICP pool's ledger>]
 """
 
 import argparse
@@ -38,7 +44,7 @@ import pathlib
 import subprocess
 import sys
 
-SEND_FEE = 10_000_000  # 0.1 ICP in e8s
+ICP_SEND_FEE = 10_000_000  # 0.1 ICP in e8s: the ICP pool's send fee
 UNSHIELD_BPS = 30
 NOTE_SHAPE = (32, 584)
 DIRECTORY_KEY_NAME = "key_1"
@@ -147,7 +153,21 @@ def main():
     parser.add_argument("--history", default=None, help="ICRC-3 tokens only: the history log; omit for the ICP ledger")
     parser.add_argument("--keyset", required=True, type=pathlib.Path)
     parser.add_argument("--test-keyset", action="store_true", help="local network only: accept a test keyset")
+    parser.add_argument("--send-fee", type=int, default=None,
+                        help="protocol fee per private send in the token's smallest unit; required for any token but ICP")
+    parser.add_argument("--legacy-pool", default=None,
+                        help="the pool whose addresses are the directory's original maps (the ICP pool), named once")
     args = parser.parse_args()
+    # 0.1 of a token is the ICP pool's fee; for ckBTC it would be 0.1 BTC per send, so any other
+    # token must say what it charges
+    if args.history is None:
+        send_fee = ICP_SEND_FEE if args.send_fee is None else args.send_fee
+    elif args.send_fee is None:
+        parser.error("--send-fee is required for an ICRC token pool (smallest units, e.g. sats for ckBTC)")
+    else:
+        send_fee = args.send_fee
+    if send_fee <= 0:
+        parser.error("--send-fee must be positive")
     dfx = Dfx(args.network, args.identity)
     me = dfx.principal()
 
@@ -203,14 +223,14 @@ def main():
 
     step("5/8 launch settings")
     ok(dfx.call(args.ledger, "set_protocol_fee",
-                f"(record {{ send_fee = {SEND_FEE} : nat64; unshield_bps = {UNSHIELD_BPS} : nat; recipient = null }})"),
+                f"(record {{ send_fee = {send_fee} : nat64; unshield_bps = {UNSHIELD_BPS} : nat; recipient = null }})"),
        "set_protocol_fee")
     ok(dfx.call(args.ledger, "set_claim_envelopes_required", "(true)"), "set_claim_envelopes_required")
     ok(dfx.call(args.ledger, "set_note_shape",
                 f"(opt record {{ ephemeral_key_len = {NOTE_SHAPE[0]} : nat; note_ciphertext_len = {NOTE_SHAPE[1]} : nat }})"),
        "set_note_shape")
     fee = dfx.call(args.ledger, "protocol_fee_status", query=True)
-    if nat(fee["send_fee"]) != SEND_FEE or nat(fee["unshield_bps"]) != UNSHIELD_BPS or opt(fee["recipient"]) is not None:
+    if nat(fee["send_fee"]) != send_fee or nat(fee["unshield_bps"]) != UNSHIELD_BPS or opt(fee["recipient"]) is not None:
         fail(f"protocol fee read back as {fee}")
     claims = dfx.call(args.ledger, "claim_status", query=True)
     if claims["required"] is not True:
@@ -218,7 +238,7 @@ def main():
     shape = opt(dfx.call(args.ledger, "get_note_shape", query=True))
     if shape is None or (nat(shape["ephemeral_key_len"]), nat(shape["note_ciphertext_len"])) != NOTE_SHAPE:
         fail(f"note shape read back as {shape}")
-    step(f"    fee {SEND_FEE} e8s per send + {UNSHIELD_BPS} bps per unshield, no recipient; envelopes required; note shape {NOTE_SHAPE}")
+    step(f"    fee {send_fee} (smallest units) per send + {UNSHIELD_BPS} bps per unshield, no recipient; envelopes required; note shape {NOTE_SHAPE}")
 
     step("6/8 verifying keys on the ledger")
     anchor = dfx.call(args.ledger, "verifying_key_anchor", query=True)
@@ -249,6 +269,26 @@ def main():
         fail(f"directory administrator {directory['administrator']}, not this identity ({me})")
     limits = directory["limits"]
     step(f"    key {DIRECTORY_KEY_NAME}, administrator {me}, limits {json.dumps(limits)}, cycles {directory['cycles']}")
+    if args.history is not None or args.legacy_pool is not None:
+        pools = dfx.call(args.directory, "pools", query=True)
+        legacy = opt(pools["legacy_pool"])
+        if args.legacy_pool is not None and legacy is None:
+            ok(dfx.call(args.directory, "set_legacy_pool", f'(principal "{args.legacy_pool}")'), "set_legacy_pool")
+            pools = dfx.call(args.directory, "pools", query=True)
+            legacy = opt(pools["legacy_pool"])
+        if args.legacy_pool is not None and legacy != args.legacy_pool:
+            fail(f"directory legacy pool {legacy}, wanted {args.legacy_pool}")
+        if args.history is not None:
+            if args.ledger == legacy:
+                fail("this ledger is the directory's legacy pool; an ICRC token pool needs its own")
+            if args.ledger not in pools["pools"]:
+                ok(dfx.call(args.directory, "add_pool", f'(principal "{args.ledger}")'), "add_pool")
+                pools = dfx.call(args.directory, "pools", query=True)
+            if args.ledger not in pools["pools"]:
+                fail(f"directory pools {pools['pools']} do not include {args.ledger}")
+            count = opt(dfx.call(args.directory, "count_for_pool", f'(principal "{args.ledger}")', query=True))
+            step(f"    directory accepts addresses for this pool ({count} so far)")
+        step(f"    directory legacy pool: {legacy}")
 
     guard = dfx.call(args.ledger, "forged_proof_guard_status", query=True)
     step(f"forged-proof cool-down left as found: {json.dumps(guard['config'])}")

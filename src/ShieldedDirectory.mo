@@ -1,6 +1,6 @@
 /// Shielded directory — Menese DeFi Team.
 ///
-/// The private balance's key desk and address book:
+/// The private balance's key desk and address book (docs/CLAIMABLE-PAYMENTS-SPEC.md):
 ///
 /// * KEYS. A user's shielded account is recovered at every sign-in from a vetKey derived for their
 ///   principal and delivered encrypted to a one-use browser transport key. The derivation input is
@@ -9,6 +9,10 @@
 /// * ADDRESSES. A user's public shielded address (`register`) so a sender can pay them directly;
 ///   `lookup_certified` answers through consensus so a single replica cannot substitute an address.
 /// * BIRTHDAY. A sealed, fixed-size wallet birthday, readable only by its owner.
+/// * POOLS. One vetKey per sign-in serves every pool (the browser derives separate account keys per
+///   pool from it), but each pool has its own address and birthday per user. The ICP pool's live in
+///   the original maps and the original calls keep meaning it; other pools (ckBTC) are registered by
+///   the administrator and use the `*_for_pool` calls, which also answer for the ICP pool.
 ///
 /// Each derivation costs the canister cycles, and anyone can mint principals, so derivations are
 /// limited per caller per day and in total per hour, and refused (not trapped) when the balance
@@ -20,6 +24,7 @@
 import Blob "mo:core/Blob";
 import Cycles "mo:core/Cycles";
 import Int "mo:core/Int";
+import Iter "mo:core/Iter";
 import Map "mo:core/Map";
 import Nat64 "mo:core/Nat64";
 import Principal "mo:core/Principal";
@@ -76,6 +81,13 @@ persistent actor class ShieldedDirectory(init : ?{ vetkd_key_name : Text; admini
   // Exactly nonce(24) ‖ secretbox(version(1) ‖ height(8) ‖ ledger hash(32) ‖ anchor(32)): one
   // size for every account, so the ciphertext length never reveals the birthday's magnitude.
   transient let BIRTHDAY_CT_SIZE : Nat = 113;
+
+  // Addresses and birthdays of pools other than the ICP pool: pool -> user -> value. Only pools the
+  // administrator registered are accepted, so callers cannot grow the key space with made-up pools.
+  let pool_entries = Map.empty<Principal, Map.Map<Principal, Entry>>();
+  let pool_birthdays = Map.empty<Principal, Map.Map<Principal, Blob>>();
+  // The pool whose addresses and birthdays are `entries` / `birthdays` (the ICP pool). Set once.
+  var legacy_pool : ?Principal = null;
 
   var limits : Limits = {
     derivations_per_caller_per_day = 20;
@@ -176,6 +188,95 @@ persistent actor class ShieldedDirectory(init : ?{ vetkd_key_name : Text; admini
   };
 
   public query func count() : async Nat { Map.size(entries) };
+
+  // ==================== per pool ====================
+
+  public type Pools = { legacy_pool : ?Principal; pools : [Principal] };
+
+  type PoolMaps = { entries : Map.Map<Principal, Entry>; birthdays : Map.Map<Principal, Blob> };
+
+  /// The maps that hold `pool`'s addresses and birthdays, or null for a pool nobody registered.
+  func mapsFor(pool : Principal) : ?PoolMaps {
+    switch (legacy_pool) {
+      case (?legacy) { if (Principal.equal(pool, legacy)) return ?{ entries; birthdays } };
+      case null {};
+    };
+    switch (Map.get(pool_entries, Principal.compare, pool), Map.get(pool_birthdays, Principal.compare, pool)) {
+      case (?e, ?b) ?{ entries = e; birthdays = b };
+      case _ null;
+    }
+  };
+
+  func validEntry(shielded_pk : Text, enc_pk : Text) : ?Text {
+    if (shielded_pk.size() == 0 or shielded_pk.size() > 128) return ?"bad-shielded-pk";
+    if (enc_pk.size() == 0 or enc_pk.size() > 128) return ?"bad-enc-pk";
+    null
+  };
+
+  /// Register (or rotate) the caller's own shielded address in `pool`.
+  public shared ({ caller }) func register_for_pool(pool : Principal, shielded_pk : Text, enc_pk : Text) : async Result.Result<(), Text> {
+    if (Principal.isAnonymous(caller)) return #err("anonymous-caller");
+    let maps = switch (mapsFor(pool)) { case (?m) m; case null return #err("unknown-pool") };
+    switch (validEntry(shielded_pk, enc_pk)) { case (?e) return #err(e); case null {} };
+    Map.add(maps.entries, Principal.compare, caller, { shielded_pk; enc_pk });
+    #ok
+  };
+
+  /// Store the caller's sealed birthday for `pool`; registration in that pool first.
+  public shared ({ caller }) func set_birthday_for_pool(pool : Principal, ct : Blob) : async Result.Result<(), Text> {
+    if (Principal.isAnonymous(caller)) return #err("anonymous-caller");
+    let maps = switch (mapsFor(pool)) { case (?m) m; case null return #err("unknown-pool") };
+    if (Map.get(maps.entries, Principal.compare, caller) == null) return #err("not-registered");
+    if (ct.size() != BIRTHDAY_CT_SIZE) return #err("bad-birthday-ct-size");
+    Map.add(maps.birthdays, Principal.compare, caller, ct);
+    #ok
+  };
+
+  /// The caller's own sealed birthday for `pool`. An update call: consensus-certified, private.
+  public shared ({ caller }) func get_birthday_for_pool(pool : Principal) : async ?Blob {
+    if (Principal.isAnonymous(caller)) return null;
+    switch (mapsFor(pool)) { case (?maps) Map.get(maps.birthdays, Principal.compare, caller); case null null }
+  };
+
+  /// A principal's shielded address in `pool`, answered by one replica (for display).
+  public query func lookup_for_pool(pool : Principal, p : Principal) : async ?Entry {
+    switch (mapsFor(pool)) { case (?maps) Map.get(maps.entries, Principal.compare, p); case null null }
+  };
+
+  /// The same, through consensus: what a sender uses before paying in `pool`.
+  public shared func lookup_certified_for_pool(pool : Principal, p : Principal) : async ?Entry {
+    switch (mapsFor(pool)) { case (?maps) Map.get(maps.entries, Principal.compare, p); case null null }
+  };
+
+  public query func count_for_pool(pool : Principal) : async ?Nat {
+    switch (mapsFor(pool)) { case (?maps) ?Map.size(maps.entries); case null null }
+  };
+
+  public query func pools() : async Pools {
+    { legacy_pool; pools = Iter.toArray(Map.keys(pool_entries)) }
+  };
+
+  /// Administrator only, once: name the pool whose addresses and birthdays are the original maps.
+  public shared ({ caller }) func set_legacy_pool(pool : Principal) : async Result.Result<(), Text> {
+    if (caller != administrator) return #err("not-administrator");
+    if (legacy_pool != null) return #err("legacy-pool-already-set");
+    if (Principal.isAnonymous(pool)) return #err("anonymous-pool");
+    if (Map.containsKey(pool_entries, Principal.compare, pool)) return #err("pool-already-registered");
+    legacy_pool := ?pool;
+    #ok
+  };
+
+  /// Administrator only: accept addresses and birthdays for another pool. Pools are never removed,
+  /// so a user's address cannot disappear under a sender.
+  public shared ({ caller }) func add_pool(pool : Principal) : async Result.Result<(), Text> {
+    if (caller != administrator) return #err("not-administrator");
+    if (Principal.isAnonymous(pool)) return #err("anonymous-pool");
+    if (legacy_pool == ?pool) return #err("pool-is-legacy");
+    if (Map.containsKey(pool_entries, Principal.compare, pool)) return #err("pool-already-registered");
+    Map.add(pool_entries, Principal.compare, pool, Map.empty<Principal, Entry>());
+    Map.add(pool_birthdays, Principal.compare, pool, Map.empty<Principal, Blob>());
+    #ok
+  };
 
   public query func status() : async Status {
     let hour = now() / NS_PER_HOUR;

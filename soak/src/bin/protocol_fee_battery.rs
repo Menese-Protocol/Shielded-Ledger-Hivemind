@@ -45,8 +45,8 @@ use std::path::{Path, PathBuf};
 
 type F = common::ScalarField;
 
-const SEND_FEE: u64 = 10_000_000; // 0.1 token at 8 decimals — the launch fee
-const UNSHIELD_BPS: u64 = 30; // 0.3% — the launch share
+const SEND_FEE: u64 = 10_000_000; // 0.1 token at 8 decimals — the ruled launch fee
+const UNSHIELD_BPS: u64 = 30; // 0.3% — the ruled launch share
 const FUND: u128 = 1_000_000_000;
 const NOTE: u64 = 200_000_000; // 2 tokens per shielded note
 const SEED: u64 = 20261015;
@@ -131,7 +131,7 @@ impl Harness {
         self.env.admin
     }
 
-    /// Account 2 stands in for the fee recipient account set by set_protocol_fee.
+    /// Account 2 stands in for the backend canister's main account (the ruled recipient).
     fn recipient(&self) -> ct::Account {
         ct::Account { owner: self.accounts[2].principal, subaccount: None }
     }
