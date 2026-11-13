@@ -30,8 +30,26 @@
 //!       sweep: resume credits the treasury exactly once; crash after the withdraw: resume pays
 //!       the recipient exactly once
 //!
+//!   P11 the fee recipient's owner sweeps and withdraws its own fees; a stranger, the anonymous
+//!       principal and a replaced recipient are refused; the owner cannot change the schedule
+//!   P12 the module upgrades the LIVE module (MPV_LIVE_LEDGER_WASM) with every fee setting and
+//!       balance kept exactly, still charges fees, and lets the recipient collect
+//!
+//!   P13 the administrator binds to SNS governance after genesis, once, with no key: not while
+//!       control is shared, not to a non-root, a root not listing the ledger, or a root NNS
+//!       SNS-W does not list; then the old administrator is refused, governance sets the fee
+//!       through dao_set_protocol_fee, a changed root answer never rebinds, upgrades keep it
+//!   P14 from the LIVE module: upgrade, administrator unchanged until the binding, then bound
+//!       with every fee setting and balance unchanged
+//!   P15 governance resumes a crashed intent through dao_resume_prepaid; the old administrator
+//!       can no longer resume another principal's intent
+//!
+//!   M  binding without the NNS SNS-W listing (a stranger controlling the canister binds)
+//!   N  the already-bound checks removed (binds twice)
+//!   O  the binding does not move the administrator (the old administrator keeps the role)
+//!
 //! RED expectations: A ⇒ P2,P9; B ⇒ P3; C ⇒ P4; D ⇒ P4,P10; E ⇒ P6; F ⇒ P7; G ⇒ P8;
-//! H ⇒ P6,P10; I ⇒ P8. The battery
+//! H ⇒ P6,P10; I ⇒ P8; J ⇒ P11; K ⇒ P11,P12; L ⇒ P12; M ⇒ P13; N ⇒ P13; O ⇒ P13,P14,P15. The battery
 //! PASSES only if every check is green on the shipped wasm AND every listed check goes red on its
 //! variant.
 
@@ -772,6 +790,553 @@ fn p10_crash_recovery(w: &Wasms, ks: keys::Keyset) -> Result<(), String> {
     Ok(())
 }
 
+/// One private transfer that pays the send fee, so there is protocol revenue to move.
+fn earn_send_fee(h: &mut Harness, acct: usize) -> Result<(), String> {
+    earn_fee(h, acct, SEND_FEE)
+}
+
+fn earn_fee(h: &mut Harness, acct: usize, fee: u64) -> Result<(), String> {
+    let (i, j) = two_notes(h, acct);
+    let p = h.prepare(acct, i, j, 1, 50_000_000, fee, 0);
+    let m = h.submit(acct, &p);
+    if m.outcome != "ACCEPT" {
+        return Err(format!("fee transfer said {}", m.outcome));
+    }
+    Ok(())
+}
+
+fn refused_as_not_admin(r: Result<u128, String>, what: &str) -> Result<(), String> {
+    match r {
+        Err(e) if e == "REJECT:not-administrator" => Ok(()),
+        other => Err(format!("{what} returned {other:?}, want REJECT:not-administrator")),
+    }
+}
+
+/// P11: the owner of the fee recipient collects its own fees (sweep, then withdraw to the
+/// recipient), the way a fee splitter the DAO controls does. A stranger and the anonymous
+/// principal are refused; the recipient's owner cannot change the schedule or the recipient;
+/// a recipient that is replaced loses the right at once.
+fn p11_recipient_collects(w: &Wasms, ks: keys::Keyset) -> Result<(), String> {
+    let mut h = Harness::new(&w.plain, ks, "p11");
+    let token_fee = h.env.token_fee;
+    let owner = h.accounts[2].principal;
+    let stranger = h.accounts[0].principal;
+    h.set_fee(SEND_FEE, UNSHIELD_BPS);
+    earn_send_fee(&mut h, 0).map_err(|e| format!("p11: {e}"))?;
+    let revenue = u64::try_from(nat(&h.status().revenue)).unwrap();
+    refused_as_not_admin(h.sweep(stranger, 1), "p11 RED: a stranger's sweep")?;
+    refused_as_not_admin(h.withdraw(stranger, 1), "p11 RED: a stranger's withdraw")?;
+    refused_as_not_admin(h.sweep(Principal::anonymous(), 1), "p11 RED: an anonymous sweep")?;
+    let moved = ct::Account { owner, subaccount: Some(serde_bytes::ByteBuf::from(vec![7u8; 32])) };
+    match h.set_fee_as(owner, SEND_FEE, UNSHIELD_BPS, Some(moved)) {
+        Err(e) if e == "REJECT:not-administrator" => {}
+        other => return Err(format!("p11 RED: the recipient's owner changed the schedule: {:?}", other.map(|_| "ok"))),
+    }
+    let pv0 = h.pool_value();
+    let swept = revenue - token_fee;
+    let t = h.sweep(owner, swept).map_err(|e| format!("p11 RED: the recipient's own sweep: {e}"))?;
+    let st = h.status();
+    if t != u128::from(swept) || nat(&st.treasury) != u128::from(swept) || nat(&st.revenue) != 0 || h.pool_value() != pv0 {
+        return Err(format!("p11 RED: after the recipient's sweep treasury {} revenue {}", nat(&st.treasury), nat(&st.revenue)));
+    }
+    h.custody_identity("p11 (sweep)")?;
+    let rec0 = h.token_of(2);
+    let paid = swept - token_fee;
+    let left = h.withdraw(owner, paid).map_err(|e| format!("p11 RED: the recipient's own withdraw: {e}"))?;
+    if left != 0 || h.token_of(2) != rec0 + u128::from(paid) {
+        return Err(format!("p11 RED: recipient grew by {} want {paid}; treasury left {left}", h.token_of(2) - rec0));
+    }
+    h.custody_identity("p11 (withdraw)")?;
+    // The administrator moves the recipient: the old owner loses the right, the new one gains it.
+    let next = ct::Account { owner: h.accounts[3].principal, subaccount: None };
+    h.set_fee_as(h.admin(), SEND_FEE, UNSHIELD_BPS, Some(next)).map_err(|e| format!("p11 set: {e}"))?;
+    earn_send_fee(&mut h, 1).map_err(|e| format!("p11: {e}"))?;
+    refused_as_not_admin(h.sweep(owner, 1), "p11 RED: a replaced recipient's sweep")?;
+    h.sweep(h.accounts[3].principal, 1).map_err(|e| format!("p11 RED: the new recipient's sweep: {e}"))?;
+    // A recipient account owned by the anonymous principal never opens the rail to everyone.
+    let anon = ct::Account { owner: Principal::anonymous(), subaccount: None };
+    if h.set_fee_as(h.admin(), SEND_FEE, UNSHIELD_BPS, Some(anon)).is_ok() {
+        refused_as_not_admin(h.sweep(Principal::anonymous(), 1), "p11 RED: an anonymous recipient's sweep")?;
+    }
+    h.custody_identity("p11")?;
+    println!("[P11] PASS the recipient's owner swept {swept} and withdrew {paid}; stranger, anonymous and replaced recipient refused");
+    Ok(())
+}
+
+/// P12: the patched module upgrades the LIVE module in place. Installed from the bytes live on
+/// mainnet (MPV_LIVE_LEDGER_WASM), the ledger earns, sweeps and refuses the recipient; after the
+/// upgrade every fee setting, revenue, treasury, pool value and both custody identities are
+/// exactly as before, a new proof-carrying transfer is still charged, and the recipient collects.
+fn p12_upgrade_from_live(w: &Wasms, ks: keys::Keyset) -> Result<(), String> {
+    let path = std::env::var("MPV_LIVE_LEDGER_WASM").map_err(|_| "p12: set MPV_LIVE_LEDGER_WASM to the live module".to_string())?;
+    let live = std::fs::read(&path).map_err(|e| format!("p12: read {path}: {e}"))?;
+    let live_w = pic_env::BuiltWasms { ledger: live, ..w.plain.clone() };
+    let mut h = Harness::new(&live_w, ks, "p12");
+    let token_fee = h.env.token_fee;
+    let owner = h.accounts[2].principal;
+    h.set_fee(SEND_FEE, UNSHIELD_BPS);
+    earn_send_fee(&mut h, 0).map_err(|e| format!("p12: {e}"))?;
+    let half = SEND_FEE / 2;
+    h.sweep(h.admin(), half).map_err(|e| format!("p12 sweep on the live module: {e}"))?;
+    refused_as_not_admin(h.sweep(owner, 1), "p12: the live module's recipient sweep")?;
+    let before = h.status();
+    let pv = h.pool_value();
+    h.custody_identity("p12 (live)")?;
+    h.env
+        .pic()
+        .upgrade_eop_canister(h.env.ledger, w.plain.ledger.clone(), candid::encode_args(()).unwrap(), Some(h.admin()))
+        .map_err(|e| format!("p12 RED: upgrade from the live module failed: {e:?}"))?;
+    let after = h.status();
+    let same = nat(&after.send_fee) == nat(&before.send_fee)
+        && nat(&after.unshield_bps) == nat(&before.unshield_bps)
+        && after.recipient.as_ref().map(|a| a.owner) == before.recipient.as_ref().map(|a| a.owner)
+        && nat(&after.revenue) == nat(&before.revenue)
+        && nat(&after.treasury) == nat(&before.treasury)
+        && after.treasury_account.owner == before.treasury_account.owner
+        && after.treasury_account.subaccount == before.treasury_account.subaccount
+        && h.pool_value() == pv;
+    if !same {
+        return Err(format!(
+            "p12 RED: after the upgrade revenue {} treasury {} send_fee {} (before {} {} {})",
+            nat(&after.revenue), nat(&after.treasury), nat(&after.send_fee),
+            nat(&before.revenue), nat(&before.treasury), nat(&before.send_fee)
+        ));
+    }
+    h.custody_identity("p12 RED (after upgrade)")?;
+    earn_send_fee(&mut h, 1).map_err(|e| format!("p12 RED: after the upgrade: {e}"))?;
+    let revenue = nat(&h.status().revenue);
+    if revenue != nat(&before.revenue) + u128::from(SEND_FEE) {
+        return Err(format!("p12 RED: after the upgrade a transfer earned {} want {SEND_FEE}", revenue - nat(&before.revenue)));
+    }
+    let swept = u64::try_from(revenue).unwrap() - token_fee;
+    h.sweep(owner, swept).map_err(|e| format!("p12 RED: the recipient's sweep after the upgrade: {e}"))?;
+    let treasury = u64::try_from(nat(&h.status().treasury)).unwrap();
+    let rec0 = h.token_of(2);
+    h.withdraw(owner, treasury - token_fee).map_err(|e| format!("p12 RED: the recipient's withdraw after the upgrade: {e}"))?;
+    if h.token_of(2) != rec0 + u128::from(treasury - token_fee) || nat(&h.status().treasury) != 0 {
+        return Err("p12 RED: the recipient was not paid exactly the treasury".into());
+    }
+    h.custody_identity("p12")?;
+    println!("[P12] PASS upgrade from the live module {}: state kept exactly, fees still charged, the recipient collected", pic_env::sha_hex(&live_w.ledger));
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// The administrator bound to SNS governance (P13-P15)
+// ---------------------------------------------------------------------------
+
+const NNS_SNS_WASM: &str = "qaa6y-5yaaa-aaaaa-aaafa-cai";
+
+#[derive(candid::CandidType, serde::Deserialize, Clone)]
+struct BindAnswer {
+    root: Option<Principal>,
+    governance: Option<Principal>,
+    ledger: Option<Principal>,
+    dapps: Vec<Principal>,
+}
+
+#[derive(candid::CandidType, serde::Deserialize, Clone)]
+struct DeployedSns {
+    root_canister_id: Option<Principal>,
+    governance_canister_id: Option<Principal>,
+    ledger_canister_id: Option<Principal>,
+}
+
+#[derive(candid::CandidType, serde::Deserialize, Clone, PartialEq, Debug)]
+struct AdminBinding {
+    root: Principal,
+    governance: Principal,
+    ledger: Principal,
+    bound_at: candid::Int,
+}
+
+#[derive(candid::CandidType, serde::Deserialize, Clone, Debug)]
+struct GovernanceBinding {
+    administrator: Option<Principal>,
+    binding: Option<AdminBinding>,
+    note: String,
+}
+
+#[derive(candid::CandidType, serde::Deserialize, Debug)]
+enum Validation {
+    Ok(String),
+    Err(String),
+}
+
+/// An SNS as the ledger sees it: root, governance, the SNS's own token ledger, and NNS SNS-W
+/// at its mainnet id. Each is an instance of tests/MockSnsBinding.mo.
+struct Sns {
+    root: Principal,
+    governance: Principal,
+    sns_ledger: Principal,
+    snsw: Principal,
+}
+
+impl Sns {
+    fn answer(&self, ledger: Principal) -> BindAnswer {
+        BindAnswer { root: Some(self.root), governance: Some(self.governance), ledger: Some(self.sns_ledger), dapps: vec![ledger] }
+    }
+    fn listed(&self) -> DeployedSns {
+        DeployedSns {
+            root_canister_id: Some(self.root),
+            governance_canister_id: Some(self.governance),
+            ledger_canister_id: Some(self.sns_ledger),
+        }
+    }
+}
+
+/// The mock SNS module, compiled once per battery run from tests/MockSnsBinding.mo.
+fn mock_sns_wasm() -> Vec<u8> {
+    static W: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    W.get_or_init(|| {
+        let root = repo_root();
+        let out = std::env::temp_dir().join(format!("mock_sns_binding_{}.wasm", std::process::id()));
+        let sources_raw = String::from_utf8(
+            std::process::Command::new("/usr/bin/mops").arg("sources").current_dir(&root).output().expect("mops").stdout,
+        )
+        .unwrap();
+        let source_args: Vec<String> = sources_raw.split_whitespace().map(String::from).collect();
+        let status = std::process::Command::new("/opt/moc-1.4.1/moc")
+            .args(&source_args)
+            .arg("-c")
+            .arg("tests/MockSnsBinding.mo")
+            .arg("-o")
+            .arg(&out)
+            .current_dir(&root)
+            .status()
+            .expect("moc spawn");
+        assert!(status.success(), "MockSnsBinding compile failed");
+        std::fs::read(&out).expect("read mock wasm")
+    })
+    .clone()
+}
+
+impl Harness {
+    fn install_mock(&self, at: Option<Principal>) -> Principal {
+        let pic = self.env.pic();
+        let c = match at {
+            Some(id) => pic.create_canister_with_id(Some(self.admin()), None, id).expect("create mock at its id"),
+            None => pic.create_canister_with_settings(Some(self.admin()), None),
+        };
+        pic.add_cycles(c, 100_000_000_000_000);
+        pic.install_canister(c, mock_sns_wasm(), candid::encode_args(()).unwrap(), Some(self.admin()));
+        c
+    }
+
+    fn sns(&self) -> Sns {
+        let snsw = self.install_mock(Some(Principal::from_text(NNS_SNS_WASM).unwrap()));
+        Sns { root: self.install_mock(None), governance: self.install_mock(None), sns_ledger: self.install_mock(None), snsw }
+    }
+
+    fn raw(&self, canister: Principal, sender: Principal, method: &str, arg: Vec<u8>) -> Result<Vec<u8>, String> {
+        self.env.pic().update_call(canister, sender, method, arg).map_err(|e| format!("{method}: {e:?}"))
+    }
+
+    fn set_answer(&self, root: Principal, a: Option<BindAnswer>) {
+        self.raw(root, self.admin(), "setAnswer", candid::encode_args((a,)).unwrap()).expect("setAnswer");
+    }
+
+    fn set_listed(&self, snsw: Principal, d: Vec<DeployedSns>) {
+        self.raw(snsw, self.admin(), "setDeployed", candid::encode_args((d,)).unwrap()).expect("setDeployed");
+    }
+
+    fn set_controllers(&self, sender: Principal, controllers: Vec<Principal>) -> Result<(), String> {
+        self.env.pic().set_controllers(self.env.ledger, Some(sender), controllers).map_err(|e| format!("set_controllers: {e:?}"))
+    }
+
+    fn binding(&self) -> Result<GovernanceBinding, String> {
+        self.env.query(self.env.ledger, "governance_binding", ())
+    }
+
+    /// Past one tick of the binding timer, with rounds for its three calls to complete.
+    fn bind_window(&self) {
+        self.env.pic().advance_time(std::time::Duration::from_secs(61));
+        for _ in 0..12 {
+            self.env.pic().tick();
+        }
+    }
+
+    /// A call that reaches the ledger from SNS governance (a generic function's execution).
+    fn as_governance(&self, governance: Principal, method: &str, arg: Vec<u8>) -> Result<Vec<u8>, String> {
+        let args = candid::encode_args((self.env.ledger, method.to_string(), serde_bytes::ByteBuf::from(arg))).unwrap();
+        let reply = self.raw(governance, self.admin(), "call", args)?;
+        let blob: serde_bytes::ByteBuf = candid::decode_one(&reply).map_err(|e| format!("decode call reply: {e}"))?;
+        Ok(blob.into_vec())
+    }
+
+    fn validate(&self, method: &str, arg: Vec<u8>) -> Result<Validation, String> {
+        let reply = self.raw(self.env.ledger, self.accounts[0].principal, method, arg)?;
+        candid::decode_one(&reply).map_err(|e| format!("decode {method}: {e}"))
+    }
+}
+
+fn fee_config(send_fee: u64, bps: u64, recipient: ct::Account) -> Vec<u8> {
+    candid::encode_args((ProtocolFeeConfig { send_fee, unshield_bps: candid::Nat::from(bps), recipient: Some(recipient) },)).unwrap()
+}
+
+fn expect_unbound(h: &Harness, what: &str, admin: Principal, note_has: &str) -> Result<(), String> {
+    let b = h.binding()?;
+    if b.binding.is_some() || b.administrator != Some(admin) || !b.note.contains(note_has) {
+        return Err(format!(
+            "{what}: binding {:?}, administrator {:?}, note {:?}; want unbound, administrator {admin}, a note containing {note_has:?}",
+            b.binding, b.administrator, b.note
+        ));
+    }
+    Ok(())
+}
+
+fn expect_bound(h: &Harness, what: &str, sns: &Sns) -> Result<AdminBinding, String> {
+    let b = h.binding()?;
+    match &b.binding {
+        Some(x) if x.root == sns.root && x.governance == sns.governance && x.ledger == sns.sns_ledger && b.administrator == Some(sns.governance) => Ok(x.clone()),
+        _ => Err(format!("{what}: binding {:?}, administrator {:?}, note {:?}; want bound to governance {}", b.binding, b.administrator, b.note, sns.governance)),
+    }
+}
+
+/// The administrator's powers, refused to `who` after the binding.
+fn admin_refused(h: &Harness, who: Principal, what: &str) -> Result<(), String> {
+    match h.set_fee_as(who, SEND_FEE, UNSHIELD_BPS, Some(h.recipient())) {
+        Err(e) if e == "REJECT:not-administrator" => {}
+        other => return Err(format!("{what}: set_protocol_fee returned {:?}, want REJECT:not-administrator", other.map(|_| "ok"))),
+    }
+    refused_as_not_admin(h.sweep(who, 1), &format!("{what}: protocol_fee_sweep"))?;
+    refused_as_not_admin(h.withdraw(who, 1), &format!("{what}: protocol_treasury_withdraw"))?;
+    if h.raw(h.env.ledger, who, "dao_set_protocol_fee", fee_config(1, 1, h.recipient())).is_ok() {
+        return Err(format!("{what}: dao_set_protocol_fee accepted from {who}"));
+    }
+    Ok(())
+}
+
+/// P13: the administrator binds to SNS governance after genesis, with no key, once and for
+/// good. It does not bind while control is shared (the swap still running), to a sole
+/// controller that is not an SNS root, to a root whose SNS does not list this ledger, or to a
+/// root NNS SNS-W does not list (a stranger who controls the canister and names itself). It
+/// binds to the real SNS; from then on the configuring principal is refused every
+/// administrator power, governance sets the fee through the generic function, its validator
+/// answers, a changed answer from root never rebinds, an upgrade keeps the binding, and the
+/// fee recipient still collects.
+fn p13_binds_to_governance(w: &Wasms, ks: keys::Keyset) -> Result<(), String> {
+    let mut h = Harness::new(&w.plain, ks, "p13");
+    let old = h.admin();
+    let owner = h.accounts[2].principal;
+    let stranger = h.accounts[1].principal;
+    let me = h.env.ledger;
+    h.set_fee(SEND_FEE, UNSHIELD_BPS);
+    earn_send_fee(&mut h, 0).map_err(|e| format!("p13: {e}"))?;
+    let s = h.sns();
+    h.set_answer(s.root, Some(s.answer(me)));
+    h.set_listed(s.snsw, vec![s.listed()]);
+    h.bind_window();
+    expect_unbound(&h, "p13 (configuring principal the only controller)", old, "not bound")?;
+
+    h.set_controllers(old, vec![old, s.root])?;
+    h.bind_window();
+    expect_unbound(&h, "p13 RED (control shared, as during the swap)", old, "controllers: 2")?;
+
+    let impostor = h.install_mock(None);
+    h.set_controllers(old, vec![impostor])?;
+    h.bind_window();
+    expect_unbound(&h, "p13 RED (sole controller not an SNS root)", old, "does not answer as an SNS root")?;
+
+    h.set_answer(impostor, Some(BindAnswer { root: Some(impostor), governance: Some(stranger), ledger: Some(s.sns_ledger), dapps: vec![] }));
+    h.bind_window();
+    expect_unbound(&h, "p13 RED (root's SNS does not list this ledger)", old, "not an SNS root listing this ledger")?;
+
+    h.set_answer(impostor, Some(BindAnswer { root: Some(impostor), governance: Some(stranger), ledger: Some(s.sns_ledger), dapps: vec![me] }));
+    h.bind_window();
+    expect_unbound(&h, "p13 RED (bind by a stranger: a root NNS SNS-W does not list)", old, "NNS SNS-W does not list")?;
+    h.set_fee_as(old, SEND_FEE, UNSHIELD_BPS, Some(h.recipient())).map_err(|e| format!("p13: the administrator before the binding: {e}"))?;
+
+    h.set_controllers(impostor, vec![s.root])?;
+    h.bind_window();
+    admin_refused(&h, old, "p13 RED (old administrator after the binding)")?;
+    let bound = expect_bound(&h, "p13 RED (the SNS's root is the sole controller)", &s)?;
+    admin_refused(&h, stranger, "p13 RED (a stranger after the binding)")?;
+
+    let next_fee = SEND_FEE * 2;
+    let next_bps = UNSHIELD_BPS + 10;
+    match h.validate("validate_dao_set_protocol_fee", fee_config(next_fee, next_bps, h.recipient()))? {
+        Validation::Ok(_) => {}
+        Validation::Err(e) => return Err(format!("p13: validator refused a valid schedule: {e}")),
+    }
+    match h.validate("validate_dao_set_protocol_fee", fee_config(u64::MAX, next_bps, h.recipient()))? {
+        Validation::Err(e) if e == "REJECT:protocol-send-fee-cap" => {}
+        other => return Err(format!("p13: validator on a send fee over the cap said {other:?}")),
+    }
+    if h.as_governance(s.governance, "dao_set_protocol_fee", fee_config(u64::MAX, next_bps, h.recipient())).is_ok() {
+        return Err("p13: governance set a send fee over the cap".into());
+    }
+    h.as_governance(s.governance, "dao_set_protocol_fee", fee_config(next_fee, next_bps, h.recipient()))
+        .map_err(|e| format!("p13 RED: governance's dao_set_protocol_fee: {e}"))?;
+    let st = h.status();
+    if nat(&st.send_fee) != u128::from(next_fee) || nat(&st.unshield_bps) != u128::from(next_bps) {
+        return Err(format!("p13 RED: after governance's call send fee {} bps {}", nat(&st.send_fee), nat(&st.unshield_bps)));
+    }
+
+    // Once and for good: root naming another governance (listed by SNS-W too) never rebinds.
+    let other = h.install_mock(None);
+    h.set_answer(s.root, Some(BindAnswer { governance: Some(other), ..s.answer(me) }));
+    let mut moved = s.listed();
+    moved.governance_canister_id = Some(other);
+    h.set_listed(s.snsw, vec![s.listed(), moved]);
+    for _ in 0..3 {
+        h.bind_window();
+    }
+    let still = h.binding()?;
+    if still.binding.as_ref() != Some(&bound) || still.administrator != Some(s.governance) {
+        return Err(format!("p13 RED (bind twice): binding now {:?}, administrator {:?}", still.binding, still.administrator));
+    }
+    // Control handed elsewhere and back, and an upgrade by root: the binding stays.
+    h.set_controllers(s.root, vec![old])?;
+    h.bind_window();
+    h.set_controllers(old, vec![s.root])?;
+    h.env
+        .pic()
+        .upgrade_eop_canister(me, w.plain.ledger.clone(), candid::encode_args(()).unwrap(), Some(s.root))
+        .map_err(|e| format!("p13: upgrade by SNS root: {e:?}"))?;
+    h.bind_window();
+    let after = h.binding()?;
+    if after.binding.as_ref() != Some(&bound) || after.administrator != Some(s.governance) {
+        return Err(format!("p13 RED (after an upgrade): binding {:?}, administrator {:?}", after.binding, after.administrator));
+    }
+    admin_refused(&h, old, "p13 RED (old administrator after the upgrade)")?;
+
+    // The fee recipient still collects its own fees.
+    let rev0 = nat(&h.status().revenue);
+    earn_fee(&mut h, 1, next_fee).map_err(|e| format!("p13: after the binding: {e}"))?;
+    let revenue = nat(&h.status().revenue);
+    if revenue != rev0 + u128::from(next_fee) {
+        return Err(format!("p13: a transfer earned {} want {next_fee}", revenue - rev0));
+    }
+    let swept = u64::try_from(revenue).unwrap() - h.env.token_fee;
+    h.sweep(owner, swept).map_err(|e| format!("p13 RED: the recipient's sweep after the binding: {e}"))?;
+    let treasury = u64::try_from(nat(&h.status().treasury)).unwrap();
+    let rec0 = h.token_of(2);
+    h.withdraw(owner, treasury - h.env.token_fee).map_err(|e| format!("p13 RED: the recipient's withdraw: {e}"))?;
+    if h.token_of(2) != rec0 + u128::from(treasury - h.env.token_fee) || nat(&h.status().treasury) != 0 {
+        return Err("p13: the recipient was not paid exactly the treasury".into());
+    }
+    h.custody_identity("p13")?;
+    println!("[P13] PASS bound once to SNS governance {}; shared control, non-root, unlisting root and an unlisted stranger refused; old administrator refused; governance set the fee; recipient collected", s.governance);
+    Ok(())
+}
+
+/// P14: from the LIVE module (MPV_LIVE_LEDGER_WASM): the upgrade keeps every setting, the
+/// configuring principal stays administrator until the binding (setup still works), and once
+/// SNS root is the sole controller the ledger binds with every fee setting, revenue, treasury
+/// and pool value unchanged.
+fn p14_live_then_bind(w: &Wasms, ks: keys::Keyset) -> Result<(), String> {
+    let path = std::env::var("MPV_LIVE_LEDGER_WASM").map_err(|_| "p14: set MPV_LIVE_LEDGER_WASM to the live module".to_string())?;
+    let live = std::fs::read(&path).map_err(|e| format!("p14: read {path}: {e}"))?;
+    let live_w = pic_env::BuiltWasms { ledger: live, ..w.plain.clone() };
+    let mut h = Harness::new(&live_w, ks, "p14");
+    let old = h.admin();
+    let me = h.env.ledger;
+    h.set_fee(SEND_FEE, UNSHIELD_BPS);
+    earn_send_fee(&mut h, 0).map_err(|e| format!("p14: {e}"))?;
+    h.sweep(old, SEND_FEE / 2).map_err(|e| format!("p14 sweep on the live module: {e}"))?;
+    h.env
+        .pic()
+        .upgrade_eop_canister(me, w.plain.ledger.clone(), candid::encode_args(()).unwrap(), Some(old))
+        .map_err(|e| format!("p14 RED: upgrade from the live module failed: {e:?}"))?;
+    expect_unbound(&h, "p14 (after the upgrade)", old, "not bound")?;
+    h.set_fee(SEND_FEE, UNSHIELD_BPS);
+    let before = h.status();
+    let pv = h.pool_value();
+    let s = h.sns();
+    h.set_answer(s.root, Some(s.answer(me)));
+    h.set_listed(s.snsw, vec![s.listed()]);
+    h.set_controllers(old, vec![s.root, old])?;
+    h.bind_window();
+    expect_unbound(&h, "p14 RED (control shared)", old, "controllers: 2")?;
+    h.set_controllers(old, vec![s.root])?;
+    h.bind_window();
+    expect_bound(&h, "p14 RED (bound after genesis)", &s)?;
+    let after = h.status();
+    let same = nat(&after.send_fee) == nat(&before.send_fee)
+        && nat(&after.unshield_bps) == nat(&before.unshield_bps)
+        && after.recipient.as_ref().map(|a| a.owner) == before.recipient.as_ref().map(|a| a.owner)
+        && nat(&after.revenue) == nat(&before.revenue)
+        && nat(&after.treasury) == nat(&before.treasury)
+        && h.pool_value() == pv;
+    if !same {
+        return Err(format!("p14 RED: the binding moved state: revenue {} treasury {}", nat(&after.revenue), nat(&after.treasury)));
+    }
+    admin_refused(&h, old, "p14 RED (old administrator after the binding)")?;
+    h.as_governance(s.governance, "dao_set_protocol_fee", fee_config(SEND_FEE, 0, h.recipient()))
+        .map_err(|e| format!("p14 RED: governance's dao_set_protocol_fee: {e}"))?;
+    if nat(&h.status().unshield_bps) != 0 {
+        return Err("p14 RED: governance's schedule not applied".into());
+    }
+    h.custody_identity("p14")?;
+    println!("[P14] PASS live module {} upgraded, administered by the configuring principal until bound, then bound with state unchanged", pic_env::sha_hex(&live_w.ledger));
+    Ok(())
+}
+
+/// P15: an intent left pending by a crash is resumed by governance through the generic
+/// function; the old administrator, no longer administrator, cannot resume another
+/// principal's intent, and nobody but governance reaches the dao_ method.
+fn p15_governance_resumes(w: &Wasms, ks: keys::Keyset) -> Result<(), String> {
+    let mut h = Harness::new(&w.hooks, ks, "p15");
+    let old = h.admin();
+    let owner = h.accounts[2].principal;
+    let stranger = h.accounts[1].principal;
+    let me = h.env.ledger;
+    h.set_fee(SEND_FEE, UNSHIELD_BPS);
+    earn_send_fee(&mut h, 0).map_err(|e| format!("p15: {e}"))?;
+    let s = h.sns();
+    h.set_answer(s.root, Some(s.answer(me)));
+    h.set_listed(s.snsw, vec![s.listed()]);
+    // Armed by the configuring principal while it is still administrator; consumed by the next
+    // token transfer, the recipient's sweep after the binding.
+    h.arm_fail_after_token();
+    h.set_controllers(old, vec![s.root])?;
+    h.bind_window();
+    expect_bound(&h, "p15 RED (bound)", &s)?;
+    let swept = u64::try_from(nat(&h.status().revenue)).unwrap() - h.env.token_fee;
+    let pool0 = h.pool_custody();
+    if h.sweep(owner, swept).is_ok() {
+        return Err("p15: armed sweep completed instead of trapping".into());
+    }
+    if h.pool_custody() + u128::from(swept) + u128::from(h.env.token_fee) != pool0 {
+        return Err("p15: the sweep did not land before the trap".into());
+    }
+    let r: ct::MotokoResult<candid::Nat> = h
+        .env
+        .update(me, old, "resume_prepaid", ())
+        .map_err(|e| format!("p15 resume_prepaid call: {e}"))?;
+    match r.into_result() {
+        Err(e) if e == "REJECT:not-pending-owner" => {}
+        other => return Err(format!("p15 RED: the old administrator's resume_prepaid returned {other:?}")),
+    }
+    for who in [old, stranger, owner] {
+        if h.raw(me, who, "dao_resume_prepaid", candid::encode_args(()).unwrap()).is_ok() {
+            return Err(format!("p15 RED: dao_resume_prepaid accepted from {who}"));
+        }
+    }
+    match h.validate("validate_dao_resume_prepaid", candid::encode_args(()).unwrap())? {
+        Validation::Ok(_) => {}
+        Validation::Err(e) => return Err(format!("p15: validator with a pending intent said {e}")),
+    }
+    let reply = h.as_governance(s.governance, "dao_resume_prepaid", candid::encode_args(()).unwrap())
+        .map_err(|e| format!("p15 RED: governance's dao_resume_prepaid: {e}"))?;
+    let r: ct::MotokoResult<candid::Nat> = candid::decode_one(&reply).map_err(|e| format!("p15 decode: {e}"))?;
+    r.into_result().map_err(|e| format!("p15: governance's resume said {e}"))?;
+    if nat(&h.status().treasury) != u128::from(swept) {
+        return Err(format!("p15 RED: treasury after the resumed sweep {} want {swept}", nat(&h.status().treasury)));
+    }
+    h.custody_identity("p15")?;
+    if h.as_governance(s.governance, "dao_resume_prepaid", candid::encode_args(()).unwrap()).is_ok() {
+        return Err("p15: a second dao_resume_prepaid with nothing pending was not refused".into());
+    }
+    match h.validate("validate_dao_resume_prepaid", candid::encode_args(()).unwrap())? {
+        Validation::Err(e) if e == "REJECT:no-pending-prepaid" => {}
+        other => return Err(format!("p15: validator with nothing pending said {other:?}")),
+    }
+    println!("[P15] PASS governance resumed the crashed sweep once (treasury {swept}); old administrator, stranger and owner refused the dao_ method");
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Builds
 // ---------------------------------------------------------------------------
@@ -854,6 +1419,11 @@ fn main() {
         ("P8", p8_caps),
         ("P9", p9_anonymous),
         ("P10", p10_crash_recovery),
+        ("P11", p11_recipient_collects),
+        ("P12", p12_upgrade_from_live),
+        ("P13", p13_binds_to_governance),
+        ("P14", p14_live_then_bind),
+        ("P15", p15_governance_resumes),
     ];
 
     println!("\n==== TEETH: planted defects must turn the checks RED ====");
@@ -917,7 +1487,7 @@ fn main() {
         (
             "G:cap-removed",
             vec![(
-                "    if (sendFee > PROTOCOL_SEND_FEE_MAX) return #err(\"REJECT:protocol-send-fee-cap\");",
+                "    if (sendFee > PROTOCOL_SEND_FEE_MAX) return ?\"REJECT:protocol-send-fee-cap\";",
                 "    // PLANTED DEFECT G: send-fee cap removed",
             )],
             vec!["P8"],
@@ -925,13 +1495,69 @@ fn main() {
         (
             "I:recipient-is-ledger-guard-removed",
             vec![(
-                "        if (account.owner == selfPrincipal()) return #err(\"REJECT:recipient-is-ledger\");",
+                "        if (account.owner == selfPrincipal()) return ?\"REJECT:recipient-is-ledger\";",
                 "        // PLANTED DEFECT I: recipient-is-ledger guard removed",
             )],
             vec!["P8"],
         ),
+        (
+            "J:fee-rail-open-to-anyone",
+            vec![(
+                "    if (isAdministrator(caller)) return true;\n    if (Principal.isAnonymous(caller)) return false;",
+                "    return true; // PLANTED DEFECT J: anyone may move protocol fees\n    if (Principal.isAnonymous(caller)) return false;",
+            )],
+            vec!["P11"],
+        ),
+        (
+            "K:recipient-refused",
+            vec![(
+                "    switch (protocol_fee_recipient) { case (?r) Principal.equal(r.owner, caller); case null false }\n  };",
+                "    false // PLANTED DEFECT K: the recipient's owner refused (the unpatched gate)\n  };",
+            )],
+            vec!["P11", "P12"],
+        ),
+        (
+            "L:revenue-lost-on-upgrade",
+            vec![(
+                "  var protocol_fee_revenue : Nat = 0;",
+                "  transient var protocol_fee_revenue : Nat = 0; // PLANTED DEFECT L",
+            )],
+            vec!["P12"],
+        ),
+        (
+            "M:binds-without-sns-w",
+            vec![(
+                "      if (not listedByNns(b, deployed.instances)) {",
+                "      if (false) { // PLANTED DEFECT M: NNS SNS-W not consulted",
+            )],
+            vec!["P13"],
+        ),
+        (
+            "N:binds-twice",
+            vec![
+                ("    if (admin_binding != null or admin_bind_running) return;", "    if (admin_bind_running) return; // PLANTED DEFECT N"),
+                ("      if (admin_binding != null) return;\n      admin_binding := ?b;", "      admin_binding := ?b; // PLANTED DEFECT N"),
+                ("    if (admin_binding == null) await* bindGovernance();", "    await* bindGovernance(); // PLANTED DEFECT N"),
+            ],
+            vec!["P13"],
+        ),
+        (
+            "O:old-admin-kept",
+            vec![("      administrator := ?b.governance;\n", "      // PLANTED DEFECT O: the administrator is not moved\n")],
+            vec!["P13", "P14", "P15"],
+        ),
     ];
 
+    // MPV_ONLY="P13,P15" runs only those checks and the planted defects aimed at them (a
+    // partial run never prints the PASS line).
+    let only: Option<Vec<String>> = std::env::var("MPV_ONLY").ok().map(|v| v.split(',').map(|x| x.trim().to_string()).collect());
+    let picked = |n: &str| only.as_ref().map_or(true, |o| o.iter().any(|x| x == n));
+    let checks: Vec<Check> = checks.into_iter().filter(|(n, _)| picked(n)).collect();
+    let variants: Vec<_> = variants
+        .into_iter()
+        .map(|(v, p, r)| (v, p, r.into_iter().filter(|n| picked(n)).collect::<Vec<&str>>()))
+        .filter(|(_, _, r)| !r.is_empty())
+        .collect();
     let mut teeth = 0u32;
     let mut wanted = 0u32;
     for (vname, patches, red_checks) in &variants {
@@ -965,5 +1591,9 @@ fn main() {
         green += 1;
     }
     println!("\nPROTOCOL-FEE BATTERY COMPLETE: {green}/{} green on shipped, {teeth}/{wanted} planted reds", checks.len());
+    if only.is_some() {
+        println!("PROTOCOL-FEE-BATTERY: PARTIAL RUN ({:?}), not a pass", only);
+        return;
+    }
     println!("PROTOCOL-FEE-BATTERY: PASS");
 }
