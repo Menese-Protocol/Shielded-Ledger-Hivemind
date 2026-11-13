@@ -13,7 +13,8 @@ The ledger runs on Internet Computer mainnet, with ICP as its token:
 
 | Canister | ID |
 |---|---|
-| shielded ledger | `3pwrb-oiaaa-aaaao-bbqba-cai` |
+| shielded ledger (ICP) | `3pwrb-oiaaa-aaaao-bbqba-cai` |
+| shielded ledger (ckBTC) | `g5hy5-3yaaa-aaaao-bbsea-cai` |
 | shielded directory | `3gv25-yaaaa-aaaao-bbqaq-cai` |
 
 - **Shield** ICP into a private balance, **send** privately to anyone who has turned on a private
@@ -25,6 +26,20 @@ The ledger runs on Internet Computer mainnet, with ICP as its token:
 - **The verifying keys are frozen.** They are the keys produced by the ceremony below, and the
   ledger can never switch to other keys. `ceremony-launch-p14/final/README.md` shows how to check
   this against the chain yourself.
+
+### The source of each module
+
+Each tag below holds the source that builds one module; `dfx canister info <id> --network ic`
+reports the live hash. Build with `mops install`, then the command shown.
+
+| Tag | Module | sha256 | Build |
+|---|---|---|---|
+| `3pwrb-live-f8c99f92` | ICP ledger, as live | `f8c99f927f8441835ce96be532a469cb3123a243cf5e3460f2ab0ca3b9d67560` | `moc $(mops sources) src/Main.mo --public-metadata candid:service --public-metadata candid:args` |
+| `3pwrb-patched-df8453a9` | ICP ledger, fee recipient collects and administrator binds to SNS governance | `df8453a91cda7dc894024219ecfcabdbc1dc6660b37138d551eca4a24e52be6e` | the same |
+| `g5hy5-live-961ac2e1` | ckBTC ledger, as live | `961ac2e1eaa3df23c9e952f6c3530e672718f5ecec1b75efcae7d014e76d52b8` | `moc $(mops sources) src/Main.mo --public-metadata candid:service` |
+| `g5hy5-patched-4c26e066` | ckBTC ledger, the same two changes | `4c26e0669b33f03679fc9fa11e8aa06e760b4b8beccf54edf601022d8a08014b` | the same |
+
+The ICP ledger's tags are on the `icp-pool` branch; the ckBTC ledger's are on `main`.
 
 ## The trusted-setup ceremony is complete
 
