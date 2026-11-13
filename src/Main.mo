@@ -404,6 +404,11 @@ persistent actor ZkLedger {
 
   var configuring : Bool = false;
   var administrator : ?Principal = null;
+  // The administrator role bound to SNS governance (see bindGovernance). Written once, after the
+  // SNS that controls this ledger exists; from then on the administrator IS that governance
+  // canister, and nothing in this canister can change it again.
+  var admin_binding : ?{ root : Principal; governance : Principal; ledger : Principal; bound_at : Int } = null;
+  var admin_bind_note : Text = "not bound: the administrator is the principal that configured the ledger";
   var verifier_id : ?Principal = null;
   var tree_oracle_id : ?Principal = null;
   var token_ledger_id : ?Principal = null;
@@ -921,6 +926,132 @@ persistent actor ZkLedger {
 
   func isAdministrator(caller : Principal) : Bool {
     switch (administrator) { case (?value) Principal.equal(value, caller); case null false }
+  };
+
+  /// Who may move protocol fees along their one route (revenue -> this ledger's treasury
+  /// subaccount -> the recipient set by set_protocol_fee): the administrator, or the owner of
+  /// that recipient account, so a fee splitter the DAO controls can collect its own fees. The
+  /// recipient's owner can neither choose a destination nor touch user money: the destination is
+  /// the administrator's, and both calls move only protocol revenue and treasury. Never the
+  /// anonymous principal, whatever the recipient says.
+  func mayCollectProtocolFees(caller : Principal) : Bool {
+    if (isAdministrator(caller)) return true;
+    if (Principal.isAnonymous(caller)) return false;
+    switch (protocol_fee_recipient) { case (?r) Principal.equal(r.owner, caller); case null false }
+  };
+
+  // ==== administrator bound to SNS governance ====
+  //
+  // Before the SNS exists, the principal that configured the ledger administers it (setup needs
+  // it). Once the SNS's swap has committed, its root is the ledger's SOLE controller (the swap
+  // hands every dapp canister to it), and the ledger reads who governs it from the platform:
+  // its controller set -> that root's list_sns_canisters -> governance, checked against the
+  // SNSes NNS SNS-W lists as deployed. The administrator role then moves to that governance
+  // canister, once and permanently, with no key and no call from anyone: a timer does it. From
+  // then on every administrator gate in this canister answers to governance alone, through
+  // proposals (the dao_* methods below are the targets of its generic functions).
+  //
+  // There is no public method that binds: the timer is the only path, so there is nothing for
+  // an ingress message to call. While SNS root shares control with NNS Root (during the swap) the
+  // ledger does not bind; if the swap aborts the ledger goes back to its fallback controllers,
+  // unbound, with its administrator unchanged.
+
+  transient let NNS_SNS_WASM : Principal = Principal.fromText("qaa6y-5yaaa-aaaaa-aaafa-cai");
+  transient let ADMIN_BIND_SECONDS : Nat = 60;
+  transient var admin_bind_running : Bool = false;
+
+  type BindSnsCanisters = {
+    root : ?Principal; governance : ?Principal; ledger : ?Principal; dapps : [Principal];
+  };
+  type BindSnsRoot = actor { list_sns_canisters : shared {} -> async BindSnsCanisters };
+  type BindDeployedSns = {
+    root_canister_id : ?Principal; governance_canister_id : ?Principal; ledger_canister_id : ?Principal;
+  };
+  type BindSnsWasm = actor { list_deployed_snses : shared {} -> async { instances : [BindDeployedSns] } };
+  type BindManagement = actor {
+    canister_info : shared { canister_id : Principal; num_requested_changes : ?Nat64 } -> async { controllers : [Principal] };
+  };
+
+  /// The binding the answer describes, if `controller` is the SNS root it names and that SNS
+  /// lists this ledger among its dapp canisters.
+  func bindingFrom(controller : Principal, a : BindSnsCanisters, now : Int) : ?{ root : Principal; governance : Principal; ledger : Principal; bound_at : Int } {
+    switch (a.root, a.governance, a.ledger) {
+      case (?root, ?governance, ?ledger) {
+        if (not Principal.equal(root, controller)) return null;
+        if (Array.find<Principal>(a.dapps, func(d) { Principal.equal(d, selfPrincipal()) }) == null) return null;
+        ?{ root; governance; ledger; bound_at = now };
+      };
+      case _ null;
+    };
+  };
+
+  func listedByNns(b : { root : Principal; governance : Principal; ledger : Principal; bound_at : Int }, instances : [BindDeployedSns]) : Bool {
+    for (i in instances.vals()) {
+      switch (i.root_canister_id, i.governance_canister_id, i.ledger_canister_id) {
+        case (?r, ?g, ?l) {
+          if (Principal.equal(r, b.root) and Principal.equal(g, b.governance) and Principal.equal(l, b.ledger)) return true;
+        };
+        case _ {};
+      };
+    };
+    false;
+  };
+
+  /// One attempt to bind. Does nothing once bound.
+  func bindGovernance() : async* () {
+    if (admin_binding != null or admin_bind_running) return;
+    admin_bind_running := true;
+    try {
+      let mgmt : BindManagement = actor ("aaaaa-aa");
+      let info = await mgmt.canister_info({ canister_id = selfPrincipal(); num_requested_changes = null });
+      if (info.controllers.size() != 1) {
+        admin_bind_note := "not bound: waiting for SNS root to be the sole controller (controllers: " # Nat.toText(info.controllers.size()) # ")";
+        return;
+      };
+      let controller = info.controllers[0];
+      let root : BindSnsRoot = actor (Principal.toText(controller));
+      let answer = try { ?(await root.list_sns_canisters({})) } catch (_) { null };
+      let b = switch (answer) {
+        case (?a) {
+          switch (bindingFrom(controller, a, Time.now())) {
+            case (?b) b;
+            case null { admin_bind_note := "not bound: the sole controller is not an SNS root listing this ledger"; return };
+          };
+        };
+        case null { admin_bind_note := "not bound: the sole controller does not answer as an SNS root"; return };
+      };
+      let snsw : BindSnsWasm = actor (Principal.toText(NNS_SNS_WASM));
+      let deployed = await snsw.list_deployed_snses({});
+      if (not listedByNns(b, deployed.instances)) {
+        admin_bind_note := "not bound: " # Principal.toText(b.root) # " answers as an SNS root but NNS SNS-W does not list that SNS";
+        return;
+      };
+      if (admin_binding != null) return;
+      admin_binding := ?b;
+      administrator := ?b.governance;
+      admin_bind_note := "bound: the administrator is SNS governance " # Principal.toText(b.governance);
+    } catch (e) {
+      admin_bind_note := "not bound: " # Error.message(e);
+    } finally {
+      admin_bind_running := false;
+    };
+  };
+
+  transient let _admin_bind_timer = Timer.recurringTimer<system>(#seconds ADMIN_BIND_SECONDS, func() : async () {
+    if (admin_binding == null) await* bindGovernance();
+  });
+
+  func isBoundGovernance(caller : Principal) : Bool {
+    switch (admin_binding) { case (?b) Principal.equal(b.governance, caller); case null false };
+  };
+
+  /// Who administers the ledger, and whether that is SNS governance yet.
+  public query func governance_binding() : async {
+    administrator : ?Principal;
+    binding : ?{ root : Principal; governance : Principal; ledger : Principal; bound_at : Int };
+    note : Text;
+  } {
+    { administrator; binding = admin_binding; note = admin_bind_note };
   };
 
   func tokenActor() : TransferLedger {
@@ -3133,7 +3264,8 @@ persistent actor ZkLedger {
     tree_state := ?initial;
     note_root := switch (hexToBlob(initial.root)) { case (?root) root; case null Runtime.trap("validated root") };
     addRoot(note_root);
-    administrator := ?caller;
+    // Once bound, the administrator is governance whoever configures.
+    administrator := switch (admin_binding) { case (?b) ?b.governance; case null ?caller };
     refreshCertification();
     configuring := false;
     #ok(statusValue())
@@ -4521,7 +4653,9 @@ persistent actor ZkLedger {
     await drivePendingShield(intentId, trapAfterToken, false)
   };
 
-  public shared ({ caller }) func resume_shield() : async MutationResult {
+  public shared ({ caller }) func resume_shield() : async MutationResult { await* resumeShieldBy(caller) };
+
+  func resumeShieldBy(caller : Principal) : async* MutationResult {
     // Blocking resume while guarded is fund-safe: the pending intent is stable and
     // reconcile-by-memo is dedup-window-independent, so finalization only WAITS for
     // guard-clear + green re-audit (Main.mo ledger_tip_before design).
@@ -4886,7 +5020,9 @@ persistent actor ZkLedger {
     finalizeUnshield(intentId)
   };
 
-  public shared ({ caller }) func resume_unshield() : async MutationResult {
+  public shared ({ caller }) func resume_unshield() : async MutationResult { await* resumeUnshieldBy(caller) };
+
+  func resumeUnshieldBy(caller : Principal) : async* MutationResult {
     switch (guardRejection()) { case (?message) return mutation(message, "NOT_CALLED"); case null {} };
     let pending = switch (pending_unshield) {
       case (?value) value;
@@ -5408,7 +5544,9 @@ persistent actor ZkLedger {
     await drivePendingPrepaid(intentId, trapAfterToken, false)
   };
 
-  public shared ({ caller }) func resume_prepaid() : async Result<Nat> {
+  public shared ({ caller }) func resume_prepaid() : async Result<Nat> { await* resumePrepaidBy(caller) };
+
+  func resumePrepaidBy(caller : Principal) : async* Result<Nat> {
     switch (guardRejection()) { case (?message) return #err(message); case null {} };
     let pending = switch (pending_prepaid) {
       case (?value) value;
@@ -5472,26 +5610,96 @@ persistent actor ZkLedger {
   public shared ({ caller }) func set_protocol_fee(config : ProtocolFeeConfig) : async Result<ProtocolFeeStatus> {
     switch (guardRejection()) { case (?message) return #err(message); case null {} };
     if (not isAdministrator(caller)) return #err("REJECT:not-administrator");
+    switch (protocolFeeRejection(config)) { case (?message) return #err(message); case null {} };
+    applyProtocolFee(config);
+    #ok(protocolFeeStatusValue())
+  };
+
+  /// Why a fee schedule is refused, or null if it may be set.
+  func protocolFeeRejection(config : ProtocolFeeConfig) : ?Text {
     let sendFee = Nat64.toNat(config.send_fee);
-    if (sendFee > PROTOCOL_SEND_FEE_MAX) return #err("REJECT:protocol-send-fee-cap");
-    if (config.unshield_bps > PROTOCOL_UNSHIELD_BPS_MAX) return #err("REJECT:protocol-unshield-bps-cap");
+    if (sendFee > PROTOCOL_SEND_FEE_MAX) return ?"REJECT:protocol-send-fee-cap";
+    if (config.unshield_bps > PROTOCOL_UNSHIELD_BPS_MAX) return ?"REJECT:protocol-unshield-bps-cap";
     switch (config.recipient) {
       case (?account) {
         switch (account.subaccount) {
-          case (?value) { if (value.size() != 32) return #err("REJECT:recipient-subaccount-length") };
+          case (?value) { if (value.size() != 32) return ?"REJECT:recipient-subaccount-length" };
           case null {};
         };
         // Every account this canister owns already holds pool or treasury money. A payout into
         // one of them would land outside pool_value and the treasury balance, and stay there.
         // To keep the fees in the ledger, leave the recipient unset: they stay in the treasury.
-        if (account.owner == selfPrincipal()) return #err("REJECT:recipient-is-ledger");
+        if (account.owner == selfPrincipal()) return ?"REJECT:recipient-is-ledger";
       };
       case null {};
     };
-    protocol_send_fee := sendFee;
+    null
+  };
+
+  func applyProtocolFee(config : ProtocolFeeConfig) {
+    protocol_send_fee := Nat64.toNat(config.send_fee);
     protocol_unshield_bps := config.unshield_bps;
     protocol_fee_recipient := config.recipient;
-    #ok(protocolFeeStatusValue())
+  };
+
+  // ==== SNS governance's generic functions ====
+  //
+  // Once the administrator is SNS governance, it acts through proposals that call these
+  // methods. Each traps on refusal, so a proposal whose call was refused is recorded as failed
+  // rather than executed. Each has a validator governance calls when the proposal is made.
+
+  /// Set the fee schedule and the recipient (generic function target).
+  public shared ({ caller }) func dao_set_protocol_fee(config : ProtocolFeeConfig) : async () {
+    if (not isBoundGovernance(caller)) Runtime.trap("REJECT:not-governance");
+    switch (guardRejection()) { case (?message) Runtime.trap(message); case null {} };
+    switch (protocolFeeRejection(config)) { case (?message) Runtime.trap(message); case null {} };
+    applyProtocolFee(config);
+  };
+
+  public shared func validate_dao_set_protocol_fee(config : ProtocolFeeConfig) : async { #Ok : Text; #Err : Text } {
+    switch (protocolFeeRejection(config)) {
+      case (?message) #Err(message);
+      case null {
+        #Ok("send fee " # Nat64.toText(config.send_fee) # ", unshield share " # Nat.toText(config.unshield_bps) # " bps, recipient "
+          # (switch (config.recipient) { case (?a) Principal.toText(a.owner) # (switch (a.subaccount) { case (?s) " subaccount " # blobToHex(s); case null "" }); case null "none (fees stay in the treasury)" }));
+      };
+    };
+  };
+
+  /// Resume the pending shield, unshield or prepaid intent as the administrator, past the
+  /// attempt limit if it was reached (generic function targets). A refusal traps; an intent
+  /// that is still not final is reported, not refused.
+  public shared ({ caller }) func dao_resume_shield() : async MutationResult {
+    if (not isBoundGovernance(caller)) Runtime.trap("REJECT:not-governance");
+    let r = await* resumeShieldBy(caller);
+    if (Text.startsWith(r.outcome, #text "REJECT")) Runtime.trap(r.outcome);
+    r
+  };
+
+  public shared ({ caller }) func dao_resume_unshield() : async MutationResult {
+    if (not isBoundGovernance(caller)) Runtime.trap("REJECT:not-governance");
+    let r = await* resumeUnshieldBy(caller);
+    if (Text.startsWith(r.outcome, #text "REJECT")) Runtime.trap(r.outcome);
+    r
+  };
+
+  public shared ({ caller }) func dao_resume_prepaid() : async Result<Nat> {
+    if (not isBoundGovernance(caller)) Runtime.trap("REJECT:not-governance");
+    let r = await* resumePrepaidBy(caller);
+    switch (r) { case (#err(m)) { if (Text.startsWith(m, #text "REJECT")) Runtime.trap(m) }; case (#ok(_)) {} };
+    r
+  };
+
+  public shared func validate_dao_resume_shield() : async { #Ok : Text; #Err : Text } {
+    switch (pending_shield) { case (?p) #Ok("resume the pending shield intent (attempts so far: " # Nat.toText(p.attempts) # ")"); case null #Err("REJECT:no-pending-shield") };
+  };
+
+  public shared func validate_dao_resume_unshield() : async { #Ok : Text; #Err : Text } {
+    switch (pending_unshield) { case (?p) #Ok("resume the pending unshield intent (attempts so far: " # Nat.toText(p.attempts) # ")"); case null #Err("REJECT:no-pending-unshield") };
+  };
+
+  public shared func validate_dao_resume_prepaid() : async { #Ok : Text; #Err : Text } {
+    switch (pending_prepaid) { case (?p) #Ok("resume the pending prepaid intent (attempts so far: " # Nat.toText(p.attempts) # ")"); case null #Err("REJECT:no-pending-prepaid") };
   };
 
   // Domain-separated treasury subaccount: protocol money never shares an account with user funds.
@@ -5503,24 +5711,24 @@ persistent actor ZkLedger {
   };
 
   /// Move `amount` of protocol revenue from the pool account into the ledger's own treasury
-  /// subaccount. Administrator only. `amount + token fee` is reserved from revenue up front and the
+  /// subaccount. The administrator or the fee recipient's owner (mayCollectProtocolFees). `amount + token fee` is reserved from revenue up front and the
   /// treasury is credited when the token block is observed; the move rides the crash-safe intent
   /// rail (memo = intent id, block-verified, resumable through resume_prepaid). Sweep in batches:
   /// each sweep is one public token transfer that shows only a total.
   public shared ({ caller }) func protocol_fee_sweep(amount : Nat64, createdAt : Nat64) : async Result<Nat> {
     switch (guardRejection()) { case (?message) return #err(message); case null {} };
-    if (not isAdministrator(caller)) return #err("REJECT:not-administrator");
+    if (not mayCollectProtocolFees(caller)) return #err("REJECT:not-administrator");
     if (not tokenConfigured()) return #err("REJECT:token-unconfigured");
     if (pending_prepaid != null) return #err("REJECT:pending-prepaid-mutation");
     if (amount == 0) return #err("REJECT:protocol-zero-value");
     await prepaidPayout(caller, #sweep, protocolTreasuryAccount(), amount, createdAt)
   };
 
-  /// Pay `amount` out of the treasury to the recipient fixed by set_protocol_fee. Administrator
-  /// only; same rail and reservation discipline as the sweep.
+  /// Pay `amount` out of the treasury to the recipient fixed by set_protocol_fee. The
+  /// administrator or the recipient's owner; same rail and reservation discipline as the sweep.
   public shared ({ caller }) func protocol_treasury_withdraw(amount : Nat64, createdAt : Nat64) : async Result<Nat> {
     switch (guardRejection()) { case (?message) return #err(message); case null {} };
-    if (not isAdministrator(caller)) return #err("REJECT:not-administrator");
+    if (not mayCollectProtocolFees(caller)) return #err("REJECT:not-administrator");
     if (not tokenConfigured()) return #err("REJECT:token-unconfigured");
     if (pending_prepaid != null) return #err("REJECT:pending-prepaid-mutation");
     if (amount == 0) return #err("REJECT:protocol-zero-value");
