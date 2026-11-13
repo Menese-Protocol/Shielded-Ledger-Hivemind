@@ -38,8 +38,15 @@ reports the live hash. Build with `mops install`, then the command shown.
 | `3pwrb-patched-df8453a9` | ICP ledger, fee recipient collects and administrator binds to SNS governance | `df8453a91cda7dc894024219ecfcabdbc1dc6660b37138d551eca4a24e52be6e` | the same |
 | `g5hy5-live-961ac2e1` | ckBTC ledger, as live | `961ac2e1eaa3df23c9e952f6c3530e672718f5ecec1b75efcae7d014e76d52b8` | `moc $(mops sources) src/Main.mo --public-metadata candid:service` |
 | `g5hy5-patched-4c26e066` | ckBTC ledger, the same two changes | `4c26e0669b33f03679fc9fa11e8aa06e760b4b8beccf54edf601022d8a08014b` | the same |
+| `3gv25-live-d65580bc` | shielded directory, as live | `d65580bc55b337f5c5d0ae8cf277e4e3307c7e53eab5006f0790afb06a753dd7` | `moc $(mops sources) src/ShieldedDirectory.mo --public-metadata candid:service` |
+| `3gv25-patched-b052e46a` | shielded directory, administrator binds to SNS governance | `b052e46a1c54043a985e4f92352f04684f123622ad86232764d4ae4a9c4f0771` | the same |
 
-The ICP ledger's tags are on the `icp-pool` branch; the ckBTC ledger's are on `main`.
+The ICP ledger's tags are on the `icp-pool` branch; the ckBTC ledger's and the directory's are on `main`.
+
+Once the SNS that controls them exists, each ledger and the directory hands its administrator
+role to that SNS's governance canister by itself, once and for good: a timer checks that SNS
+root is the sole controller, that root lists the canister, and that NNS SNS-W lists that SNS.
+From then on fees, pools and limits change only by DAO proposal.
 
 ## The trusted-setup ceremony is complete
 

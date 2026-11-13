@@ -18,20 +18,29 @@
 /// limited per caller per day and in total per hour, and refused (not trapped) when the balance
 /// would fall below a reserve. The administrator (set at install) adjusts the limits.
 ///
+/// ADMINISTRATOR AND THE DAO. Once the SNS that controls this canister exists, the administrator
+/// role binds to that SNS's governance canister, once and permanently, with no key and no call
+/// from anyone (see `bindGovernance`). From then on the limits and the pools change only by DAO
+/// proposal, through `dao_add_pool` and `dao_set_limits`, and the role cannot be handed on.
+///
 /// Install: `(opt record { vetkd_key_name = "key_1"; administrator = principal "..." })`. Upgrades
 /// may pass `null`: the key and administrator are kept from install (stable), because a different
 /// key would derive every user's account anew and strand their notes.
+import Array "mo:core/Array";
 import Blob "mo:core/Blob";
 import Cycles "mo:core/Cycles";
+import Error "mo:core/Error";
 import Int "mo:core/Int";
 import Iter "mo:core/Iter";
 import Map "mo:core/Map";
+import Nat "mo:core/Nat";
 import Nat64 "mo:core/Nat64";
 import Principal "mo:core/Principal";
 import Result "mo:core/Result";
 import Runtime "mo:core/Runtime";
 import Text "mo:core/Text";
 import Time "mo:core/Time";
+import Timer "mo:core/Timer";
 
 persistent actor class ShieldedDirectory(init : ?{ vetkd_key_name : Text; administrator : Principal }) = self {
   public type Entry = { shielded_pk : Text; enc_pk : Text };
@@ -270,12 +279,22 @@ persistent actor class ShieldedDirectory(init : ?{ vetkd_key_name : Text; admini
   /// so a user's address cannot disappear under a sender.
   public shared ({ caller }) func add_pool(pool : Principal) : async Result.Result<(), Text> {
     if (caller != administrator) return #err("not-administrator");
-    if (Principal.isAnonymous(pool)) return #err("anonymous-pool");
-    if (legacy_pool == ?pool) return #err("pool-is-legacy");
-    if (Map.containsKey(pool_entries, Principal.compare, pool)) return #err("pool-already-registered");
+    switch (addPoolRefusal(pool)) { case (?e) return #err(e); case null {} };
+    applyAddPool(pool);
+    #ok
+  };
+
+  /// Why `pool` cannot be added, or null if it can.
+  func addPoolRefusal(pool : Principal) : ?Text {
+    if (Principal.isAnonymous(pool)) return ?"anonymous-pool";
+    if (legacy_pool == ?pool) return ?"pool-is-legacy";
+    if (Map.containsKey(pool_entries, Principal.compare, pool)) return ?"pool-already-registered";
+    null
+  };
+
+  func applyAddPool(pool : Principal) {
     Map.add(pool_entries, Principal.compare, pool, Map.empty<Principal, Entry>());
     Map.add(pool_birthdays, Principal.compare, pool, Map.empty<Principal, Blob>());
-    #ok
   };
 
   public query func status() : async Status {
@@ -293,16 +312,174 @@ persistent actor class ShieldedDirectory(init : ?{ vetkd_key_name : Text; admini
   /// Administrator only.
   public shared ({ caller }) func set_limits(next : Limits) : async Result.Result<Limits, Text> {
     if (caller != administrator) return #err("not-administrator");
-    if (next.derivations_per_caller_per_day == 0 or next.derivations_per_hour == 0) return #err("limits-must-be-positive");
+    switch (limitsRefusal(next)) { case (?e) return #err(e); case null {} };
     limits := next;
     #ok(limits)
   };
 
-  /// Administrator only: hand the role to another principal.
+  func limitsRefusal(next : Limits) : ?Text {
+    if (next.derivations_per_caller_per_day == 0 or next.derivations_per_hour == 0) return ?"limits-must-be-positive";
+    null
+  };
+
+  /// Administrator only: hand the role to another principal. Refused once the role is bound to
+  /// SNS governance: from then on nothing can move it.
   public shared ({ caller }) func set_administrator(next : Principal) : async Result.Result<(), Text> {
     if (caller != administrator) return #err("not-administrator");
+    if (admin_binding != null) return #err("administrator-bound-to-dao");
     if (Principal.isAnonymous(next)) return #err("anonymous-administrator");
     administrator := next;
     #ok
+  };
+
+  // ==================== administrator bound to SNS governance ====================
+  //
+  // Before the SNS exists, the principal set at install administers the directory. Once the
+  // SNS's swap has committed, its root is this canister's SOLE controller (the swap hands every
+  // dapp canister to it), and the directory reads who governs it from the platform: its
+  // controller set -> that root's list_sns_canisters -> governance, checked against the SNSes
+  // NNS SNS-W lists as deployed. The administrator role then moves to that governance canister,
+  // once and permanently, with no key and no call from anyone: a timer does it.
+  //
+  // There is no public method that binds: the timer is the only path. While SNS root shares
+  // control with NNS Root (during the swap) nothing happens; if the swap aborts the directory goes
+  // back to its fallback controllers, unbound, with its administrator unchanged.
+
+  var admin_binding : ?{ root : Principal; governance : Principal; ledger : Principal; bound_at : Int } = null;
+  var admin_bind_note : Text = "not bound: the administrator is the principal set at install";
+
+  transient let NNS_SNS_WASM : Principal = Principal.fromText("qaa6y-5yaaa-aaaaa-aaafa-cai");
+  transient let ADMIN_BIND_SECONDS : Nat = 60;
+  transient var admin_bind_running : Bool = false;
+
+  type BindSnsCanisters = {
+    root : ?Principal; governance : ?Principal; ledger : ?Principal; dapps : [Principal];
+  };
+  type BindSnsRoot = actor { list_sns_canisters : shared {} -> async BindSnsCanisters };
+  type BindDeployedSns = {
+    root_canister_id : ?Principal; governance_canister_id : ?Principal; ledger_canister_id : ?Principal;
+  };
+  type BindSnsWasm = actor { list_deployed_snses : shared {} -> async { instances : [BindDeployedSns] } };
+  type BindManagement = actor {
+    canister_info : shared { canister_id : Principal; num_requested_changes : ?Nat64 } -> async { controllers : [Principal] };
+  };
+
+  func selfPrincipal() : Principal { Principal.fromActor(self) };
+
+  /// The binding the answer describes, if `controller` is the SNS root it names and that SNS
+  /// lists this canister among its dapp canisters.
+  func bindingFrom(controller : Principal, a : BindSnsCanisters, now : Int) : ?{ root : Principal; governance : Principal; ledger : Principal; bound_at : Int } {
+    switch (a.root, a.governance, a.ledger) {
+      case (?root, ?governance, ?ledger) {
+        if (not Principal.equal(root, controller)) return null;
+        if (Array.find<Principal>(a.dapps, func(d) { Principal.equal(d, selfPrincipal()) }) == null) return null;
+        ?{ root; governance; ledger; bound_at = now };
+      };
+      case _ null;
+    };
+  };
+
+  func listedByNns(b : { root : Principal; governance : Principal; ledger : Principal; bound_at : Int }, instances : [BindDeployedSns]) : Bool {
+    for (i in instances.vals()) {
+      switch (i.root_canister_id, i.governance_canister_id, i.ledger_canister_id) {
+        case (?r, ?g, ?l) {
+          if (Principal.equal(r, b.root) and Principal.equal(g, b.governance) and Principal.equal(l, b.ledger)) return true;
+        };
+        case _ {};
+      };
+    };
+    false;
+  };
+
+  /// One attempt to bind. Does nothing once bound.
+  func bindGovernance() : async* () {
+    if (admin_binding != null or admin_bind_running) return;
+    admin_bind_running := true;
+    try {
+      let mgmt : BindManagement = actor ("aaaaa-aa");
+      let info = await mgmt.canister_info({ canister_id = selfPrincipal(); num_requested_changes = null });
+      if (info.controllers.size() != 1) {
+        admin_bind_note := "not bound: waiting for SNS root to be the sole controller (controllers: " # Nat.toText(info.controllers.size()) # ")";
+        return;
+      };
+      let controller = info.controllers[0];
+      let root : BindSnsRoot = actor (Principal.toText(controller));
+      let answer = try { ?(await root.list_sns_canisters({})) } catch (_) { null };
+      let b = switch (answer) {
+        case (?a) {
+          switch (bindingFrom(controller, a, Time.now())) {
+            case (?b) b;
+            case null { admin_bind_note := "not bound: the sole controller is not an SNS root listing this canister"; return };
+          };
+        };
+        case null { admin_bind_note := "not bound: the sole controller does not answer as an SNS root"; return };
+      };
+      let snsw : BindSnsWasm = actor (Principal.toText(NNS_SNS_WASM));
+      let deployed = await snsw.list_deployed_snses({});
+      if (not listedByNns(b, deployed.instances)) {
+        admin_bind_note := "not bound: " # Principal.toText(b.root) # " answers as an SNS root but NNS SNS-W does not list that SNS";
+        return;
+      };
+      if (admin_binding != null) return;
+      admin_binding := ?b;
+      administrator := b.governance;
+      admin_bind_note := "bound: the administrator is SNS governance " # Principal.toText(b.governance);
+    } catch (e) {
+      admin_bind_note := "not bound: " # Error.message(e);
+    } finally {
+      admin_bind_running := false;
+    };
+  };
+
+  transient let _admin_bind_timer = Timer.recurringTimer<system>(#seconds ADMIN_BIND_SECONDS, func() : async () {
+    if (admin_binding == null) await* bindGovernance();
+  });
+
+  func isBoundGovernance(caller : Principal) : Bool {
+    switch (admin_binding) { case (?b) Principal.equal(b.governance, caller); case null false };
+  };
+
+  /// Who administers the directory, and whether that is SNS governance yet.
+  public query func governance_binding() : async {
+    administrator : Principal;
+    binding : ?{ root : Principal; governance : Principal; ledger : Principal; bound_at : Int };
+    note : Text;
+  } {
+    { administrator; binding = admin_binding; note = admin_bind_note };
+  };
+
+  // ==================== SNS governance's generic functions ====================
+  //
+  // Once bound, governance acts through proposals that call these methods. Each traps on
+  // refusal, so a proposal whose call was refused is recorded as failed rather than executed.
+  // Each has a validator governance calls when the proposal is made.
+
+  /// Accept addresses and birthdays for another pool (generic function target).
+  public shared ({ caller }) func dao_add_pool(pool : Principal) : async () {
+    if (not isBoundGovernance(caller)) Runtime.trap("not-governance");
+    switch (addPoolRefusal(pool)) { case (?e) Runtime.trap(e); case null {} };
+    applyAddPool(pool);
+  };
+
+  public shared func validate_dao_add_pool(pool : Principal) : async { #Ok : Text; #Err : Text } {
+    switch (addPoolRefusal(pool)) {
+      case (?e) #Err(e);
+      case null #Ok("accept addresses and birthdays for pool " # Principal.toText(pool));
+    };
+  };
+
+  /// Set the derivation limits and the cycles reserve (generic function target).
+  public shared ({ caller }) func dao_set_limits(next : Limits) : async () {
+    if (not isBoundGovernance(caller)) Runtime.trap("not-governance");
+    switch (limitsRefusal(next)) { case (?e) Runtime.trap(e); case null {} };
+    limits := next;
+  };
+
+  public shared func validate_dao_set_limits(next : Limits) : async { #Ok : Text; #Err : Text } {
+    switch (limitsRefusal(next)) {
+      case (?e) #Err(e);
+      case null #Ok("derivations per caller per day " # Nat.toText(next.derivations_per_caller_per_day)
+        # ", per hour " # Nat.toText(next.derivations_per_hour) # ", cycles reserve " # Nat.toText(next.cycles_reserve));
+    };
   };
 };
